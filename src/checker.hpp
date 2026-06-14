@@ -838,6 +838,17 @@ struct CheckerContext {
 	Scope *    polymorphic_scope;
 
 	Ast *assignment_lhs_hint;
+
+	// UFCS: when checking a selector that is the callee of a CallExpr,
+	// ufcs_call_context is true. If x.foo doesn't resolve as a field but
+	// foo is a free proc in x's type's owning package, check_selector
+	// resolves to that entity and stores the (possibly auto-&-wrapped)
+	// receiver here. check_call_expr then prepends ufcs_first_arg to the
+	// call's args and replaces the call's proc with a fresh Ident bound
+	// to ufcs_entity so the backend can resolve it normally.
+	bool       ufcs_call_context;
+	Ast *      ufcs_first_arg;
+	Entity *   ufcs_entity;
 };
 
 gb_internal u64 check_vet_flags(CheckerContext *c);

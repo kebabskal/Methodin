@@ -6016,6 +6016,108 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 	end_of_array_selector_swizzle:;
 	}
 
+	// UFCS: when this selector is the callee of a CallExpr (c->ufcs_call_context)
+	// and field lookup didn't find anything, try resolving `selector` as a free
+	// procedure declared in the receiver type's owning package. On success the
+	// receiver is stashed in c->ufcs_first_arg (with auto-&/auto-* applied) so
+	// check_call_expr can prepend it to the call's argument list.
+	if (entity == nullptr && c->ufcs_call_context && selector->kind == Ast_Ident &&
+	    operand->mode != Addressing_Type && operand->mode != Addressing_Invalid &&
+	    operand->mode != Addressing_Builtin && operand->mode != Addressing_ProcGroup &&
+	    operand->type != nullptr && operand->type != t_invalid) {
+		Type *deref_type = type_deref(operand->type);
+		AstPackage *pkg = nullptr;
+		if (deref_type != nullptr) {
+			Type *named = nullptr;
+			if (deref_type->kind == Type_Named) {
+				named = deref_type;
+			} else {
+				Type *bt = base_type(deref_type);
+				if (bt != nullptr && bt->kind == Type_Named) {
+					named = bt;
+				}
+			}
+			if (named != nullptr) {
+				Entity *tn = named->Named.type_name;
+				if (tn != nullptr) {
+					pkg = tn->pkg;
+				}
+			}
+			if (pkg == nullptr) {
+				Type *bt = base_type(deref_type);
+				if (bt != nullptr) {
+					if (bt->kind == Type_DynamicArray ||
+					    bt->kind == Type_Slice ||
+					    bt->kind == Type_Map ||
+					    (bt->kind == Type_Basic && bt->Basic.kind == Basic_string) ||
+					    (bt->kind == Type_Basic && bt->Basic.kind == Basic_cstring)) {
+						pkg = c->info->runtime_package;
+					}
+				}
+			}
+		}
+		if (pkg != nullptr) {
+			Entity *e = scope_lookup_current(pkg->scope, selector->Ident.interned, selector->Ident.hash);
+			if (e != nullptr && (e->kind == Entity_Procedure || e->kind == Entity_ProcGroup)) {
+				check_entity_decl(c, e, nullptr, nullptr);
+				// Entity_ProcGroup entities have type == t_invalid by design;
+				// only require a real type for single-procedure entities.
+				bool entity_usable = false;
+				if (e->kind == Entity_Procedure) {
+					entity_usable = e->type != nullptr && e->type != t_invalid;
+				} else {
+					entity_usable = e->ProcGroup.entities.count > 0;
+				}
+				if (entity_usable) {
+					Type *want_first = nullptr;
+					if (e->kind == Entity_Procedure) {
+						Type *pt = base_type(e->type);
+						if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.param_count > 0) {
+							want_first = pt->Proc.params->Tuple.variables[0]->type;
+						}
+					} else {
+						for (Entity *m : e->ProcGroup.entities) {
+							if (m == nullptr || m->type == nullptr) continue;
+							Type *pt = base_type(m->type);
+							if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.param_count > 0) {
+								want_first = pt->Proc.params->Tuple.variables[0]->type;
+								break;
+							}
+						}
+					}
+					Ast *first_arg = op_expr;
+					if (want_first != nullptr) {
+						Operand y = {};
+						y.mode = operand->mode;
+						y.type = operand->type;
+						y.value = operand->value;
+						if (check_is_assignable_to(c, &y, want_first)) {
+							// Pass receiver as-is.
+						} else {
+							Operand z = y;
+							z.type = type_deref(y.type);
+							if (z.type != y.type && check_is_assignable_to(c, &z, want_first)) {
+								Token op = {Token_Pointer};
+								first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
+							} else if (y.mode == Addressing_Variable) {
+								Operand w = y;
+								w.type = alloc_type_pointer(y.type);
+								if (check_is_assignable_to(c, &w, want_first)) {
+									Token op = {Token_And};
+									first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
+								}
+							}
+						}
+					}
+					c->ufcs_first_arg = first_arg;
+					c->ufcs_entity = e;
+					entity = e;
+					expr_entity = nullptr; // skip constant-field branches below
+				}
+			}
+		}
+	}
+
 	if (entity == nullptr) {
 		gbString op_str   = expr_to_string(op_expr);
 		gbString type_str = type_to_string_shorthand(operand->type);
@@ -6030,7 +6132,11 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 		} else {
 			ERROR_BLOCK();
 
-			error(op_expr, "'%s' of type '%s' has no field '%s'", op_str, type_str, sel_str);
+			if (c->ufcs_call_context) {
+				error(op_expr, "'%s' of type '%s' has no field or method '%s'", op_str, type_str, sel_str);
+			} else {
+				error(op_expr, "'%s' of type '%s' has no field '%s'", op_str, type_str, sel_str);
+			}
 
 			if (operand->type != nullptr && selector->kind == Ast_Ident) {
 				String const &name = selector->Ident.token.string;
@@ -8645,7 +8751,51 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 		}
 	} else {
 		if (proc != nullptr) {
+			bool   prev_ufcs_call_context = c->ufcs_call_context;
+			Ast *  prev_ufcs_first_arg    = c->ufcs_first_arg;
+			Entity *prev_ufcs_entity      = c->ufcs_entity;
+			bool try_ufcs = proc->kind == Ast_SelectorExpr && proc->SelectorExpr.token.kind == Token_Period;
+			if (try_ufcs) {
+				c->ufcs_call_context = true;
+				c->ufcs_first_arg    = nullptr;
+				c->ufcs_entity       = nullptr;
+			}
 			check_expr_or_type(c, operand, proc);
+			if (try_ufcs && c->ufcs_first_arg != nullptr && c->ufcs_entity != nullptr) {
+				ast_node(ce, CallExpr, call);
+				Entity *ufcs_e = c->ufcs_entity;
+				// Replace the selector callee with a freshly synthesised Ident
+				// bound to the resolved free procedure. The backend then sees
+				// a plain procedure reference instead of a selector that would
+				// fail lookup_field.
+				Ast *new_proc = ast_ident(call->file(), ufcs_e->token);
+				add_entity_use(c, new_proc, ufcs_e);
+				AddressingMode mode = (ufcs_e->kind == Entity_ProcGroup) ? Addressing_ProcGroup : Addressing_Value;
+				Type *t = ufcs_e->type;
+				if (ufcs_e->kind == Entity_Procedure && t == nullptr) {
+					t = t_invalid;
+				}
+				add_type_and_value(c, new_proc, mode, t, {});
+				ce->proc = new_proc;
+
+				auto modified_args = permanent_slice_make<Ast *>(ce->args.count + 1);
+				modified_args[0] = c->ufcs_first_arg;
+				slice_copy(&modified_args, ce->args, 1);
+				ce->args = modified_args;
+				ce->split_args = nullptr;
+
+				// Reset the operand to reflect the new (plain) proc reference.
+				operand->expr = new_proc;
+				operand->mode = mode;
+				operand->type = t;
+				operand->value = {};
+				if (ufcs_e->kind == Entity_ProcGroup) {
+					operand->proc_group = ufcs_e;
+				}
+			}
+			c->ufcs_call_context = prev_ufcs_call_context;
+			c->ufcs_first_arg    = prev_ufcs_first_arg;
+			c->ufcs_entity       = prev_ufcs_entity;
 		} else {
 			GB_ASSERT(operand->expr != nullptr);
 		}
