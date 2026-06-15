@@ -6087,24 +6087,43 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 					}
 					Ast *first_arg = op_expr;
 					if (want_first != nullptr) {
-						Operand y = {};
-						y.mode = operand->mode;
-						y.type = operand->type;
-						y.value = operand->value;
-						if (check_is_assignable_to(c, &y, want_first)) {
-							// Pass receiver as-is.
-						} else {
-							Operand z = y;
-							z.type = type_deref(y.type);
-							if (z.type != y.type && check_is_assignable_to(c, &z, want_first)) {
+						// For polymorphic want_first (common with proc groups like
+						// `append`, whose first member has `^$T/[dynamic]$E`), we
+						// cannot use check_is_assignable_to: matching against a
+						// polymorphic type specialises it and that state persists
+						// on the shared type instance, so a later UFCS call with a
+						// different element type would fail. Decide structurally
+						// here and let real overload resolution validate the call.
+						if (is_type_polymorphic(want_first)) {
+							bool want_pointer     = is_type_pointer(want_first);
+							bool receiver_pointer = is_type_pointer(operand->type);
+							if (want_pointer && !receiver_pointer && operand->mode == Addressing_Variable) {
+								Token op = {Token_And};
+								first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
+							} else if (!want_pointer && receiver_pointer) {
 								Token op = {Token_Pointer};
 								first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
-							} else if (y.mode == Addressing_Variable) {
-								Operand w = y;
-								w.type = alloc_type_pointer(y.type);
-								if (check_is_assignable_to(c, &w, want_first)) {
-									Token op = {Token_And};
-									first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
+							}
+						} else {
+							Operand y = {};
+							y.mode = operand->mode;
+							y.type = operand->type;
+							y.value = operand->value;
+							if (check_is_assignable_to(c, &y, want_first)) {
+								// Pass receiver as-is.
+							} else {
+								Operand z = y;
+								z.type = type_deref(y.type);
+								if (z.type != y.type && check_is_assignable_to(c, &z, want_first)) {
+									Token op = {Token_Pointer};
+									first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
+								} else if (y.mode == Addressing_Variable) {
+									Operand w = y;
+									w.type = alloc_type_pointer(y.type);
+									if (check_is_assignable_to(c, &w, want_first)) {
+										Token op = {Token_And};
+										first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
+									}
 								}
 							}
 						}
