@@ -118,3 +118,57 @@ test_method_name_collision_becomes_proc_group :: proc(t: ^testing.T) {
 	testing.expect_value(t, g.attack(), 20)
 	testing.expect_value(t, g.rage, 2)
 }
+
+// In-struct and impl methods can coexist on the same type — both
+// forms feed the same lifting machinery.
+Mage :: struct {
+	mp:        int,
+	cast_spell :: proc() {
+		mp -= 1
+	},
+}
+
+impl Mage {
+	rest :: proc() {
+		mp = 10
+	}
+}
+
+@test
+test_in_struct_and_impl_block_on_same_type :: proc(t: ^testing.T) {
+	m := Mage{mp = 3}
+	m.cast_spell()
+	m.cast_spell()
+	testing.expect_value(t, m.mp, 1)
+	m.rest()
+	testing.expect_value(t, m.mp, 10)
+}
+
+// A method can call another method on `self` via UFCS — `self.other()`
+// works because `self` is in scope. This exercises the chained-call
+// path through the lifted proc body.
+Account :: struct {
+	balance: int,
+
+	deposit :: proc(amount: int) {
+		balance += amount
+	},
+
+	withdraw :: proc(amount: int) {
+		balance -= amount
+	},
+
+	transfer_to :: proc(other: ^Account, amount: int) {
+		self.withdraw(amount)
+		other.deposit(amount)
+	},
+}
+
+@test
+test_method_calls_method_via_self :: proc(t: ^testing.T) {
+	a := Account{balance = 100}
+	b := Account{balance = 0}
+	a.transfer_to(&b, 30)
+	testing.expect_value(t, a.balance, 70)
+	testing.expect_value(t, b.balance, 30)
+}
