@@ -201,6 +201,32 @@ Critter :: union {
 	Mouse,
 }
 
+// Inside an in-struct method body, a bare call to another method on
+// the same struct should resolve via UFCS as `self.<method>(...)`. The
+// lift pass rewrites the body so the user doesn't have to write the
+// `self.` prefix explicitly — mirrors implicit field access under
+// `using self`.
+Counter2 :: struct {
+	value: int,
+
+	bump :: proc() {
+		value += 1
+	},
+
+	bump_n :: proc(n: int) {
+		for _ in 0 ..< n {
+			bump() // bare call → rewritten to self.bump()
+		}
+	},
+}
+
+@test
+test_intra_struct_method_call :: proc(t: ^testing.T) {
+	c := Counter2{value = 0}
+	c.bump_n(5)
+	testing.expect_value(t, c.value, 5)
+}
+
 @test
 test_union_dispatch :: proc(t: ^testing.T) {
 	critters: [2]Critter = {Cat{noise = 0}, Mouse{noise = 0}}
