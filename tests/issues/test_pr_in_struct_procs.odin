@@ -55,3 +55,32 @@ test_in_struct_proc_free_call_form :: proc(t: ^testing.T) {
 	damage(&p, 25)
 	testing.expect_value(t, p.hp, 75)
 }
+
+// `impl Type { ... }` is the second supported form — methods declared
+// in a block separate from the struct definition (often a different
+// file). Same desugaring: each method becomes a free proc with `using
+// self: ^Type` prepended.
+Box :: struct {
+	w, h: int,
+}
+
+impl Box {
+	scale :: proc(factor: int) {
+		w *= factor
+		h *= factor
+	}
+
+	area :: proc() -> int {
+		return w * h
+	}
+}
+
+@test
+test_impl_block :: proc(t: ^testing.T) {
+	b := Box{w = 3, h = 4}
+	testing.expect_value(t, b.area(), 12)
+	b.scale(2)
+	testing.expect_value(t, b.w, 6)
+	testing.expect_value(t, b.h, 8)
+	testing.expect_value(t, b.area(), 48)
+}
