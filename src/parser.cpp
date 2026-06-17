@@ -6909,7 +6909,13 @@ gb_internal Ast *parse_impl_block(AstFile *f) {
 // Shared lowering for one method node: prepends `using self: ^Name` to
 // the proc literal's parameter list and appends the resulting decl
 // (which is the same ValueDecl node, mutated in place) to `decls_out`.
-gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Array<Ast *> *decls_out, bool no_using_self = false) {
+//
+// If `polymorphic_params` is non-null (the owning struct is polymorphic)
+// the receiver is built as `^Name($P1, $P2, ...)`, re-introducing each
+// of the struct's polymorphic params on the lifted proc so the body
+// can see them and `^Name(...)` is a complete struct type for the
+// checker to bind against.
+gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Ast *polymorphic_params, Array<Ast *> *decls_out, bool no_using_self = false) {
 	if (method->kind != Ast_ValueDecl) return;
 	if (method->ValueDecl.values.count != 1) return;
 
@@ -6922,7 +6928,52 @@ gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 	caret_tok.pos = struct_name_token.pos;
 
 	Ast *struct_name_ref = ast_ident(f, struct_name_token);
-	Ast *ptr_type = ast_pointer_type(f, caret_tok, struct_name_ref);
+	Ast *elem = struct_name_ref;
+
+	if (polymorphic_params != nullptr && polymorphic_params->kind == Ast_FieldList) {
+		// Build `Name($P1, $P2, ...)` — one Poly_Type arg per polymorphic
+		// param name. The struct's params themselves are parsed as
+		// PolyType-wrapped Idents (Field.names = [PolyType{Ident}]); we
+		// unwrap to the bare Ident, then re-introduce with `$` on the
+		// lifted proc so the checker treats each as a new polymorphic
+		// param of the proc, inferred from the receiver type.
+		auto call_args = array_make<Ast *>(ast_allocator(f));
+		for (Ast *field : polymorphic_params->FieldList.list) {
+			if (field->kind != Ast_Field) continue;
+			for (Ast *name : field->Field.names) {
+				Ast *bare_ident = name;
+				if (bare_ident->kind == Ast_PolyType && bare_ident->PolyType.type != nullptr) {
+					bare_ident = bare_ident->PolyType.type;
+				}
+				if (bare_ident->kind != Ast_Ident) continue;
+				Token name_tok = bare_ident->Ident.token;
+
+				Token dollar_tok = {};
+				dollar_tok.kind = Token_Dollar;
+				dollar_tok.string = str_lit("$");
+				dollar_tok.pos = struct_name_token.pos;
+
+				Ast *name_node = ast_ident(f, name_tok);
+				Ast *poly = ast_poly_type(f, dollar_tok, name_node, /*specialization*/ nullptr);
+				array_add(&call_args, poly);
+			}
+		}
+
+		if (call_args.count > 0) {
+			Token open_tok = {};
+			open_tok.kind = Token_OpenParen;
+			open_tok.string = str_lit("(");
+			open_tok.pos = struct_name_token.pos;
+			Token close_tok = {};
+			close_tok.kind = Token_CloseParen;
+			close_tok.string = str_lit(")");
+			close_tok.pos = struct_name_token.pos;
+			Token ellipsis_tok = {};
+			elem = ast_call_expr(f, struct_name_ref, call_args, open_tok, close_tok, ellipsis_tok);
+		}
+	}
+
+	Ast *ptr_type = ast_pointer_type(f, caret_tok, elem);
 
 	Token self_tok = {};
 	self_tok.kind = Token_Ident;
@@ -6953,6 +7004,7 @@ gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 struct PendingMethod {
 	Ast *method;             // Ast_ValueDecl wrapping the proc literal
 	Token struct_name_token; // owning struct's name token
+	Ast *polymorphic_params; // owning struct's polymorphic_params FieldList, or nullptr
 	bool no_using_self;      // true for union dispatchers: prepend `self: ^Union` without `using`
 };
 
@@ -7400,8 +7452,17 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 				continue;
 			}
 			Token struct_name_token = te->Ident.token;
+			// Look up the target struct in the same file so we can carry
+			// its polymorphic_params through to the lift pass. If the
+			// struct isn't found in this file the receiver stays
+			// `^Name`, which fails cleanly at check time.
+			Ast *target_struct = find_struct_type_in_decls(decls_out, struct_name_token.string);
+			Ast *poly = nullptr;
+			if (target_struct != nullptr) {
+				poly = target_struct->StructType.polymorphic_params;
+			}
 			for (Ast *method : decl->ImplBlock.methods) {
-				array_add(&pending, PendingMethod{method, struct_name_token});
+				array_add(&pending, PendingMethod{method, struct_name_token, poly});
 			}
 			continue;
 		}
@@ -7422,7 +7483,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 
 		Token struct_name_token = name_ident->Ident.token;
 		for (Ast *method : st->methods) {
-			array_add(&pending, PendingMethod{method, struct_name_token});
+			array_add(&pending, PendingMethod{method, struct_name_token, st->polymorphic_params});
 		}
 	}
 
@@ -7538,7 +7599,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			if (!all_have_it) continue;
 
 			Ast *dispatcher = build_union_dispatcher(f, union_name_token, name, variants_slice, sample);
-			array_add(&pending, PendingMethod{dispatcher, union_name_token, /*no_using_self*/true});
+			array_add(&pending, PendingMethod{dispatcher, union_name_token, /*polymorphic_params*/nullptr, /*no_using_self*/true});
 		}
 	}
 
@@ -7579,7 +7640,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 
 		if (group_indices.count == 1) {
 			// No collision — lift with the user-visible name.
-			lift_one_method(f, pending[i].method, pending[i].struct_name_token, decls_out, pending[i].no_using_self);
+			lift_one_method(f, pending[i].method, pending[i].struct_name_token, pending[i].polymorphic_params, decls_out, pending[i].no_using_self);
 			continue;
 		}
 
@@ -7596,7 +7657,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			mangled_tok.string = mangle_method_name(pm.struct_name_token.string, method_name);
 			name_ident->Ident.token = mangled_tok;
 
-			lift_one_method(f, pm.method, pm.struct_name_token, decls_out, pm.no_using_self);
+			lift_one_method(f, pm.method, pm.struct_name_token, pm.polymorphic_params, decls_out, pm.no_using_self);
 
 			array_add(&group_members, ast_ident(f, mangled_tok));
 		}
