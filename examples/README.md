@@ -1,9 +1,13 @@
 # Examples
 
-The `example` directory contains two packages:
+This directory contains:
 
-A [demo](demo) illustrating the basics of Odin.
+- [`demo`](demo) — a tour of the upstream Odin language basics.
+- [`all`](all) — imports every [core](/core) and [vendor](/vendor)
+  package so that `odin check` can verify them all in one go.
+- [`methods`](methods) — shapes-with-a-loop demo of in-struct procs +
+  union dispatch (one of the [Methodin](../README.md) extensions).
+- [`animals`](animals) — same idea, with `using` inheritance thrown in.
 
-It further contains [all](all), which imports all [core](/core) and [vendor](/vendor) packages so we can conveniently run `odin check` on everything at once.
-
-For additional example code, see the [examples](https://github.com/odin-lang/examples) repository.
+For additional upstream example code, see the
+[examples](https://github.com/odin-lang/examples) repository.
