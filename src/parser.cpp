@@ -5969,6 +5969,7 @@ gb_internal AstPackage *try_add_import_path(Parser *p, String path, String const
 	pkg->fullpath = path;
 	array_init(&pkg->files, permanent_allocator());
 	pkg->foreign_files.allocator = permanent_allocator();
+	array_init(&pkg->methodin_methods, permanent_allocator());
 
 	// NOTE(bill): Single file initial package
 	if (kind == Package_Init && !path_is_directory(path) && string_ends_with(path, FILE_EXT)) {
@@ -6915,6 +6916,8 @@ gb_internal Ast *parse_impl_block(AstFile *f) {
 // of the struct's polymorphic params on the lifted proc so the body
 // can see them and `^Name(...)` is a complete struct type for the
 // checker to bind against.
+gb_internal String mangle_method_name(String struct_name, String method_name);
+
 gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Ast *polymorphic_params, Array<Ast *> *decls_out, bool no_using_self = false) {
 	if (method->kind != Ast_ValueDecl) return;
 	if (method->ValueDecl.values.count != 1) return;
@@ -6922,12 +6925,32 @@ gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 	Ast *value = method->ValueDecl.values[0];
 
 	// `name :: proc { A, B }` declared inside a struct body: this is a
-	// user-written procedure group, not an in-struct proc. Lift it to
-	// file scope unchanged — the inner names already refer to the
-	// lifted free procs (or to other file-scope procs), and there's no
-	// receiver to inject. UFCS on `x.name(...)` then runs the normal
-	// proc-group overload resolution.
+	// user-written procedure group, not an in-struct proc. The inner
+	// names refer to the struct's other methods, which Pass 2 mangles
+	// to `<Struct>__<name>`. Rewrite each member ident to its mangled
+	// form so the proc-group decl ends up pointing at the actual
+	// lifted free procs at package scope.
 	if (value->kind == Ast_ProcGroup) {
+		// Replace each arg ident with a fresh `ast_ident` carrying the
+		// mangled token. Can't just mutate `arg->Ident.token.string`
+		// because Ident also caches a `hash` and `interned` derived
+		// from the original string at parse time, and scope_lookup
+		// uses those — not token.string — so an in-place rewrite
+		// would silently fail to resolve.
+		ast_node(pg, ProcGroup, value);
+		isize n = pg->args.count;
+		Ast **new_args = gb_alloc_array(ast_allocator(f), Ast *, n);
+		for (isize i = 0; i < n; i++) {
+			Ast *arg = pg->args[i];
+			if (arg == nullptr || arg->kind != Ast_Ident) {
+				new_args[i] = arg;
+				continue;
+			}
+			Token t = arg->Ident.token;
+			t.string = mangle_method_name(struct_name_token.string, t.string);
+			new_args[i] = ast_ident(f, t);
+		}
+		pg->args.data = new_args;
 		array_add(decls_out, method);
 		return;
 	}
@@ -7651,20 +7674,28 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			}
 		}
 
-		if (group_indices.count == 1) {
-			// No collision — lift with the user-visible name.
-			lift_one_method(f, pending[i].method, pending[i].struct_name_token, pending[i].polymorphic_params, decls_out, pending[i].no_using_self);
-			continue;
-		}
-
-		// Collision: mangle each method to `<Struct>__<name>`, lift,
-		// then synthesise a `name :: proc { Struct1__name, ... }`
-		// group at file scope so unqualified UFCS calls still
-		// dispatch correctly via overload resolution.
-		auto group_members = array_make<Ast *>(ast_allocator(f));
-
+		// Always mangle the lifted method name to `<Struct>__<name>` and
+		// record the (original_name, mangled_token) pair on the package.
+		// `assemble_methodin_method_groups` (called after every file in
+		// the package has been parsed) walks all of these and emits one
+		// `name :: proc { ... }` proc-group per original_name, so
+		// collisions across files in the same package no longer trigger
+		// a file-scope redeclaration error. User-written proc groups
+		// (Phase 11) and union dispatchers stay untouched — those route
+		// through the Ast_ProcGroup branch in lift_one_method.
+		AstPackage *pkg = f->pkg;
 		for (isize idx : group_indices) {
 			PendingMethod pm = pending[idx];
+			Ast *value = pm.method->ValueDecl.values[0];
+
+			// In-struct user-written proc-groups (`name :: proc { A, B }`)
+			// are valid in their original form — don't mangle, don't
+			// register them as a method bucket member.
+			if (value->kind == Ast_ProcGroup) {
+				lift_one_method(f, pm.method, pm.struct_name_token, pm.polymorphic_params, decls_out, pm.no_using_self);
+				continue;
+			}
+
 			Ast *name_ident = pm.method->ValueDecl.names[0];
 			Token mangled_tok = name_ident->Ident.token;
 			mangled_tok.string = mangle_method_name(pm.struct_name_token.string, method_name);
@@ -7672,31 +7703,84 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 
 			lift_one_method(f, pm.method, pm.struct_name_token, pm.polymorphic_params, decls_out, pm.no_using_self);
 
-			array_add(&group_members, ast_ident(f, mangled_tok));
+			if (pkg != nullptr) {
+				MethodinMethodEntry entry = {};
+				entry.original_name = method_name;
+				entry.mangled_tok   = mangled_tok;
+				MUTEX_GUARD_BLOCK(&pkg->methodin_methods_mutex) {
+					array_add(&pkg->methodin_methods, entry);
+				}
+			}
+		}
+	}
+}
+
+// After every file in a package has finished parsing, walk the
+// collected (original_name → mangled_tok) entries and emit one
+// `name :: proc { Struct1__name, Struct2__name, ... }` proc-group
+// per name, appended to pkg->files[0]->decls. This is what makes
+// `t.update(...)` resolve when `Time` declares `update` in one file
+// and `FpsCamera` declares `update` in another — the lift pass
+// always mangles, and this pass stitches the user-visible name back
+// together at package scope.
+gb_internal void assemble_methodin_method_groups(AstPackage *pkg) {
+	if (pkg == nullptr) return;
+	if (pkg->methodin_methods.count == 0) return;
+	if (pkg->files.count == 0) return;
+
+	AstFile *target = pkg->files[0];
+	if (target == nullptr) return;
+
+	auto handled = array_make<bool>(temporary_allocator(), pkg->methodin_methods.count);
+	auto new_decls = array_make<Ast *>(ast_allocator(target));
+
+	for (isize i = 0; i < pkg->methodin_methods.count; i++) {
+		if (handled[i]) continue;
+		String name = pkg->methodin_methods[i].original_name;
+
+		auto group_members = array_make<Ast *>(ast_allocator(target));
+		array_add(&group_members, ast_ident(target, pkg->methodin_methods[i].mangled_tok));
+		handled[i] = true;
+
+		for (isize j = i+1; j < pkg->methodin_methods.count; j++) {
+			if (handled[j]) continue;
+			if (pkg->methodin_methods[j].original_name == name) {
+				array_add(&group_members, ast_ident(target, pkg->methodin_methods[j].mangled_tok));
+				handled[j] = true;
+			}
 		}
 
-		// `proc { ... }` group expression.
 		Token proc_tok = {};
 		proc_tok.kind = Token_proc;
 		proc_tok.string = str_lit("proc");
-		proc_tok.pos = pending[group_indices[0]].struct_name_token.pos;
-		Token open_tok = proc_tok; open_tok.kind = Token_OpenBrace; open_tok.string = str_lit("{");
+		proc_tok.pos = pkg->methodin_methods[i].mangled_tok.pos;
+		Token open_tok = proc_tok;  open_tok.kind  = Token_OpenBrace;  open_tok.string  = str_lit("{");
 		Token close_tok = proc_tok; close_tok.kind = Token_CloseBrace; close_tok.string = str_lit("}");
 
-		Ast *group_expr = ast_proc_group(f, proc_tok, open_tok, close_tok, group_members);
+		Ast *group_expr = ast_proc_group(target, proc_tok, open_tok, close_tok, group_members);
 
-		// Wrap as `<name> :: proc { ... }` ValueDecl and append.
-		Token group_name_tok = pending[group_indices[0]].struct_name_token;
+		Token group_name_tok = pkg->methodin_methods[i].mangled_tok;
 		group_name_tok.kind = Token_Ident;
-		group_name_tok.string = method_name;
+		group_name_tok.string = name;
 
-		auto gn = array_make<Ast *>(ast_allocator(f), 0, 1);
-		array_add(&gn, ast_ident(f, group_name_tok));
-		auto gv = array_make<Ast *>(ast_allocator(f), 0, 1);
+		auto gn = array_make<Ast *>(ast_allocator(target), 0, 1);
+		array_add(&gn, ast_ident(target, group_name_tok));
+		auto gv = array_make<Ast *>(ast_allocator(target), 0, 1);
 		array_add(&gv, group_expr);
-		Ast *group_decl = ast_value_decl(f, gn, nullptr, gv, false, nullptr, nullptr);
-		array_add(decls_out, group_decl);
+		Ast *group_decl = ast_value_decl(target, gn, nullptr, gv, false, nullptr, nullptr);
+		array_add(&new_decls, group_decl);
 	}
+
+	if (new_decls.count == 0) return;
+
+	// Append to target->decls. The Slice is fixed-size; allocate a new
+	// backing array, copy the old slice over, then the new decls.
+	isize old_count = target->decls.count;
+	Ast **merged = gb_alloc_array(ast_allocator(target), Ast *, old_count + new_decls.count);
+	for (isize i = 0; i < old_count; i++) merged[i] = target->decls[i];
+	for (isize i = 0; i < new_decls.count; i++) merged[old_count + i] = new_decls[i];
+	target->decls.data  = merged;
+	target->decls.count = old_count + new_decls.count;
 }
 
 gb_internal bool parse_file(Parser *p, AstFile *f) {
@@ -8008,6 +8092,15 @@ gb_internal ParseFileError parse_packages(Parser *p, String init_filename) {
 		for (AstFile *file : pkg->files) {
 			p->total_seen_load_directive_count += file->seen_load_directive_count;
 		}
+	}
+
+	// Now that every file in every package has finished parsing, stitch
+	// the per-file mangled in-struct methods into one user-visible proc-
+	// group per `(package, name)` so cross-file struct method collisions
+	// (Time.update + FpsCamera.update in separate files) don't trip the
+	// file-scope redeclaration check.
+	for (AstPackage *pkg : p->packages) {
+		assemble_methodin_method_groups(pkg);
 	}
 
 	g_parsing_done.store(true, std::memory_order_relaxed);

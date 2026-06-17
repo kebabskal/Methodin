@@ -76,6 +76,9 @@ $ODIN check ../test_issue_6484.odin -no-entry-point $COMMON
 
 $ODIN test ../test_pr_in_struct_procs.odin $COMMON
 
+# Cross-file in-struct method collision — needs a full package, not -file.
+$ODIN test ../test_pr_in_struct_procs_cross_file -define:ODIN_TEST_FANCY=false -vet -strict-style -ignore-unused-defineables
+
 set +x
 
 popd
