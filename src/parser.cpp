@@ -465,6 +465,7 @@ gb_internal Ast *clone_ast(Ast *node, AstFile *f) {
 		break;
 	case Ast_StructType:
 		n->StructType.fields             = clone_ast_array(n->StructType.fields, f);
+		n->StructType.methods            = clone_ast_array(n->StructType.methods, f);
 		n->StructType.polymorphic_params = clone_ast(n->StructType.polymorphic_params, f);
 		n->StructType.align              = clone_ast(n->StructType.align, f);
 		n->StructType.min_field_align    = clone_ast(n->StructType.min_field_align, f);
@@ -1272,6 +1273,7 @@ gb_internal Ast *ast_fixed_capacity_dynamic_array_type(AstFile *f, Token token, 
 }
 
 gb_internal Ast *ast_struct_type(AstFile *f, Token token, Slice<Ast *> fields, isize field_count,
+                     Slice<Ast *> methods,
                      Ast *polymorphic_params, bool is_packed, bool is_raw_union, bool is_all_or_none, bool is_simple,
                      Ast *align, Ast *min_field_align, Ast *max_field_align,
                      Token where_token, Array<Ast *> const &where_clauses) {
@@ -1279,6 +1281,7 @@ gb_internal Ast *ast_struct_type(AstFile *f, Token token, Slice<Ast *> fields, i
 	result->StructType.token              = token;
 	result->StructType.fields             = fields;
 	result->StructType.field_count        = field_count;
+	result->StructType.methods            = methods;
 	result->StructType.polymorphic_params = polymorphic_params;
 	result->StructType.is_packed          = is_packed;
 	result->StructType.is_raw_union       = is_raw_union;
@@ -2100,8 +2103,8 @@ gb_internal Array<Ast *> parse_rhs_expr_list    (AstFile *f);
 gb_internal Ast *        parse_simple_stmt      (AstFile *f, u32 flags);
 gb_internal Ast *        parse_type             (AstFile *f);
 gb_internal Ast *        parse_call_expr        (AstFile *f, Ast *operand);
-gb_internal Ast *        parse_struct_field_list(AstFile *f, isize *name_count_);
-gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_flags, TokenKind follow, bool allow_default_parameters, bool allow_typeid_token);
+gb_internal Ast *        parse_struct_field_list(AstFile *f, isize *name_count_, Array<Ast *> *methods_out = nullptr);
+gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_flags, TokenKind follow, bool allow_default_parameters, bool allow_typeid_token, Array<Ast *> *methods_out = nullptr);
 gb_internal Ast *parse_unary_expr(AstFile *f, bool lhs);
 
 
@@ -2920,7 +2923,8 @@ gb_internal Ast *parse_operand(AstFile *f, bool lhs) {
 		Token open = expect_token_after(f, Token_OpenBrace, "struct");
 
 		isize name_count = 0;
-		Ast *fields = parse_struct_field_list(f, &name_count);
+		auto methods = array_make<Ast *>(ast_allocator(f));
+		Ast *fields = parse_struct_field_list(f, &name_count, &methods);
 		Token close = expect_closing_brace_of_field_list(f);
 
 		Slice<Ast *> decls = {};
@@ -2931,7 +2935,7 @@ gb_internal Ast *parse_operand(AstFile *f, bool lhs) {
 
 		parser_check_polymorphic_record_parameters(f, polymorphic_params);
 
-		return ast_struct_type(f, token, decls, name_count,
+		return ast_struct_type(f, token, decls, name_count, slice_from_array(methods),
 		                       polymorphic_params, is_packed, is_raw_union, is_all_or_none, is_simple,
 		                       align, min_field_align, max_field_align,
 		                       where_token, where_clauses);
@@ -4389,12 +4393,12 @@ gb_internal bool allow_field_separator(AstFile *f) {
 	return false;
 }
 
-gb_internal Ast *parse_struct_field_list(AstFile *f, isize *name_count_) {
+gb_internal Ast *parse_struct_field_list(AstFile *f, isize *name_count_, Array<Ast *> *methods_out) {
 	Token start_token = f->curr_token;
 
 	isize total_name_count = 0;
 
-	Ast *params = parse_field_list(f, &total_name_count, FieldFlag_Struct, Token_CloseBrace, false, false);
+	Ast *params = parse_field_list(f, &total_name_count, FieldFlag_Struct, Token_CloseBrace, false, false, methods_out);
 	if (name_count_) *name_count_ = total_name_count;
 	return params;
 }
@@ -4429,7 +4433,7 @@ gb_internal bool check_procedure_name_list(Array<Ast *> const &names) {
 	return any_polymorphic_names;
 }
 
-gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_flags, TokenKind follow, bool allow_default_parameters, bool allow_typeid_token) {
+gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_flags, TokenKind follow, bool allow_default_parameters, bool allow_typeid_token, Array<Ast *> *methods_out) {
 	bool prev_allow_newline = f->allow_newline;
 	defer (f->allow_newline = prev_allow_newline);
 	f->allow_newline = file_allow_newline(f);
@@ -4453,6 +4457,32 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 	       f->curr_token.kind != Token_Colon &&
 	       f->curr_token.kind != Token_EOF) {
 		if (!is_signature) parse_enforce_tabs(f);
+
+		// In-struct method decl: `name :: proc(...)`. Only recognised when
+		// the caller passed `methods_out` (currently struct bodies). We
+		// parse the proc literal directly (rather than via parse_value_decl)
+		// because the latter calls parse_rhs_expr_list, which would consume
+		// the trailing `,` that separates struct fields.
+		if (methods_out != nullptr &&
+		    f->curr_token.kind == Token_Ident &&
+		    peek_token_n(f, 0).kind == Token_Colon &&
+		    peek_token_n(f, 1).kind == Token_Colon &&
+		    peek_token_n(f, 2).kind == Token_proc) {
+			CommentGroup *method_docs = f->lead_comment;
+			Token name_token = expect_token(f, Token_Ident);
+			expect_token(f, Token_Colon);
+			expect_token(f, Token_Colon);
+			Ast *proc_lit = parse_expr(f, false);
+			auto method_names = array_make<Ast *>(ast_allocator(f), 0, 1);
+			array_add(&method_names, ast_ident(f, name_token));
+			auto method_values = array_make<Ast *>(ast_allocator(f), 0, 1);
+			array_add(&method_values, proc_lit);
+			Ast *method = ast_value_decl(f, method_names, nullptr, method_values, false, method_docs, f->line_comment);
+			array_add(methods_out, method);
+			allow_field_separator(f);
+			continue;
+		}
+
 		u32 flags = parse_field_prefixes(f);
 		Ast *param = parse_var_type(f, allow_ellipsis, allow_typeid_token);
 		if (param->kind == Ast_Ellipsis) {
@@ -4575,6 +4605,30 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 		CommentGroup *docs = f->lead_comment;
 
 		if (!is_signature) parse_enforce_tabs(f);
+
+		// In-struct method decl: `name :: proc(...)`. Same detection as the
+		// first loop above — see comment there.
+		if (methods_out != nullptr &&
+		    f->curr_token.kind == Token_Ident &&
+		    peek_token_n(f, 0).kind == Token_Colon &&
+		    peek_token_n(f, 1).kind == Token_Colon &&
+		    peek_token_n(f, 2).kind == Token_proc) {
+			Token name_token = expect_token(f, Token_Ident);
+			expect_token(f, Token_Colon);
+			expect_token(f, Token_Colon);
+			Ast *proc_lit = parse_expr(f, false);
+			auto method_names = array_make<Ast *>(ast_allocator(f), 0, 1);
+			array_add(&method_names, ast_ident(f, name_token));
+			auto method_values = array_make<Ast *>(ast_allocator(f), 0, 1);
+			array_add(&method_values, proc_lit);
+			Ast *method = ast_value_decl(f, method_names, nullptr, method_values, false, docs, f->line_comment);
+			array_add(methods_out, method);
+			if (!allow_field_separator(f)) {
+				break;
+			}
+			continue;
+		}
+
 		u32 set_flags = parse_field_prefixes(f);
 		Token tag = {};
 		Array<Ast *> names = parse_ident_list(f, allow_poly_names);
@@ -6760,6 +6814,80 @@ gb_internal bool parse_file_tag(const String &lc, const Token &tok, AstFile *f) 
 	return true;
 }
 
+// Lifts in-struct method decls to top-level package-scope ValueDecls.
+// For each `Name :: struct { ... <method_name> :: proc(...) {...} ... }`
+// top-level decl, synthesises a free `<method_name> :: proc(using self:
+// ^Name, ...) {...}` decl and appends it to the file's decls list.
+// The method's body is preserved as-is; `using self` makes the struct's
+// fields directly accessible without a `self.` prefix (full OO
+// ergonomics, per the Methodin design call).
+//
+// Anonymous inline structs (not bound to a top-level name) cannot have
+// methods lifted anywhere meaningful, so any methods declared in them
+// are silently dropped here. Polymorphic struct parameters are not
+// supported in this first cut.
+gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
+	isize original_count = decls_out->count;
+	for (isize i = 0; i < original_count; i++) {
+		Ast *decl = (*decls_out)[i];
+		if (decl->kind != Ast_ValueDecl) continue;
+		if (decl->ValueDecl.is_mutable) continue;
+		if (decl->ValueDecl.names.count != 1) continue;
+		if (decl->ValueDecl.values.count != 1) continue;
+
+		Ast *value = decl->ValueDecl.values[0];
+		if (value->kind != Ast_StructType) continue;
+
+		Ast *name_ident = decl->ValueDecl.names[0];
+		if (name_ident->kind != Ast_Ident) continue;
+
+		ast_node(st, StructType, value);
+		if (st->methods.count == 0) continue;
+
+		Token struct_name_token = name_ident->Ident.token;
+
+		for (Ast *method : st->methods) {
+			if (method->kind != Ast_ValueDecl) continue;
+			if (method->ValueDecl.values.count != 1) continue;
+
+			Ast *proc_lit = method->ValueDecl.values[0];
+			if (proc_lit->kind != Ast_ProcLit) continue;
+
+			Token caret_tok = {};
+			caret_tok.kind = Token_Pointer;
+			caret_tok.string = str_lit("^");
+			caret_tok.pos = struct_name_token.pos;
+
+			Ast *struct_name_ref = ast_ident(f, struct_name_token);
+			Ast *ptr_type = ast_pointer_type(f, caret_tok, struct_name_ref);
+
+			Token self_tok = {};
+			self_tok.kind = Token_Ident;
+			self_tok.string = str_lit("self");
+			self_tok.pos = struct_name_token.pos;
+
+			auto self_names = array_make<Ast *>(ast_allocator(f), 0, 1);
+			array_add(&self_names, ast_ident(f, self_tok));
+			Token blank_tag = {};
+			Ast *self_field = ast_field(f, self_names, ptr_type, nullptr, FieldFlag_using|FieldFlag_using_self_synth, blank_tag, nullptr, nullptr);
+
+			Ast *proc_type = proc_lit->ProcLit.type;
+			GB_ASSERT(proc_type->kind == Ast_ProcType);
+			Ast *params = proc_type->ProcType.params;
+			GB_ASSERT(params->kind == Ast_FieldList);
+
+			auto new_list = array_make<Ast *>(ast_allocator(f), 0, params->FieldList.list.count + 1);
+			array_add(&new_list, self_field);
+			for (Ast *existing : params->FieldList.list) {
+				array_add(&new_list, existing);
+			}
+			params->FieldList.list = slice_from_array(new_list);
+
+			array_add(decls_out, method);
+		}
+	}
+}
+
 gb_internal bool parse_file(Parser *p, AstFile *f) {
 	if (f->tokens.count == 0) {
 		return true;
@@ -6866,6 +6994,8 @@ gb_internal bool parse_file(Parser *p, AstFile *f) {
 				}
 			}
 		}
+
+		lift_struct_methods(f, &decls);
 
 		f->decls = slice_from_array(decls);
 

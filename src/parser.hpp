@@ -366,6 +366,12 @@ enum FieldFlag : u32 {
 
 	FieldFlag_no_capture  = 1<<11,
 
+	// Synthesised `using self: ^Struct` parameter on a lifted in-struct
+	// method. Same semantics as FieldFlag_using, but exempt from the
+	// `using-stmt` opt-in check (the user didn't write the `using`; the
+	// compiler did, as part of in-struct proc lowering).
+	FieldFlag_using_self_synth = 1<<12,
+
 	// Internal use by the parser only
 	FieldFlag_Tags      = 1<<15,
 	FieldFlag_Results   = 1<<16,
@@ -779,6 +785,7 @@ AST_KIND(_TypeBegin, "", bool) \
 		Token token;                \
 		Slice<Ast *> fields;        \
 		isize field_count;          \
+		Slice<Ast *> methods;       \
 		Ast *polymorphic_params;    \
 		Ast *align;                 \
 		Ast *min_field_align;       \

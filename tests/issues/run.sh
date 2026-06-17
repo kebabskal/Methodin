@@ -74,6 +74,8 @@ else
 fi
 $ODIN check ../test_issue_6484.odin -no-entry-point $COMMON
 
+$ODIN test ../test_pr_in_struct_procs.odin $COMMON
+
 set +x
 
 popd

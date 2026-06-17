@@ -1902,11 +1902,12 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 		Type *specialization = nullptr;
 
 		bool is_using = (p->flags&FieldFlag_using) != 0;
+		bool is_synth_using_self = (p->flags&FieldFlag_using_self_synth) != 0;
 
 
 		u64 feature_flags = check_feature_flags(ctx, param);
 
-		if (is_using && (feature_flags & OptInFeatureFlag_UsingStmt) == 0) {
+		if (is_using && !is_synth_using_self && (feature_flags & OptInFeatureFlag_UsingStmt) == 0) {
 			ERROR_BLOCK();
 			error(param, "'using' has been disallowed as it is considered bad practice to use as a statement/procedure parameter outside of immediate refactoring");
 			error_line("\tIf you do require it for refactoring purposes or legacy code, it can be enabled on a per-file basis with '#+feature using-stmt'\n");
