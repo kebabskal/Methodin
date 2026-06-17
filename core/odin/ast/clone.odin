@@ -283,6 +283,9 @@ clone_node :: proc(node: ^Node) -> ^Node {
 			r.attributes = clone_dynamic_array(r.attributes)
 			r.name = auto_cast clone(r.name)
 			r.fullpaths  = clone_array(r.fullpaths)
+		case ^Impl_Block:
+			r.type_expr = clone(r.type_expr)
+			r.methods   = clone(r.methods)
 		case ^Proc_Group:
 			r.args = clone(r.args)
 		case ^Attribute:

@@ -324,6 +324,14 @@ walk :: proc(v: ^Visitor, node: ^Node) {
 			walk(v, n.comment)
 		}
 		walk_expr_list(v, n.fullpaths)
+	case ^Impl_Block:
+		if n.docs != nil {
+			walk(v, n.docs)
+		}
+		if n.type_expr != nil {
+			walk(v, n.type_expr)
+		}
+		walk_stmt_list(v, n.methods)
 
 	case ^Proc_Group:
 		walk_expr_list(v, n.args)

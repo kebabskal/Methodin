@@ -1371,7 +1371,71 @@ parse_unrolled_for_loop :: proc(p: ^Parser, inline_tok: tokenizer.Token) -> ^ast
 	return range_stmt
 }
 
+parse_impl_block :: proc(p: ^Parser) -> ^ast.Stmt {
+	docs := p.lead_comment
+	impl_tok := expect_token(p, .Ident)
+	type_expr := parse_type(p)
+	skip_possible_newline_for_literal(p)
+	open := expect_token(p, .Open_Brace)
+	_ = open
+
+	methods: [dynamic]^ast.Stmt
+
+	for p.curr_tok.kind != .Close_Brace && p.curr_tok.kind != .EOF {
+		if p.curr_tok.kind != .Ident ||
+		   !peek_token_kind(p, .Colon, 0) ||
+		   !peek_token_kind(p, .Colon, 1) ||
+		   !peek_token_kind(p, .Proc,  2) {
+			error(p, p.curr_tok.pos, "expected a method declaration `name :: proc(...) {...}` inside impl block")
+			advance_token(p)
+			continue
+		}
+
+		method_docs := p.lead_comment
+		name_tok := expect_token(p, .Ident)
+		expect_token(p, .Colon)
+		expect_token(p, .Colon)
+		value := parse_expr(p, false)
+
+		name_ident := ast.new(ast.Ident, name_tok.pos, end_pos(name_tok))
+		name_ident.name = name_tok.text
+
+		names := make([]^ast.Expr, 1)
+		names[0] = name_ident
+		values := make([]^ast.Expr, 1)
+		values[0] = value
+
+		vd := ast.new(ast.Value_Decl, name_tok.pos, value.end)
+		vd.names      = names
+		vd.values     = values
+		vd.is_mutable = false
+		vd.docs       = method_docs
+		append(&methods, cast(^ast.Stmt)vd)
+
+		allow_token(p, .Comma)
+		for tokenizer.is_newline(p.curr_tok) {
+			advance_token(p)
+		}
+	}
+
+	close := expect_token(p, .Close_Brace)
+	ib := ast.new(ast.Impl_Block, impl_tok.pos, end_pos(close))
+	ib.impl_tok  = impl_tok
+	ib.type_expr = type_expr
+	ib.methods   = methods[:]
+	ib.docs      = docs
+	return ib
+}
+
 parse_stmt :: proc(p: ^Parser) -> ^ast.Stmt {
+	// Contextual `impl <Type> { ... }` block. `impl` isn't a reserved
+	// keyword; only treated as a block introducer when shape matches.
+	if p.curr_tok.kind == .Ident && p.curr_tok.text == "impl" &&
+	   peek_token_kind(p, .Ident, 0) &&
+	   peek_token_kind(p, .Open_Brace, 1) {
+		return parse_impl_block(p)
+	}
+
 	#partial switch p.curr_tok.kind {
 	case .Inline:
 		if peek_token_kind(p, .For) {
@@ -1950,7 +2014,46 @@ parse_ident_list :: proc(p: ^Parser, allow_poly_names: bool) -> []^ast.Expr {
 
 
 
-parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags: ast.Field_Flags) -> (field_list: ^ast.Field_List, total_name_count: int) {
+// `methods_out`, when non-nil, enables in-struct method-decl parsing
+// (`name :: proc(...) {...}`) inside the field list. The methods are
+// appended to it and excluded from the regular field list.
+parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags: ast.Field_Flags, methods_out: ^[dynamic]^ast.Stmt = nil) -> (field_list: ^ast.Field_List, total_name_count: int) {
+	try_parse_in_struct_method :: proc(p: ^Parser, methods_out: ^[dynamic]^ast.Stmt) -> bool {
+		if methods_out == nil do return false
+		if p.curr_tok.kind != .Ident do return false
+		if !peek_token_kind(p, .Colon, 0) do return false
+		if !peek_token_kind(p, .Colon, 1) do return false
+		if !peek_token_kind(p, .Proc,  2) do return false
+
+		docs := p.lead_comment
+		name_tok := expect_token(p, .Ident)
+		expect_token(p, .Colon)
+		expect_token(p, .Colon)
+		value := parse_expr(p, false)
+
+		name_ident := ast.new(ast.Ident, name_tok.pos, end_pos(name_tok))
+		name_ident.name = name_tok.text
+
+		names := make([]^ast.Expr, 1)
+		names[0] = name_ident
+		values := make([]^ast.Expr, 1)
+		values[0] = value
+
+		vd := ast.new(ast.Value_Decl, name_tok.pos, value.end)
+		vd.names      = names
+		vd.values     = values
+		vd.is_mutable = false
+		vd.docs       = docs
+		append(methods_out, cast(^ast.Stmt)vd)
+
+		allow_token(p, .Comma)
+		for tokenizer.is_newline(p.curr_tok) {
+			advance_token(p)
+		}
+		return true
+	}
+	_ = try_parse_in_struct_method // suppress unused-proc when methods_out == nil at the call site
+
 	handle_field :: proc(p: ^Parser,
 	                     seen_ellipsis: ^bool, fields: ^[dynamic]^ast.Field,
 	                     docs: ^ast.Comment_Group,
@@ -2067,6 +2170,9 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 	for p.curr_tok.kind != follow &&
 	    p.curr_tok.kind != .Colon &&
 	    p.curr_tok.kind != .EOF {
+		if try_parse_in_struct_method(p, methods_out) {
+			continue
+		}
 		prefix_flags := parse_field_prefixes(p)
 		param := parse_var_type(p, allowed_flags & {.Typeid_Token, .Ellipsis})
 		if _, ok := param.derived.(^ast.Ellipsis); ok {
@@ -2124,6 +2230,9 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 
 		for p.curr_tok.kind != follow && p.curr_tok.kind != .EOF {
 			docs = p.lead_comment
+			if try_parse_in_struct_method(p, methods_out) {
+				continue
+			}
 			set_flags = parse_field_prefixes(p)
 			names = parse_ident_list(p, allow_poly_names)
 
@@ -2830,7 +2939,8 @@ parse_operand :: proc(p: ^Parser, lhs: bool) -> ^ast.Expr {
 
 		skip_possible_newline_for_literal(p)
 		expect_token(p, .Open_Brace)
-		fields, name_count = parse_field_list(p, .Close_Brace, ast.Field_Flags_Struct)
+		methods: [dynamic]^ast.Stmt
+		fields, name_count = parse_field_list(p, .Close_Brace, ast.Field_Flags_Struct, &methods)
 		close := expect_closing_brace_of_field_list(p)
 
 		st := ast.new(ast.Struct_Type, tok.pos, end_pos(close))
@@ -2847,6 +2957,7 @@ parse_operand :: proc(p: ^Parser, lhs: bool) -> ^ast.Expr {
 		st.name_count        = name_count
 		st.where_token       = where_token
 		st.where_clauses     = where_clauses
+		st.methods           = methods[:]
 		return st
 
 	case .Union:
