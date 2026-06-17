@@ -172,3 +172,44 @@ test_method_calls_method_via_self :: proc(t: ^testing.T) {
 	testing.expect_value(t, a.balance, 70)
 	testing.expect_value(t, b.balance, 30)
 }
+
+// Union variant dispatch: when every variant of a union has a method
+// of the same name, the compiler synthesises a dispatcher that
+// type-switches on the runtime variant and forwards to the matching
+// per-variant method. Calling `u.method(...)` on a union value then
+// works the same as calling it on a concrete variant.
+Cat :: struct {
+	noise: int,
+
+	speak :: proc() -> int {
+		noise += 1
+		return noise * 10
+	},
+}
+
+Mouse :: struct {
+	noise: int,
+
+	speak :: proc() -> int {
+		noise += 1
+		return noise
+	},
+}
+
+Critter :: union {
+	Cat,
+	Mouse,
+}
+
+@test
+test_union_dispatch :: proc(t: ^testing.T) {
+	critters: [2]Critter = {Cat{noise = 0}, Mouse{noise = 0}}
+
+	cat_first  := critters[0].speak() // → Cat__speak: noise=1, returns 10
+	mouse_first := critters[1].speak() // → Mouse__speak: noise=1, returns 1
+	cat_again  := critters[0].speak() // → Cat__speak: noise=2, returns 20
+
+	testing.expect_value(t, cat_first, 10)
+	testing.expect_value(t, mouse_first, 1)
+	testing.expect_value(t, cat_again, 20)
+}

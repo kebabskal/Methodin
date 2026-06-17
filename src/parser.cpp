@@ -6909,7 +6909,7 @@ gb_internal Ast *parse_impl_block(AstFile *f) {
 // Shared lowering for one method node: prepends `using self: ^Name` to
 // the proc literal's parameter list and appends the resulting decl
 // (which is the same ValueDecl node, mutated in place) to `decls_out`.
-gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Array<Ast *> *decls_out) {
+gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Array<Ast *> *decls_out, bool no_using_self = false) {
 	if (method->kind != Ast_ValueDecl) return;
 	if (method->ValueDecl.values.count != 1) return;
 
@@ -6932,7 +6932,8 @@ gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 	auto self_names = array_make<Ast *>(ast_allocator(f), 0, 1);
 	array_add(&self_names, ast_ident(f, self_tok));
 	Token blank_tag = {};
-	Ast *self_field = ast_field(f, self_names, ptr_type, nullptr, FieldFlag_using|FieldFlag_using_self_synth, blank_tag, nullptr, nullptr);
+	u32 self_flags = no_using_self ? 0u : (FieldFlag_using|FieldFlag_using_self_synth);
+	Ast *self_field = ast_field(f, self_names, ptr_type, nullptr, self_flags, blank_tag, nullptr, nullptr);
 
 	Ast *proc_type = proc_lit->ProcLit.type;
 	GB_ASSERT(proc_type->kind == Ast_ProcType);
@@ -6952,6 +6953,7 @@ gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 struct PendingMethod {
 	Ast *method;             // Ast_ValueDecl wrapping the proc literal
 	Token struct_name_token; // owning struct's name token
+	bool no_using_self;      // true for union dispatchers: prepend `self: ^Union` without `using`
 };
 
 // Builds `Struct__name` as a permanent String for the mangled per-struct
@@ -6960,6 +6962,187 @@ gb_internal String mangle_method_name(String struct_name, String method_name) {
 	gbString s = gb_string_make(permanent_allocator(), "");
 	s = gb_string_append_fmt(s, "%.*s__%.*s", LIT(struct_name), LIT(method_name));
 	return make_string_c(s);
+}
+
+// Builds a synthetic dispatcher value-decl:
+//
+//     <method_name> :: proc(<cloned params>) <-> <cloned results> {
+//         switch &v in self^ {
+//         case <V1>: v.<method_name>(<param idents>)
+//         case <V2>: ...
+//         }
+//     }
+//
+// The dispatcher is left without a receiver here; `lift_one_method`
+// prepends `using self: ^Union` to its params during the normal lift
+// pass, which is what makes `self^` resolve in the body. The body's
+// `v.<method_name>(...)` is plain UFCS — overload resolution on the
+// variant type picks the right per-variant method.
+gb_internal Ast *build_union_dispatcher(AstFile *f, Token union_name_token,
+                                        String method_name, Slice<Ast *> variant_idents,
+                                        Ast *sample_method) {
+	Token pos_tok = union_name_token;
+
+	auto blank_token = []() { Token t = {}; return t; };
+
+	// Clone the sample method's proc-type params and results so we
+	// don't share mutable AST with the sample method (which will get
+	// its own `using self: ^Variant` injected later).
+	Ast *sample_pl = sample_method->ValueDecl.values[0];
+	Ast *sample_pt = sample_pl->ProcLit.type;
+	Ast *cloned_params  = clone_ast(sample_pt->ProcType.params, f);
+	Ast *cloned_results = clone_ast(sample_pt->ProcType.results, f);
+
+	// Collect names of every result slot. Returning procs need named
+	// returns so the switch cases can write to them and the dispatcher
+	// can end with `return` — without that the checker would reject the
+	// body since it can't see the type-switch as exhaustive even when
+	// every variant has a `case`. Result fields without source-level
+	// names get synth names (`__ret0`, ...).
+	auto result_name_idents = array_make<Ast *>(ast_allocator(f));
+	if (cloned_results != nullptr) {
+		isize next_idx = 0;
+		for (Ast *field : cloned_results->FieldList.list) {
+			isize existing = field->Field.names.count;
+			if (existing > 0) {
+				for (Ast *name : field->Field.names) {
+					if (name->kind == Ast_Ident) {
+						array_add(&result_name_idents, ast_ident(f, name->Ident.token));
+					}
+				}
+				next_idx += existing;
+			} else {
+				Token synth = {};
+				synth.kind = Token_Ident;
+				gbString s = gb_string_make(permanent_allocator(), "");
+				s = gb_string_append_fmt(s, "__ret%lld", cast(long long)next_idx);
+				synth.string = make_string_c(s);
+				synth.pos = pos_tok.pos;
+				auto names = array_make<Ast *>(ast_allocator(f), 0, 1);
+				array_add(&names, ast_ident(f, synth));
+				field->Field.names = slice_from_array(names);
+				array_add(&result_name_idents, ast_ident(f, synth));
+				next_idx += 1;
+			}
+		}
+	}
+	bool returning = result_name_idents.count > 0;
+
+	// Collect arg-name idents from the cloned params so the body can
+	// forward them by name. Fields can carry multiple names, so flatten.
+	auto arg_idents = array_make<Ast *>(ast_allocator(f));
+	if (cloned_params != nullptr) {
+		for (Ast *field : cloned_params->FieldList.list) {
+			for (Ast *name : field->Field.names) {
+				if (name->kind == Ast_Ident) {
+					array_add(&arg_idents, ast_ident(f, name->Ident.token));
+				}
+			}
+		}
+	}
+
+	// Build cases: `case <Variant>: v.<method>(<args>)`
+	auto cases = array_make<Ast *>(ast_allocator(f));
+	for (Ast *variant : variant_idents) {
+		Token v_tok = {}; v_tok.kind = Token_Ident; v_tok.string = str_lit("v"); v_tok.pos = pos_tok.pos;
+		Ast *v_ident = ast_ident(f, v_tok);
+
+		Token method_tok = {}; method_tok.kind = Token_Ident;
+		method_tok.string = method_name; method_tok.pos = pos_tok.pos;
+		Ast *method_ident = ast_ident(f, method_tok);
+
+		Token dot_tok = {}; dot_tok.kind = Token_Period; dot_tok.string = str_lit("."); dot_tok.pos = pos_tok.pos;
+		Ast *selector = ast_selector_expr(f, dot_tok, v_ident, method_ident);
+
+		// Clone the arg idents for this case (one Ident node per use).
+		auto call_args = array_make<Ast *>(ast_allocator(f));
+		for (Ast *arg : arg_idents) {
+			array_add(&call_args, ast_ident(f, arg->Ident.token));
+		}
+
+		Token open_tok = {}; open_tok.kind = Token_OpenParen; open_tok.string = str_lit("("); open_tok.pos = pos_tok.pos;
+		Token close_tok = {}; close_tok.kind = Token_CloseParen; close_tok.string = str_lit(")"); close_tok.pos = pos_tok.pos;
+		Token ellipsis_tok = blank_token();
+		Ast *call = ast_call_expr(f, selector, call_args, open_tok, close_tok, ellipsis_tok);
+
+		Ast *stmt;
+		if (returning) {
+			// `<ret>, <ret>... = v.method(args...)` — write into named
+			// returns so the trailing `return` after the switch picks
+			// them up.
+			auto lhs = array_make<Ast *>(ast_allocator(f), 0, result_name_idents.count);
+			for (Ast *rn : result_name_idents) {
+				array_add(&lhs, ast_ident(f, rn->Ident.token));
+			}
+			auto rhs = array_make<Ast *>(ast_allocator(f), 0, 1);
+			array_add(&rhs, call);
+			Token eq_tok = {}; eq_tok.kind = Token_Eq; eq_tok.string = str_lit("="); eq_tok.pos = pos_tok.pos;
+			stmt = ast_assign_stmt(f, eq_tok, lhs, rhs);
+		} else {
+			stmt = ast_expr_stmt(f, call);
+		}
+
+		auto list = array_make<Ast *>(ast_allocator(f), 0, 1);
+		array_add(&list, clone_ast(variant, f));
+		auto stmts = array_make<Ast *>(ast_allocator(f), 0, 1);
+		array_add(&stmts, stmt);
+		Token case_tok = {}; case_tok.kind = Token_case; case_tok.string = str_lit("case"); case_tok.pos = pos_tok.pos;
+		Ast *clause = ast_case_clause(f, case_tok, list, stmts);
+		array_add(&cases, clause);
+	}
+
+	// Switch body: BlockStmt holding the case clauses.
+	Token open_brace = {}; open_brace.kind = Token_OpenBrace; open_brace.string = str_lit("{"); open_brace.pos = pos_tok.pos;
+	Token close_brace = {}; close_brace.kind = Token_CloseBrace; close_brace.string = str_lit("}"); close_brace.pos = pos_tok.pos;
+	Ast *switch_body = ast_block_stmt(f, cases, open_brace, close_brace);
+
+	// `switch &v in self^`
+	Token v_tok = {}; v_tok.kind = Token_Ident; v_tok.string = str_lit("v"); v_tok.pos = pos_tok.pos;
+	Token self_tok = {}; self_tok.kind = Token_Ident; self_tok.string = str_lit("self"); self_tok.pos = pos_tok.pos;
+	Ast *v_ident = ast_ident(f, v_tok);
+	Token amp_tok = {}; amp_tok.kind = Token_And; amp_tok.string = str_lit("&"); amp_tok.pos = pos_tok.pos;
+	Ast *amp_v = ast_unary_expr(f, amp_tok, v_ident);
+	Ast *self_ident = ast_ident(f, self_tok);
+	Token caret_tok = {}; caret_tok.kind = Token_Pointer; caret_tok.string = str_lit("^"); caret_tok.pos = pos_tok.pos;
+	Ast *self_deref = ast_deref_expr(f, self_ident, caret_tok);
+
+	auto lhs = array_make<Ast *>(ast_allocator(f), 0, 1); array_add(&lhs, amp_v);
+	auto rhs = array_make<Ast *>(ast_allocator(f), 0, 1); array_add(&rhs, self_deref);
+	Token in_tok = {}; in_tok.kind = Token_in; in_tok.string = str_lit("in"); in_tok.pos = pos_tok.pos;
+	Ast *tag = ast_assign_stmt(f, in_tok, lhs, rhs);
+
+	Token switch_tok = {}; switch_tok.kind = Token_switch; switch_tok.string = str_lit("switch"); switch_tok.pos = pos_tok.pos;
+	Ast *type_switch = ast_type_switch_stmt(f, switch_tok, tag, switch_body);
+
+	// Outer body of dispatcher proc: BlockStmt holding the type switch
+	// and, when the proc returns, a trailing `return` that picks up the
+	// named result variables.
+	auto body_stmts = array_make<Ast *>(ast_allocator(f), 0, 2);
+	array_add(&body_stmts, type_switch);
+	if (returning) {
+		Token return_tok = {}; return_tok.kind = Token_return; return_tok.string = str_lit("return"); return_tok.pos = pos_tok.pos;
+		auto empty_results = array_make<Ast *>(ast_allocator(f));
+		Ast *ret_stmt = ast_return_stmt(f, return_tok, empty_results);
+		array_add(&body_stmts, ret_stmt);
+	}
+	Ast *body = ast_block_stmt(f, body_stmts, open_brace, close_brace);
+
+	// Dispatcher proc-lit and outer value-decl.
+	Token proc_tok = {}; proc_tok.kind = Token_proc; proc_tok.string = str_lit("proc"); proc_tok.pos = pos_tok.pos;
+	Ast *proc_type = ast_proc_type(f, proc_tok, cloned_params, cloned_results,
+	                                0, ProcCC_Odin, /*generic*/false, /*diverging*/false);
+	auto where_clauses = array_make<Ast *>(ast_allocator(f));
+	Ast *proc_lit = ast_proc_lit(f, proc_type, body, 0, blank_token(), where_clauses);
+
+	Token method_name_tok = {};
+	method_name_tok.kind = Token_Ident;
+	method_name_tok.string = method_name;
+	method_name_tok.pos = pos_tok.pos;
+	auto vd_names  = array_make<Ast *>(ast_allocator(f), 0, 1);
+	array_add(&vd_names, ast_ident(f, method_name_tok));
+	auto vd_values = array_make<Ast *>(ast_allocator(f), 0, 1);
+	array_add(&vd_values, proc_lit);
+	return ast_value_decl(f, vd_names, nullptr, vd_values, /*is_mutable*/false, nullptr, nullptr);
 }
 
 gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
@@ -7010,6 +7193,85 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 		}
 	}
 
+	// Pass 1.5: for every union whose variants are simple idents, find
+	// methods present on every variant and synthesise a dispatcher per
+	// method. The dispatcher is just another pending method scoped to
+	// the union's name — Pass 2 mangles + groups it together with the
+	// per-variant methods, so unqualified UFCS calls on a value of the
+	// union type land in the dispatcher (which then type-switches and
+	// forwards to the right variant).
+	for (isize i = 0; i < original_count; i++) {
+		Ast *decl = (*decls_out)[i];
+		if (decl->kind != Ast_ValueDecl) continue;
+		if (decl->ValueDecl.is_mutable) continue;
+		if (decl->ValueDecl.names.count != 1) continue;
+		if (decl->ValueDecl.values.count != 1) continue;
+		Ast *value = decl->ValueDecl.values[0];
+		if (value->kind != Ast_UnionType) continue;
+		Ast *union_name_ast = decl->ValueDecl.names[0];
+		if (union_name_ast->kind != Ast_Ident) continue;
+		Token union_name_token = union_name_ast->Ident.token;
+
+		ast_node(ut, UnionType, value);
+		if (ut->variants.count == 0) continue;
+
+		// Variants must all be simple idents for the lookup to work.
+		// (Parametric / qualified variants are out of scope for this slice.)
+		auto variant_idents = array_make<Ast *>(temporary_allocator());
+		bool variants_ok = true;
+		for (Ast *variant : ut->variants) {
+			if (variant->kind != Ast_Ident) { variants_ok = false; break; }
+			array_add(&variant_idents, variant);
+		}
+		if (!variants_ok) continue;
+
+		// For each method name on the first variant, check if every
+		// other variant also has a pending method with that name.
+		// Stash a sample method to clone signature info from.
+		Slice<Ast *> variants_slice = slice_from_array(variant_idents);
+		String first_variant = variant_idents[0]->Ident.token.string;
+
+		auto seen_method_names = array_make<String>(temporary_allocator());
+
+		for (PendingMethod const &pm : pending) {
+			if (pm.struct_name_token.string != first_variant) continue;
+			Ast *method = pm.method;
+			if (method->kind != Ast_ValueDecl) continue;
+			if (method->ValueDecl.names.count != 1) continue;
+			if (method->ValueDecl.names[0]->kind != Ast_Ident) continue;
+			String name = method->ValueDecl.names[0]->Ident.token.string;
+
+			bool already_seen = false;
+			for (String const &n : seen_method_names) {
+				if (n == name) { already_seen = true; break; }
+			}
+			if (already_seen) continue;
+			array_add(&seen_method_names, name);
+
+			// Check that every remaining variant also has `name`.
+			bool all_have_it = true;
+			for (isize vi = 1; vi < variant_idents.count; vi++) {
+				String v_name = variant_idents[vi]->Ident.token.string;
+				bool found = false;
+				for (PendingMethod const &pm2 : pending) {
+					if (pm2.struct_name_token.string != v_name) continue;
+					Ast *m2 = pm2.method;
+					if (m2->kind != Ast_ValueDecl) continue;
+					if (m2->ValueDecl.names.count != 1) continue;
+					if (m2->ValueDecl.names[0]->kind != Ast_Ident) continue;
+					if (m2->ValueDecl.names[0]->Ident.token.string == name) {
+						found = true; break;
+					}
+				}
+				if (!found) { all_have_it = false; break; }
+			}
+			if (!all_have_it) continue;
+
+			Ast *dispatcher = build_union_dispatcher(f, union_name_token, name, variants_slice, method);
+			array_add(&pending, PendingMethod{dispatcher, union_name_token, /*no_using_self*/true});
+		}
+	}
+
 	// Pass 2: group by user-visible method name, lift each group.
 	// O(N^2) over collected methods — N is small in practice (the
 	// number of in-struct / impl methods declared in one file).
@@ -7047,7 +7309,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 
 		if (group_indices.count == 1) {
 			// No collision — lift with the user-visible name.
-			lift_one_method(f, pending[i].method, pending[i].struct_name_token, decls_out);
+			lift_one_method(f, pending[i].method, pending[i].struct_name_token, decls_out, pending[i].no_using_self);
 			continue;
 		}
 
@@ -7064,7 +7326,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			mangled_tok.string = mangle_method_name(pm.struct_name_token.string, method_name);
 			name_ident->Ident.token = mangled_tok;
 
-			lift_one_method(f, pm.method, pm.struct_name_token, decls_out);
+			lift_one_method(f, pm.method, pm.struct_name_token, decls_out, pm.no_using_self);
 
 			array_add(&group_members, ast_ident(f, mangled_tok));
 		}
