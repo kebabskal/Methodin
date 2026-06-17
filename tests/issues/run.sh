@@ -85,6 +85,8 @@ $ODIN check ../test_issue_6979.odin -no-entry-point $COMMON
 clang -c ../test_issue_7010.c -o test_issue_7010_c.o
 $ODIN test ../test_issue_7010.odin $COMMON
 
+$ODIN test ../test_pr_in_struct_procs.odin $COMMON
+
 set +x
 
 popd
