@@ -84,3 +84,37 @@ test_impl_block :: proc(t: ^testing.T) {
 	testing.expect_value(t, b.h, 8)
 	testing.expect_value(t, b.area(), 48)
 }
+
+// Two structs in the same file declaring methods with the same name.
+// Lifted versions are mangled (`Hero__attack`, `Goblin__attack`) and
+// merged into a synthesised proc group `attack`. UFCS resolution
+// auto-`&`s the receiver and overload resolution picks the right
+// member by first-arg type.
+Hero :: struct {
+	mp: int,
+	attack :: proc() -> int {
+		mp -= 1
+		return 50
+	},
+}
+
+Goblin :: struct {
+	rage: int,
+	attack :: proc() -> int {
+		rage += 1
+		return 10 * rage
+	},
+}
+
+@test
+test_method_name_collision_becomes_proc_group :: proc(t: ^testing.T) {
+	h := Hero{mp = 5}
+	g := Goblin{rage = 0}
+
+	testing.expect_value(t, h.attack(), 50)
+	testing.expect_value(t, h.mp, 4)
+
+	testing.expect_value(t, g.attack(), 10)
+	testing.expect_value(t, g.attack(), 20)
+	testing.expect_value(t, g.rage, 2)
+}
