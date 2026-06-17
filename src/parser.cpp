@@ -6919,7 +6919,20 @@ gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 	if (method->kind != Ast_ValueDecl) return;
 	if (method->ValueDecl.values.count != 1) return;
 
-	Ast *proc_lit = method->ValueDecl.values[0];
+	Ast *value = method->ValueDecl.values[0];
+
+	// `name :: proc { A, B }` declared inside a struct body: this is a
+	// user-written procedure group, not an in-struct proc. Lift it to
+	// file scope unchanged — the inner names already refer to the
+	// lifted free procs (or to other file-scope procs), and there's no
+	// receiver to inject. UFCS on `x.name(...)` then runs the normal
+	// proc-group overload resolution.
+	if (value->kind == Ast_ProcGroup) {
+		array_add(decls_out, method);
+		return;
+	}
+
+	Ast *proc_lit = value;
 	if (proc_lit->kind != Ast_ProcLit) return;
 
 	Token caret_tok = {};

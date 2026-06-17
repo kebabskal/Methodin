@@ -339,6 +339,38 @@ Grid :: struct {
 	},
 }
 
+// User-written procedure groups inside a struct body: `name :: proc { A, B }`
+// gets lifted to file scope unchanged. The inner names (A, B) resolve to
+// the lifted free procs in the same package, so UFCS on `x.name(...)`
+// runs the proc-group overload resolution by receiver-arg type.
+Bag :: struct {
+	items: [4]int,
+
+	put_one :: proc(x: int) {
+		items[0] = x
+	},
+
+	put_many :: proc(xs: []int) {
+		for x, i in xs {
+			if i < len(items) do items[i] = x
+		}
+	},
+
+	put :: proc { put_one, put_many },
+}
+
+@test
+test_in_struct_proc_group_overload :: proc(t: ^testing.T) {
+	b: Bag
+	b.put(7)                  // dispatches to Bag.put_one
+	testing.expect_value(t, b.items[0], 7)
+
+	b.put([]int{10, 20, 30})  // dispatches to Bag.put_many
+	testing.expect_value(t, b.items[0], 10)
+	testing.expect_value(t, b.items[1], 20)
+	testing.expect_value(t, b.items[2], 30)
+}
+
 @test
 test_using_pointer_param_address_of_field :: proc(t: ^testing.T) {
 	g: Grid
