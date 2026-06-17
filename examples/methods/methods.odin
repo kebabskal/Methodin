@@ -13,8 +13,11 @@
 package main
 
 import "core:fmt"
+import "./physics"
 
-Vec2 :: struct { x, y: f32 }
+Vec2 :: struct {
+	x, y: f32,
+}
 
 // A handful of free procedures that take a Vec2 (or ^Vec2) as the first
 // parameter. With UFCS these read like methods at the call site.
@@ -24,11 +27,11 @@ add :: proc(a, b: Vec2) -> Vec2 {
 }
 
 dot :: proc(a, b: Vec2) -> f32 {
-	return a.x*b.x + a.y*b.y
+	return a.x * b.x + a.y * b.y
 }
 
 length_squared :: proc(v: Vec2) -> f32 {
-	return v.x*v.x + v.y*v.y
+	return v.x * v.x + v.y * v.y
 }
 
 scale_by :: proc(v: ^Vec2, k: f32) {
@@ -48,8 +51,8 @@ step :: proc(p: ^Player, dt: f32) {
 	// `p.vel.scale_by(...)` — receiver `p.vel` is addressable
 	// (it's a field of `p^`), so the compiler auto-takes its address
 	// to match scale_by's `^Vec2` parameter.
-	p.vel.scale_by(0.98)            // drag
-	p.pos = p.pos.add(p.vel)        // value receiver, no auto-&
+	p.vel.scale_by(0.98) // drag
+	p.pos = p.pos.add(p.vel) // value receiver, no auto-&
 }
 
 damage :: proc(p: ^Player, amount: int) {
@@ -61,26 +64,42 @@ damage :: proc(p: ^Player, amount: int) {
 // variants, so there's no vtable. Each variant is a plain struct that can
 // also carry its own methods.
 
-Circle    :: struct { r: f32 }
-Rectangle :: struct { w, h: f32 }
-Triangle  :: struct { base, height: f32 }
+Circle :: struct {
+	r: f32,
+}
+Rectangle :: struct {
+	w, h: f32,
+}
+Triangle :: struct {
+	base, height: f32,
+}
 
-Shape :: union { Circle, Rectangle, Triangle }
+Shape :: union {
+	Circle,
+	Rectangle,
+	Triangle,
+}
 
 area :: proc(s: Shape) -> f32 {
 	switch v in s {
-	case Circle:    return 3.14159265 * v.r * v.r
-	case Rectangle: return v.w * v.h
-	case Triangle:  return 0.5 * v.base * v.height
+	case Circle:
+		return 3.14159265 * v.r * v.r
+	case Rectangle:
+		return v.w * v.h
+	case Triangle:
+		return 0.5 * v.base * v.height
 	}
 	return 0
 }
 
 scale :: proc(s: ^Shape, k: f32) {
 	switch &v in s {
-	case Circle:    v.r *= k
-	case Rectangle: v.w *= k; v.h *= k
-	case Triangle:  v.base *= k; v.height *= k
+	case Circle:
+		v.r *= k
+	case Rectangle:
+		v.w *= k; v.h *= k
+	case Triangle:
+		v.base *= k; v.height *= k
 	}
 }
 
@@ -94,17 +113,65 @@ total_area :: proc(shapes: []Shape) -> f32 {
 	return sum
 }
 
+// --- inheritance-style sharing via `using` + UFCS ---
+//
+// `using` makes a struct's fields available on the outer struct, and UFCS
+// walks the `using` chain when resolving a method that isn't a field. So a
+// free proc that takes `^Mob` as its first parameter is callable on any
+// struct that embeds Mob — through any depth of nesting — without
+// registering anything anywhere.
+
+Mob :: struct {
+	mob_hp: int,
+}
+
+mob_damage :: proc(m: ^Mob, amount: int) {
+	m.mob_hp -= amount
+}
+
+mob_heal :: proc(m: ^Mob, amount: int) {
+	m.mob_hp += amount
+}
+
+// Goblin embeds Mob. `g.mob_damage(...)` walks the `using mob: Mob` and
+// lands on the free proc above; the auto-& takes the address of `g.mob`.
+
+Goblin :: struct {
+	using mob: Mob,
+	loot:      int,
+}
+
+// Mage embeds Goblin which embeds Mob. UFCS walks two `using` hops to find
+// the Mob methods — the rule is transitive.
+
+Mage :: struct {
+	using goblin: Goblin,
+	mana:         int,
+}
+
+// Cross-package case: `Body` and its methods live in the sibling
+// `physics` package. `Entity` here in `main` embeds `physics.Body` with
+// `using`. `apply_force` and `integrate` aren't visible by name in
+// `main`, so UFCS walks the `using` chain into the field type's owning
+// package to find them — no `physics.apply_force(&e.body, ...)` needed.
+
+Entity :: struct {
+	using body: physics.Body,
+	name:       string,
+}
+
 main :: proc() {
 	// --- methods on a user struct ---
-	p := Player{
+	p := Player {
 		pos = Vec2{0, 0},
 		vel = Vec2{3, 4},
 		hp  = 100,
 	}
 
-	for _ in 0..<3 {
-		p.step(1.0/60)
+	for _ in 0 ..< 3 {
+		p.step(1.0 / 60)
 	}
+
 	p.damage(15)
 
 	fmt.printfln("player after 3 steps + 1 hit: pos=%v hp=%d", p.pos, p.hp)
@@ -147,7 +214,45 @@ main :: proc() {
 	// additive — every call is equivalent to its free-proc form.
 	speed_sq := dot(p.vel, p.vel)
 	speed_sq2 := p.vel.dot(p.vel)
-	fmt.assertf(speed_sq == speed_sq2, "UFCS and free-call must agree (%v vs %v)", speed_sq, speed_sq2)
+	fmt.assertf(
+		speed_sq == speed_sq2,
+		"UFCS and free-call must agree (%v vs %v)",
+		speed_sq,
+		speed_sq2,
+	)
+
+	// --- inheritance via `using` ---
+	// Mage embeds Goblin embeds Mob. None of `mob_damage`, `mob_heal` are
+	// defined on Mage or Goblin — they live on Mob. UFCS walks the `using`
+	// chain to find them, and the auto-& reaches into the right embedded
+	// field at the right depth (`&m.base.base` for the Mob layer).
+
+	m := Mage {
+		goblin = Goblin{mob = Mob{mob_hp = 50}, loot = 3},
+		mana = 100,
+	}
+
+	m.mob_damage(7) // → mob_damage(&m.goblin.mob, 7)
+	m.mob_heal(2) // → mob_heal(&m.goblin.mob, 2)
+
+	fmt.printfln("mage hp after damage+heal: %d (expected 45)", m.mob_hp)
+	fmt.assertf(m.mob_hp == 45, "expected mage hp 45, got %d", m.mob_hp)
+
+	// --- methods reaching across packages ---
+	// `apply_force` and `integrate` live in package `physics`, not `main`.
+	// `e.apply_force(...)` forces the lookup to walk `using body:
+	// physics.Body` and resolve into the physics package's scope.
+
+	e := Entity {
+		body = physics.Body{mass = 2},
+		name = "ball",
+	}
+
+	e.apply_force(0, 20) // → physics.apply_force(&e.body, 0, 20)
+	e.integrate(0.5) // → physics.integrate(&e.body, 0.5)
+
+	fmt.printfln("entity %q: pos=(%v, %v) v=(%v, %v)", e.name, e.x, e.y, e.vx, e.vy)
+	fmt.assertf(e.vy == 10 && e.y == 5, "expected vy=10 y=5, got vy=%v y=%v", e.vy, e.y)
 
 	fmt.println("OK")
 }

@@ -5762,6 +5762,131 @@ gb_internal Entity *check_entity_from_ident_or_selector(CheckerContext *c, Ast *
 }
 
 
+// ufcs_owning_package returns the package whose top-level scope is the right
+// place to search for a UFCS method on `t`: a Named type's defining package,
+// or `runtime` for built-in containers ([dynamic]T, []T, map[K]V, string,
+// cstring). Returns nullptr if no such package applies.
+gb_internal AstPackage *ufcs_owning_package(CheckerContext *c, Type *t) {
+	if (t == nullptr) return nullptr;
+	Type *named = nullptr;
+	if (t->kind == Type_Named) {
+		named = t;
+	} else {
+		Type *bt = base_type(t);
+		if (bt != nullptr && bt->kind == Type_Named) {
+			named = bt;
+		}
+	}
+	if (named != nullptr) {
+		Entity *tn = named->Named.type_name;
+		if (tn != nullptr) {
+			return tn->pkg;
+		}
+	}
+	Type *bt = base_type(t);
+	if (bt != nullptr) {
+		if (bt->kind == Type_DynamicArray ||
+		    bt->kind == Type_Slice ||
+		    bt->kind == Type_Map ||
+		    (bt->kind == Type_Basic && bt->Basic.kind == Basic_string) ||
+		    (bt->kind == Type_Basic && bt->Basic.kind == Basic_cstring)) {
+			return c->info->runtime_package;
+		}
+	}
+	return nullptr;
+}
+
+// try_ufcs_resolve_at performs a single-package UFCS lookup. On success it
+// writes the resolved procedure entity to *out_entity and the (possibly
+// auto-&'d / auto-*'d) receiver expression to *out_first_arg and returns
+// true. The same auto-&/auto-* logic applies for both the direct-package
+// case and the using-walk case — the only thing that varies is the receiver
+// expression / type / mode passed in.
+gb_internal bool try_ufcs_resolve_at(CheckerContext *c, AstPackage *pkg,
+                                      InternedString name, u32 hash,
+                                      Ast *recv_expr, Type *recv_type,
+                                      AddressingMode recv_mode, ExactValue recv_value,
+                                      Entity **out_entity, Ast **out_first_arg) {
+	if (pkg == nullptr || recv_expr == nullptr || recv_type == nullptr) return false;
+	Entity *e = scope_lookup_current(pkg->scope, name, hash);
+	if (e == nullptr) return false;
+	if (e->kind != Entity_Procedure && e->kind != Entity_ProcGroup) return false;
+	check_entity_decl(c, e, nullptr, nullptr);
+
+	bool usable = false;
+	if (e->kind == Entity_Procedure) {
+		usable = e->type != nullptr && e->type != t_invalid;
+	} else {
+		usable = e->ProcGroup.entities.count > 0;
+	}
+	if (!usable) return false;
+
+	Type *want_first = nullptr;
+	if (e->kind == Entity_Procedure) {
+		Type *pt = base_type(e->type);
+		if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.param_count > 0) {
+			want_first = pt->Proc.params->Tuple.variables[0]->type;
+		}
+	} else {
+		for (Entity *m : e->ProcGroup.entities) {
+			if (m == nullptr || m->type == nullptr) continue;
+			Type *pt = base_type(m->type);
+			if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.param_count > 0) {
+				want_first = pt->Proc.params->Tuple.variables[0]->type;
+				break;
+			}
+		}
+	}
+
+	Ast *first_arg = recv_expr;
+	if (want_first != nullptr) {
+		// For polymorphic want_first (common with proc groups like `append`,
+		// whose first member has `^$T/[dynamic]$E`), we cannot use
+		// check_is_assignable_to: matching against a polymorphic type
+		// specialises it and that state persists on the shared type instance,
+		// so a later UFCS call with a different element type would fail.
+		// Decide structurally here and let real overload resolution validate
+		// the call.
+		if (is_type_polymorphic(want_first)) {
+			bool want_pointer     = is_type_pointer(want_first);
+			bool receiver_pointer = is_type_pointer(recv_type);
+			if (want_pointer && !receiver_pointer && recv_mode == Addressing_Variable) {
+				Token op = {Token_And};
+				first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
+			} else if (!want_pointer && receiver_pointer) {
+				Token op = {Token_Pointer};
+				first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
+			}
+		} else {
+			Operand y = {};
+			y.mode = recv_mode;
+			y.type = recv_type;
+			y.value = recv_value;
+			if (check_is_assignable_to(c, &y, want_first)) {
+				// Pass receiver as-is.
+			} else {
+				Operand z = y;
+				z.type = type_deref(y.type);
+				if (z.type != y.type && check_is_assignable_to(c, &z, want_first)) {
+					Token op = {Token_Pointer};
+					first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
+				} else if (y.mode == Addressing_Variable) {
+					Operand w = y;
+					w.type = alloc_type_pointer(y.type);
+					if (check_is_assignable_to(c, &w, want_first)) {
+						Token op = {Token_And};
+						first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
+					}
+				}
+			}
+		}
+	}
+
+	*out_entity = e;
+	*out_first_arg = first_arg;
+	return true;
+}
+
 gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *node, Type *type_hint) {
 	ast_node(se, SelectorExpr, node);
 
@@ -6021,119 +6146,110 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 	// procedure declared in the receiver type's owning package. On success the
 	// receiver is stashed in c->ufcs_first_arg (with auto-&/auto-* applied) so
 	// check_call_expr can prepend it to the call's argument list.
+	//
+	// When the receiver's own package has no match, walk `using` fields BFS-
+	// style — the first depth at which any lookup succeeds wins; multiple
+	// successes at that depth are an ambiguity error.
 	if (entity == nullptr && c->ufcs_call_context && selector->kind == Ast_Ident &&
 	    operand->mode != Addressing_Type && operand->mode != Addressing_Invalid &&
 	    operand->mode != Addressing_Builtin && operand->mode != Addressing_ProcGroup &&
 	    operand->type != nullptr && operand->type != t_invalid) {
+
+		InternedString sel_name = selector->Ident.interned;
+		u32 sel_hash = selector->Ident.hash;
 		Type *deref_type = type_deref(operand->type);
-		AstPackage *pkg = nullptr;
-		if (deref_type != nullptr) {
-			Type *named = nullptr;
-			if (deref_type->kind == Type_Named) {
-				named = deref_type;
-			} else {
-				Type *bt = base_type(deref_type);
-				if (bt != nullptr && bt->kind == Type_Named) {
-					named = bt;
+
+		// First try the receiver's own package.
+		Entity *resolved = nullptr;
+		Ast *resolved_arg = nullptr;
+		AstPackage *root_pkg = ufcs_owning_package(c, deref_type);
+		(void) try_ufcs_resolve_at(c, root_pkg, sel_name, sel_hash,
+		                            op_expr, operand->type, operand->mode, operand->value,
+		                            &resolved, &resolved_arg);
+
+		// If still unresolved, BFS through `using` fields.
+		if (resolved == nullptr && deref_type != nullptr) {
+			struct UFCSFrontier { Ast *expr; Type *type; };
+			gbAllocator ufcs_arena = heap_allocator();
+			auto current = array_make<UFCSFrontier>(ufcs_arena);
+			defer (array_free(&current));
+
+			auto enqueue_using_children = [&](Array<UFCSFrontier> *out, Ast *parent_expr, Type *parent_type) {
+				Type *bt = base_type(type_deref(parent_type));
+				if (bt == nullptr || bt->kind != Type_Struct) return;
+				for (Entity *f : bt->Struct.fields) {
+					if (f == nullptr || f->type == nullptr) continue;
+					if ((f->flags & EntityFlag_Using) == 0) continue;
+					if (!is_type_struct(type_deref(f->type))) continue;
+					Token period = {Token_Period, 0, str_lit(".")};
+					Ast *new_recv = ast_selector_expr(parent_expr->file(), period, parent_expr,
+					                                   ast_ident(parent_expr->file(), f->token));
+					array_add(out, UFCSFrontier{new_recv, f->type});
 				}
-			}
-			if (named != nullptr) {
-				Entity *tn = named->Named.type_name;
-				if (tn != nullptr) {
-					pkg = tn->pkg;
-				}
-			}
-			if (pkg == nullptr) {
-				Type *bt = base_type(deref_type);
-				if (bt != nullptr) {
-					if (bt->kind == Type_DynamicArray ||
-					    bt->kind == Type_Slice ||
-					    bt->kind == Type_Map ||
-					    (bt->kind == Type_Basic && bt->Basic.kind == Basic_string) ||
-					    (bt->kind == Type_Basic && bt->Basic.kind == Basic_cstring)) {
-						pkg = c->info->runtime_package;
+			};
+
+			enqueue_using_children(&current, op_expr, operand->type);
+
+			while (current.count > 0) {
+				auto hit_entities = array_make<Entity *>(ufcs_arena);
+				auto hit_args = array_make<Ast *>(ufcs_arena);
+				auto next = array_make<UFCSFrontier>(ufcs_arena);
+
+				for (UFCSFrontier const &fr : current) {
+					AstPackage *fr_pkg = ufcs_owning_package(c, type_deref(fr.type));
+					Entity *he = nullptr; Ast *ha = nullptr;
+					if (try_ufcs_resolve_at(c, fr_pkg, sel_name, sel_hash,
+					                         fr.expr, fr.type, operand->mode, ExactValue{},
+					                         &he, &ha)) {
+						array_add(&hit_entities, he);
+						array_add(&hit_args, ha);
+						continue; // don't expand a frontier node that hit
 					}
+					enqueue_using_children(&next, fr.expr, fr.type);
 				}
+
+				if (hit_entities.count == 1) {
+					resolved = hit_entities[0];
+					resolved_arg = hit_args[0];
+					array_free(&hit_entities);
+					array_free(&hit_args);
+					array_free(&next);
+					break;
+				} else if (hit_entities.count > 1) {
+					ERROR_BLOCK();
+					gbString sel_str = expr_to_string(selector);
+					gbString op_str  = expr_to_string(op_expr);
+					error(op_expr, "Ambiguous method call '%s.%s': reachable through multiple `using` fields",
+					      op_str, sel_str);
+					for (isize i = 0; i < hit_args.count; i++) {
+						gbString via = expr_to_string(hit_args[i]);
+						error_line("\tvia %s\n", via);
+						gb_string_free(via);
+					}
+					error_line("\tDisambiguate with an explicit field path, e.g. `%s.<field>.%s(...)`\n",
+					           op_str, sel_str);
+					gb_string_free(op_str);
+					gb_string_free(sel_str);
+					array_free(&hit_entities);
+					array_free(&hit_args);
+					array_free(&next);
+					operand->mode = Addressing_Invalid;
+					expr_entity = nullptr;
+					return nullptr;
+				}
+
+				array_free(&hit_entities);
+				array_free(&hit_args);
+				array_free(&current);
+				current = next;
 			}
 		}
-		if (pkg != nullptr) {
-			Entity *e = scope_lookup_current(pkg->scope, selector->Ident.interned, selector->Ident.hash);
-			if (e != nullptr && (e->kind == Entity_Procedure || e->kind == Entity_ProcGroup)) {
-				check_entity_decl(c, e, nullptr, nullptr);
-				// Entity_ProcGroup entities have type == t_invalid by design;
-				// only require a real type for single-procedure entities.
-				bool entity_usable = false;
-				if (e->kind == Entity_Procedure) {
-					entity_usable = e->type != nullptr && e->type != t_invalid;
-				} else {
-					entity_usable = e->ProcGroup.entities.count > 0;
-				}
-				if (entity_usable) {
-					Type *want_first = nullptr;
-					if (e->kind == Entity_Procedure) {
-						Type *pt = base_type(e->type);
-						if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.param_count > 0) {
-							want_first = pt->Proc.params->Tuple.variables[0]->type;
-						}
-					} else {
-						for (Entity *m : e->ProcGroup.entities) {
-							if (m == nullptr || m->type == nullptr) continue;
-							Type *pt = base_type(m->type);
-							if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.param_count > 0) {
-								want_first = pt->Proc.params->Tuple.variables[0]->type;
-								break;
-							}
-						}
-					}
-					Ast *first_arg = op_expr;
-					if (want_first != nullptr) {
-						// For polymorphic want_first (common with proc groups like
-						// `append`, whose first member has `^$T/[dynamic]$E`), we
-						// cannot use check_is_assignable_to: matching against a
-						// polymorphic type specialises it and that state persists
-						// on the shared type instance, so a later UFCS call with a
-						// different element type would fail. Decide structurally
-						// here and let real overload resolution validate the call.
-						if (is_type_polymorphic(want_first)) {
-							bool want_pointer     = is_type_pointer(want_first);
-							bool receiver_pointer = is_type_pointer(operand->type);
-							if (want_pointer && !receiver_pointer && operand->mode == Addressing_Variable) {
-								Token op = {Token_And};
-								first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
-							} else if (!want_pointer && receiver_pointer) {
-								Token op = {Token_Pointer};
-								first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
-							}
-						} else {
-							Operand y = {};
-							y.mode = operand->mode;
-							y.type = operand->type;
-							y.value = operand->value;
-							if (check_is_assignable_to(c, &y, want_first)) {
-								// Pass receiver as-is.
-							} else {
-								Operand z = y;
-								z.type = type_deref(y.type);
-								if (z.type != y.type && check_is_assignable_to(c, &z, want_first)) {
-									Token op = {Token_Pointer};
-									first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
-								} else if (y.mode == Addressing_Variable) {
-									Operand w = y;
-									w.type = alloc_type_pointer(y.type);
-									if (check_is_assignable_to(c, &w, want_first)) {
-										Token op = {Token_And};
-										first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
-									}
-								}
-							}
-						}
-					}
-					c->ufcs_first_arg = first_arg;
-					c->ufcs_entity = e;
-					entity = e;
-					expr_entity = nullptr; // skip constant-field branches below
-				}
-			}
+
+		if (resolved != nullptr) {
+			c->ufcs_first_arg = resolved_arg;
+			c->ufcs_entity = resolved;
+			entity = resolved;
+			expr_entity = nullptr; // skip constant-field branches below
 		}
 	}
 
