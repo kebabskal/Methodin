@@ -5194,6 +5194,12 @@ gb_internal void check_collect_entities(CheckerContext *c, Slice<Ast *> const &n
 			}
 		case_end;
 
+		case_ast_node(ib, ImplBlock, decl);
+			// Methods were lifted to free procs in `parse_file` via
+			// `lift_struct_methods`; the ImplBlock node itself has no
+			// further checker semantics.
+		case_end;
+
 		default:
 			if (c->scope->flags&ScopeFlag_File) {
 				error(decl, "Only declarations are allowed at file scope");

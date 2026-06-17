@@ -399,6 +399,10 @@ gb_internal Ast *clone_ast(Ast *node, AstFile *f) {
 		n->ForeignBlockDecl.body            = clone_ast(n->ForeignBlockDecl.body, f);
 		n->ForeignBlockDecl.attributes      = clone_ast_array(n->ForeignBlockDecl.attributes, f);
 		break;
+	case Ast_ImplBlock:
+		n->ImplBlock.type_expr = clone_ast(n->ImplBlock.type_expr, f);
+		n->ImplBlock.methods   = clone_ast_array(n->ImplBlock.methods, f);
+		break;
 	case Ast_Label:
 		n->Label.name = clone_ast(n->Label.name, f);
 		break;
@@ -1373,6 +1377,16 @@ gb_internal Ast *ast_label_decl(AstFile *f, Token token, Ast *name) {
 	return result;
 }
 
+gb_internal Ast *ast_impl_block(AstFile *f, Token impl_token, Ast *type_expr,
+                                Slice<Ast *> methods, CommentGroup *docs) {
+	Ast *result = alloc_ast_node(f, Ast_ImplBlock);
+	result->ImplBlock.impl_token = impl_token;
+	result->ImplBlock.type_expr  = type_expr;
+	result->ImplBlock.methods    = methods;
+	result->ImplBlock.docs       = docs;
+	return result;
+}
+
 gb_internal Ast *ast_value_decl(AstFile *f, Array<Ast *> const &names, Ast *type, Array<Ast *> const &values, bool is_mutable,
                     CommentGroup *docs, CommentGroup *comment) {
 	Ast *result = alloc_ast_node(f, Ast_ValueDecl);
@@ -2105,6 +2119,7 @@ gb_internal Ast *        parse_type             (AstFile *f);
 gb_internal Ast *        parse_call_expr        (AstFile *f, Ast *operand);
 gb_internal Ast *        parse_struct_field_list(AstFile *f, isize *name_count_, Array<Ast *> *methods_out = nullptr);
 gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_flags, TokenKind follow, bool allow_default_parameters, bool allow_typeid_token, Array<Ast *> *methods_out = nullptr);
+gb_internal Ast *        parse_impl_block(AstFile *f);
 gb_internal Ast *parse_unary_expr(AstFile *f, bool lhs);
 
 
@@ -5430,6 +5445,18 @@ gb_internal Ast *parse_unrolled_for_loop(AstFile *f, Token unroll_token) {
 gb_internal Ast *parse_stmt(AstFile *f) {
 	Ast *s = nullptr;
 	Token token = f->curr_token;
+
+	// Contextual `impl <Type> { ... }` block. `impl` is not a reserved
+	// keyword — it's an identifier used elsewhere (e.g. as a parameter
+	// name in core:crypto/aead). We only treat it as a block introducer
+	// when the shape is `Ident("impl") Ident OpenBrace`, which can't
+	// match any other valid statement.
+	if (token.kind == Token_Ident && token.string == "impl" &&
+	    peek_token_n(f, 0).kind == Token_Ident &&
+	    peek_token_n(f, 1).kind == Token_OpenBrace) {
+		return parse_impl_block(f);
+	}
+
 	switch (token.kind) {
 	// Operands
 	case Token_context: // Also allows for `context =`
@@ -6814,6 +6841,59 @@ gb_internal bool parse_file_tag(const String &lc, const Token &tok, AstFile *f) 
 	return true;
 }
 
+// Parses `impl <Type> { name :: proc(...) {...}, ... }`. `impl` is a
+// contextual keyword — the caller has already confirmed the
+// `Ident("impl") Ident OpenBrace` shape. Returns an Ast_ImplBlock that
+// `lift_struct_methods` later expands into free procs at file scope.
+gb_internal Ast *parse_impl_block(AstFile *f) {
+	CommentGroup *docs = f->lead_comment;
+	Token impl_token = expect_token(f, Token_Ident);
+	Ast *type_expr = parse_type(f);
+	skip_possible_newline_for_literal(f);
+	Token open = expect_token(f, Token_OpenBrace);
+
+	auto methods = array_make<Ast *>(ast_allocator(f));
+
+	while (f->curr_token.kind != Token_CloseBrace &&
+	       f->curr_token.kind != Token_EOF) {
+		if (f->curr_token.kind != Token_Ident ||
+		    peek_token_n(f, 0).kind != Token_Colon ||
+		    peek_token_n(f, 1).kind != Token_Colon ||
+		    peek_token_n(f, 2).kind != Token_proc) {
+			syntax_error(f->curr_token, "Expected a method declaration `name :: proc(...) {...}` inside the impl block");
+			advance_token(f);
+			continue;
+		}
+
+		CommentGroup *method_docs = f->lead_comment;
+		Token name_token = expect_token(f, Token_Ident);
+		expect_token(f, Token_Colon);
+		expect_token(f, Token_Colon);
+		Ast *proc_lit = parse_expr(f, false);
+
+		auto method_names = array_make<Ast *>(ast_allocator(f), 0, 1);
+		array_add(&method_names, ast_ident(f, name_token));
+		auto method_values = array_make<Ast *>(ast_allocator(f), 0, 1);
+		array_add(&method_values, proc_lit);
+
+		Ast *method = ast_value_decl(f, method_names, nullptr, method_values, false, method_docs, f->line_comment);
+		array_add(&methods, method);
+
+		// Methods are separated by an optional comma + newline. The
+		// closing brace is on its own line, mirroring how regular
+		// top-level decls work.
+		allow_token(f, Token_Comma);
+		while (f->curr_token.kind == Token_Semicolon && f->curr_token.string == "\n") {
+			advance_token(f);
+		}
+	}
+
+	Token close = expect_token(f, Token_CloseBrace);
+	gb_unused(open); gb_unused(close);
+
+	return ast_impl_block(f, impl_token, type_expr, slice_from_array(methods), docs);
+}
+
 // Lifts in-struct method decls to top-level package-scope ValueDecls.
 // For each `Name :: struct { ... <method_name> :: proc(...) {...} ... }`
 // top-level decl, synthesises a free `<method_name> :: proc(using self:
@@ -6826,10 +6906,72 @@ gb_internal bool parse_file_tag(const String &lc, const Token &tok, AstFile *f) 
 // methods lifted anywhere meaningful, so any methods declared in them
 // are silently dropped here. Polymorphic struct parameters are not
 // supported in this first cut.
+// Shared lowering for one method node: prepends `using self: ^Name` to
+// the proc literal's parameter list and appends the resulting decl
+// (which is the same ValueDecl node, mutated in place) to `decls_out`.
+gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Array<Ast *> *decls_out) {
+	if (method->kind != Ast_ValueDecl) return;
+	if (method->ValueDecl.values.count != 1) return;
+
+	Ast *proc_lit = method->ValueDecl.values[0];
+	if (proc_lit->kind != Ast_ProcLit) return;
+
+	Token caret_tok = {};
+	caret_tok.kind = Token_Pointer;
+	caret_tok.string = str_lit("^");
+	caret_tok.pos = struct_name_token.pos;
+
+	Ast *struct_name_ref = ast_ident(f, struct_name_token);
+	Ast *ptr_type = ast_pointer_type(f, caret_tok, struct_name_ref);
+
+	Token self_tok = {};
+	self_tok.kind = Token_Ident;
+	self_tok.string = str_lit("self");
+	self_tok.pos = struct_name_token.pos;
+
+	auto self_names = array_make<Ast *>(ast_allocator(f), 0, 1);
+	array_add(&self_names, ast_ident(f, self_tok));
+	Token blank_tag = {};
+	Ast *self_field = ast_field(f, self_names, ptr_type, nullptr, FieldFlag_using|FieldFlag_using_self_synth, blank_tag, nullptr, nullptr);
+
+	Ast *proc_type = proc_lit->ProcLit.type;
+	GB_ASSERT(proc_type->kind == Ast_ProcType);
+	Ast *params = proc_type->ProcType.params;
+	GB_ASSERT(params->kind == Ast_FieldList);
+
+	auto new_list = array_make<Ast *>(ast_allocator(f), 0, params->FieldList.list.count + 1);
+	array_add(&new_list, self_field);
+	for (Ast *existing : params->FieldList.list) {
+		array_add(&new_list, existing);
+	}
+	params->FieldList.list = slice_from_array(new_list);
+
+	array_add(decls_out, method);
+}
+
 gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 	isize original_count = decls_out->count;
 	for (isize i = 0; i < original_count; i++) {
 		Ast *decl = (*decls_out)[i];
+
+		// `impl <Type> { ... }` block: forward the methods to be lifted
+		// against the impl's target type. The target must be a simple
+		// identifier — qualified types like `pkg.T` are deferred to a
+		// later phase since lifting cross-package methods raises
+		// visibility / ownership questions of their own.
+		if (decl->kind == Ast_ImplBlock) {
+			Ast *te = decl->ImplBlock.type_expr;
+			if (te == nullptr || te->kind != Ast_Ident) {
+				syntax_error(decl->ImplBlock.impl_token, "impl block target must be a simple type identifier in the same package");
+				continue;
+			}
+			Token struct_name_token = te->Ident.token;
+			for (Ast *method : decl->ImplBlock.methods) {
+				lift_one_method(f, method, struct_name_token, decls_out);
+			}
+			continue;
+		}
+
 		if (decl->kind != Ast_ValueDecl) continue;
 		if (decl->ValueDecl.is_mutable) continue;
 		if (decl->ValueDecl.names.count != 1) continue;
@@ -6847,43 +6989,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 		Token struct_name_token = name_ident->Ident.token;
 
 		for (Ast *method : st->methods) {
-			if (method->kind != Ast_ValueDecl) continue;
-			if (method->ValueDecl.values.count != 1) continue;
-
-			Ast *proc_lit = method->ValueDecl.values[0];
-			if (proc_lit->kind != Ast_ProcLit) continue;
-
-			Token caret_tok = {};
-			caret_tok.kind = Token_Pointer;
-			caret_tok.string = str_lit("^");
-			caret_tok.pos = struct_name_token.pos;
-
-			Ast *struct_name_ref = ast_ident(f, struct_name_token);
-			Ast *ptr_type = ast_pointer_type(f, caret_tok, struct_name_ref);
-
-			Token self_tok = {};
-			self_tok.kind = Token_Ident;
-			self_tok.string = str_lit("self");
-			self_tok.pos = struct_name_token.pos;
-
-			auto self_names = array_make<Ast *>(ast_allocator(f), 0, 1);
-			array_add(&self_names, ast_ident(f, self_tok));
-			Token blank_tag = {};
-			Ast *self_field = ast_field(f, self_names, ptr_type, nullptr, FieldFlag_using|FieldFlag_using_self_synth, blank_tag, nullptr, nullptr);
-
-			Ast *proc_type = proc_lit->ProcLit.type;
-			GB_ASSERT(proc_type->kind == Ast_ProcType);
-			Ast *params = proc_type->ProcType.params;
-			GB_ASSERT(params->kind == Ast_FieldList);
-
-			auto new_list = array_make<Ast *>(ast_allocator(f), 0, params->FieldList.list.count + 1);
-			array_add(&new_list, self_field);
-			for (Ast *existing : params->FieldList.list) {
-				array_add(&new_list, existing);
-			}
-			params->FieldList.list = slice_from_array(new_list);
-
-			array_add(decls_out, method);
+			lift_one_method(f, method, struct_name_token, decls_out);
 		}
 	}
 }

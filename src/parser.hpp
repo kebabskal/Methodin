@@ -654,6 +654,12 @@ AST_KIND(_DeclBegin,      "", bool) \
 		Array<Ast *> attributes; \
 		CommentGroup *docs;      \
 	}) \
+	AST_KIND(ImplBlock, "impl block", struct { \
+		Token impl_token;         \
+		Ast *type_expr;           \
+		Slice<Ast *> methods;     \
+		CommentGroup *docs;       \
+	}) \
 	AST_KIND(Label, "label", struct { 	\
 		Token token; \
 		Ast *name; \
