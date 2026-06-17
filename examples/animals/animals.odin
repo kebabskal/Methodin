@@ -1,45 +1,58 @@
-// Smallest possible demo of in-struct procs + auto-dispatch on a union.
+// Methodin demo: inheritance via `using` + `impl` blocks + union dispatch.
 //
-// `Animal`, `Dog`, and `Cat` each declare their own `greet`. The compiler
-// lifts each to a free proc, mangles the names, and synthesises a
-// procedure group `greet :: proc { Animal__greet, Dog__greet, Cat__greet }`.
-// Calling `thing.greet(...)` on a `union { Animal, Dog }` expands to a
-// `switch v in thing` at compile time — no vtable, no indirection.
+// `Animal` declares `introduce` as an in-struct proc. `Dog` and `Cat` each
+// embed `Animal` with `using`, so they inherit `introduce` automatically.
+// Their own `speak` method is declared in a separate `impl` block — same
+// desugaring as an in-struct proc, just lifted from a different syntax.
+// Calling `p.speak()` on `Pet` expands to a `switch v in p` over the
+// known variants.
 
 package animals
 
 import "core:fmt"
 
 Animal :: struct {
-	greet :: proc(name: string) {
-		fmt.println("Hi,", name, "!")
+	name: string,
+
+	introduce :: proc() {
+		fmt.printfln("Hi, I'm %s.", name)
 	},
 }
 
 Dog :: struct {
 	using animal: Animal,
-	greet :: proc(name: string) {
-		fmt.println("Woof,", name, "!")
-	},
+}
+
+impl Dog {
+	speak :: proc() {
+		fmt.printfln("%s: woof!", name)
+	}
 }
 
 Cat :: struct {
 	using animal: Animal,
-	greet :: proc(name: string) {
-		fmt.println("Meow,", name, "!")
-	},
 }
 
-Thing :: union {
-	Animal,
+impl Cat {
+	speak :: proc() {
+		fmt.printfln("%s: meow.", name)
+	}
+}
+
+Pet :: union {
 	Dog,
 	Cat,
 }
 
 main :: proc() {
-	things: []Thing = {Animal{}, Dog{}, Cat{}}
+	rex     := Dog{animal = {name = "Rex"}}
+	mittens := Cat{animal = {name = "Mittens"}}
 
-	for &thing in things {
-		thing.greet("MineDrabe")
+	rex.introduce()     // inherited from Animal via `using`
+	mittens.introduce()
+
+	pets := []Pet{rex, mittens}
+	for &p in pets {
+		p.speak()       // union-dispatched: Dog__speak vs Cat__speak
 	}
 }

@@ -62,6 +62,63 @@ free proc (`Circle__area`, `Rectangle__area`, `Triangle__area`), synthesises
 a procedure group at file scope, and expands `s.area()` on the union to a
 `switch v in s` over the known variants. No vtable, no indirection.
 
+### …with `using` inheritance and `impl` blocks
+
+```odin
+package main
+
+import "core:fmt"
+
+Animal :: struct {
+    name: string,
+
+    introduce :: proc() {
+        fmt.printfln("Hi, I'm %s.", name)
+    },
+}
+
+Dog :: struct {
+    using animal: Animal,
+}
+
+impl Dog {
+    speak :: proc() {
+        fmt.printfln("%s: woof!", name)
+    }
+}
+
+Cat :: struct {
+    using animal: Animal,
+}
+
+impl Cat {
+    speak :: proc() {
+        fmt.printfln("%s: meow.", name)
+    }
+}
+
+Pet :: union { Dog, Cat }
+
+main :: proc() {
+    rex     := Dog{animal = {name = "Rex"}}
+    mittens := Cat{animal = {name = "Mittens"}}
+
+    rex.introduce()     // inherited from Animal via `using`
+    mittens.introduce()
+
+    pets := []Pet{rex, mittens}
+    for &p in pets {
+        p.speak()       // union-dispatched: Dog__speak vs Cat__speak
+    }
+}
+```
+
+`Dog` and `Cat` don't redeclare `introduce` — they inherit it by embedding
+`Animal` with `using`, and the UFCS resolver walks the embed chain to find
+it. `speak` is declared in an `impl` block, which is exactly the same
+lifting as an in-struct proc — useful when you want the method to live in
+a different file from the struct.
+
 See [`examples/methods`](examples/methods) and
 [`examples/animals`](examples/animals) for the runnable demos.
 
