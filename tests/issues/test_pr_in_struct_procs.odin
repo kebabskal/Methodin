@@ -239,3 +239,52 @@ test_union_dispatch :: proc(t: ^testing.T) {
 	testing.expect_value(t, mouse_first, 1)
 	testing.expect_value(t, cat_again, 20)
 }
+
+// Inheritance-aware union dispatch: a method that every variant
+// reaches via a same-file `using` field (not declared directly on the
+// variants themselves) must still synthesise a dispatcher. The
+// dispatcher body is plain UFCS, so the `using`-walk picks up the
+// inherited method on each branch.
+Critter_Base :: struct {
+	noise: int,
+	bump :: proc() {
+		noise += 1
+	},
+}
+
+Wolf :: struct {
+	using base: Critter_Base,
+}
+
+impl Wolf {
+	speak :: proc() -> int {
+		return noise * 10
+	}
+}
+
+Owl :: struct {
+	using base: Critter_Base,
+}
+
+impl Owl {
+	speak :: proc() -> int {
+		return noise
+	}
+}
+
+Forest_Critter :: union {
+	Wolf,
+	Owl,
+}
+
+@test
+test_union_dispatch_via_using :: proc(t: ^testing.T) {
+	creatures: [2]Forest_Critter = {Wolf{}, Owl{}}
+
+	creatures[0].bump() // dispatched on union, inherited from Critter_Base
+	creatures[0].bump()
+	creatures[1].bump()
+
+	testing.expect_value(t, creatures[0].speak(), 20) // Wolf__speak: 2*10
+	testing.expect_value(t, creatures[1].speak(), 1)  // Owl__speak: 1
+}
