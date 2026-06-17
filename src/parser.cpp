@@ -7287,6 +7287,97 @@ gb_internal Ast *build_union_dispatcher(AstFile *f, Token union_name_token,
 	return ast_value_decl(f, vd_names, nullptr, vd_values, /*is_mutable*/false, nullptr, nullptr);
 }
 
+// Looks up a same-file top-level `Name :: struct { ... }` decl and
+// returns its StructType AST. Used by the inheritance walk in the
+// union-dispatch pass. Cross-file / cross-package lookup is out of
+// scope here — the dispatcher synthesis is itself per-file.
+gb_internal Ast *find_struct_type_in_decls(Array<Ast *> *decls_out, String name) {
+	for (Ast *decl : *decls_out) {
+		if (decl->kind != Ast_ValueDecl) continue;
+		if (decl->ValueDecl.is_mutable) continue;
+		if (decl->ValueDecl.names.count != 1) continue;
+		if (decl->ValueDecl.values.count != 1) continue;
+		Ast *name_ast = decl->ValueDecl.names[0];
+		if (name_ast->kind != Ast_Ident) continue;
+		if (name_ast->Ident.token.string != name) continue;
+		Ast *value = decl->ValueDecl.values[0];
+		if (value->kind != Ast_StructType) continue;
+		return value;
+	}
+	return nullptr;
+}
+
+// Returns a sample PendingMethod (the ValueDecl AST) for `(sname, mname)`,
+// resolving through single-ident `using` fields if `sname` doesn't
+// declare `mname` directly. Recursion is depth-capped to defend against
+// `using` cycles that the checker would normally catch later.
+gb_internal Ast *find_method_for_struct_effective(Array<Ast *> *decls_out,
+                                                  Array<PendingMethod> const &pending,
+                                                  String sname, String mname,
+                                                  isize depth) {
+	if (depth > 8) return nullptr;
+
+	for (PendingMethod const &pm : pending) {
+		if (pm.struct_name_token.string != sname) continue;
+		Ast *method = pm.method;
+		if (method->kind != Ast_ValueDecl) continue;
+		if (method->ValueDecl.names.count != 1) continue;
+		Ast *n = method->ValueDecl.names[0];
+		if (n->kind != Ast_Ident) continue;
+		if (n->Ident.token.string == mname) return method;
+	}
+
+	Ast *st_ast = find_struct_type_in_decls(decls_out, sname);
+	if (st_ast == nullptr) return nullptr;
+	ast_node(st, StructType, st_ast);
+	for (Ast *field_ast : st->fields) {
+		if (field_ast->kind != Ast_Field) continue;
+		ast_node(field, Field, field_ast);
+		if ((field->flags & FieldFlag_using) == 0) continue;
+		if (field->type == nullptr || field->type->kind != Ast_Ident) continue;
+		String inner = field->type->Ident.token.string;
+		Ast *hit = find_method_for_struct_effective(decls_out, pending, inner, mname, depth+1);
+		if (hit != nullptr) return hit;
+	}
+	return nullptr;
+}
+
+// Fills `out` with the deduplicated method names available on `sname`,
+// counting both direct in-struct/impl methods and those reached through
+// single-ident `using` fields.
+gb_internal void collect_effective_method_names(Array<Ast *> *decls_out,
+                                                 Array<PendingMethod> const &pending,
+                                                 String sname,
+                                                 Array<String> *out,
+                                                 isize depth) {
+	if (depth > 8) return;
+
+	for (PendingMethod const &pm : pending) {
+		if (pm.struct_name_token.string != sname) continue;
+		Ast *method = pm.method;
+		if (method->kind != Ast_ValueDecl) continue;
+		if (method->ValueDecl.names.count != 1) continue;
+		Ast *n = method->ValueDecl.names[0];
+		if (n->kind != Ast_Ident) continue;
+		String mname = n->Ident.token.string;
+		bool already = false;
+		for (String const &x : *out) { if (x == mname) { already = true; break; } }
+		if (!already) array_add(out, mname);
+	}
+
+	Ast *st_ast = find_struct_type_in_decls(decls_out, sname);
+	if (st_ast == nullptr) return;
+	ast_node(st, StructType, st_ast);
+	for (Ast *field_ast : st->fields) {
+		if (field_ast->kind != Ast_Field) continue;
+		ast_node(field, Field, field_ast);
+		if ((field->flags & FieldFlag_using) == 0) continue;
+		if (field->type == nullptr || field->type->kind != Ast_Ident) continue;
+		String inner = field->type->Ident.token.string;
+		collect_effective_method_names(decls_out, pending, inner, out, depth+1);
+	}
+}
+
 gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 	// Pass 1: collect every in-struct / impl-block method along with the
 	// token of the struct it belongs to. We do this before any lifting
@@ -7419,49 +7510,34 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 		}
 		if (!variants_ok) continue;
 
-		// For each method name on the first variant, check if every
-		// other variant also has a pending method with that name.
-		// Stash a sample method to clone signature info from.
+		// For each method name *effectively* available on the first
+		// variant (direct in-struct/impl methods plus anything reached
+		// through single-ident `using` fields in the same file), check
+		// that every other variant also has it effectively. The
+		// dispatcher body uses plain UFCS (`v.<name>(...)`), so
+		// inherited methods get found by the normal UFCS `using`-walk
+		// — we just have to make sure the dispatcher gets synthesised
+		// in the first place.
 		Slice<Ast *> variants_slice = slice_from_array(variant_idents);
 		String first_variant = variant_idents[0]->Ident.token.string;
 
-		auto seen_method_names = array_make<String>(temporary_allocator());
+		auto candidate_names = array_make<String>(temporary_allocator());
+		collect_effective_method_names(decls_out, pending, first_variant, &candidate_names, 0);
 
-		for (PendingMethod const &pm : pending) {
-			if (pm.struct_name_token.string != first_variant) continue;
-			Ast *method = pm.method;
-			if (method->kind != Ast_ValueDecl) continue;
-			if (method->ValueDecl.names.count != 1) continue;
-			if (method->ValueDecl.names[0]->kind != Ast_Ident) continue;
-			String name = method->ValueDecl.names[0]->Ident.token.string;
+		for (String const &name : candidate_names) {
+			Ast *sample = find_method_for_struct_effective(decls_out, pending, first_variant, name, 0);
+			if (sample == nullptr) continue;
 
-			bool already_seen = false;
-			for (String const &n : seen_method_names) {
-				if (n == name) { already_seen = true; break; }
-			}
-			if (already_seen) continue;
-			array_add(&seen_method_names, name);
-
-			// Check that every remaining variant also has `name`.
 			bool all_have_it = true;
 			for (isize vi = 1; vi < variant_idents.count; vi++) {
 				String v_name = variant_idents[vi]->Ident.token.string;
-				bool found = false;
-				for (PendingMethod const &pm2 : pending) {
-					if (pm2.struct_name_token.string != v_name) continue;
-					Ast *m2 = pm2.method;
-					if (m2->kind != Ast_ValueDecl) continue;
-					if (m2->ValueDecl.names.count != 1) continue;
-					if (m2->ValueDecl.names[0]->kind != Ast_Ident) continue;
-					if (m2->ValueDecl.names[0]->Ident.token.string == name) {
-						found = true; break;
-					}
+				if (find_method_for_struct_effective(decls_out, pending, v_name, name, 0) == nullptr) {
+					all_have_it = false; break;
 				}
-				if (!found) { all_have_it = false; break; }
 			}
 			if (!all_have_it) continue;
 
-			Ast *dispatcher = build_union_dispatcher(f, union_name_token, name, variants_slice, method);
+			Ast *dispatcher = build_union_dispatcher(f, union_name_token, name, variants_slice, sample);
 			array_add(&pending, PendingMethod{dispatcher, union_name_token, /*no_using_self*/true});
 		}
 	}
