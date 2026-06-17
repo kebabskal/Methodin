@@ -322,3 +322,35 @@ test_polymorphic_struct_methods :: proc(t: ^testing.T) {
 	testing.expect_value(t, v.in_bounds(-1, 0, 0), false)
 	testing.expect_value(t, v.in_bounds(0, 4, 0), false)
 }
+
+// Returning a pointer / slice into a field reached through
+// `using self: ^Struct` is safe (the array lives in the caller's
+// memory, not the proc's stack). check_unsafe_return now walks the
+// using chain and exempts the case when the root is a pointer param.
+Grid :: struct {
+	cells: [16]int,
+
+	at :: proc(i: int) -> ^int {
+		return &cells[i]
+	},
+
+	row :: proc(start, end: int) -> []int {
+		return cells[start:end]
+	},
+}
+
+@test
+test_using_pointer_param_address_of_field :: proc(t: ^testing.T) {
+	g: Grid
+	g.cells[3] = 7
+	g.cells[5] = 11
+
+	p := g.at(3)
+	testing.expect_value(t, p^, 7)
+	p^ = 42
+	testing.expect_value(t, g.cells[3], 42)
+
+	r := g.row(3, 6)
+	testing.expect_value(t, len(r), 3)
+	testing.expect_value(t, r[2], 11)
+}
