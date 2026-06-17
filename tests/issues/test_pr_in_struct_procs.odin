@@ -288,3 +288,37 @@ test_union_dispatch_via_using :: proc(t: ^testing.T) {
 	testing.expect_value(t, creatures[0].speak(), 20) // Wolf__speak: 2*10
 	testing.expect_value(t, creatures[1].speak(), 1)  // Owl__speak: 1
 }
+
+// Polymorphic struct methods: when a struct has polymorphic params, the
+// lift pass has to carry them through to the receiver type so the body
+// can see the params and the checker can bind a concrete instantiation.
+// Receiver becomes `^Volume($T, $N, ...)` — same dollar-prefixed names
+// the struct uses, reintroduced on the lifted proc.
+Volume :: struct($VOXEL_T: typeid, $SIZE_X, $SIZE_Y, $SIZE_Z: int) {
+	voxels: [SIZE_X * SIZE_Y * SIZE_Z]VOXEL_T,
+
+	index :: proc(x, y, z: int) -> int {
+		return x + y * SIZE_X + z * SIZE_X * SIZE_Y
+	},
+
+	get :: proc(x, y, z: int) -> VOXEL_T {
+		return voxels[index(x, y, z)]
+	},
+
+	in_bounds :: proc(x, y, z: int) -> bool {
+		return x >= 0 && x < SIZE_X &&
+		       y >= 0 && y < SIZE_Y &&
+		       z >= 0 && z < SIZE_Z
+	},
+}
+
+@test
+test_polymorphic_struct_methods :: proc(t: ^testing.T) {
+	v: Volume(int, 4, 4, 4)
+	v.voxels[v.index(1, 2, 3)] = 42
+
+	testing.expect_value(t, v.get(1, 2, 3), 42)
+	testing.expect_value(t, v.in_bounds(1, 2, 3), true)
+	testing.expect_value(t, v.in_bounds(-1, 0, 0), false)
+	testing.expect_value(t, v.in_bounds(0, 4, 0), false)
+}
