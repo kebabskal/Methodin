@@ -191,6 +191,17 @@ struct AstPackageExportedEntity {
 	Entity *entity;
 };
 
+// In-struct / impl-block methods are always mangled to `<Struct>__<name>`
+// during the per-file lift pass; this record lets the parser assemble
+// the user-visible `name :: proc { <Struct1>__name, <Struct2>__name, ... }`
+// proc-group decl after every file in the package has been parsed, so
+// the same `name` declared on structs in *different files* doesn't
+// trigger a file-scope redeclaration error.
+struct MethodinMethodEntry {
+	String  original_name;
+	Token   mangled_tok;
+};
+
 struct AstPackage {
 	PackageKind           kind;
 	isize                 id;
@@ -205,6 +216,9 @@ struct AstPackage {
 	BlockingMutex         foreign_files_mutex;
 	BlockingMutex         type_and_value_mutex;
 	BlockingMutex         name_mutex;
+
+	BlockingMutex             methodin_methods_mutex;
+	Array<MethodinMethodEntry> methodin_methods;
 
 	// NOTE(bill): This must be a MPMCQueue
 	MPMCQueue<AstPackageExportedEntity> exported_entity_queue;
