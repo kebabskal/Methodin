@@ -6964,6 +6964,148 @@ gb_internal String mangle_method_name(String struct_name, String method_name) {
 	return make_string_c(s);
 }
 
+// Recursively walks `node` and, for every CallExpr whose `proc` is a
+// bare ident matching one of `method_names`, rewrites the proc to a
+// SelectorExpr `self.<ident>` so the call resolves through UFCS to the
+// per-receiver lifted version. Lets methods on the same struct call
+// each other without an explicit `self.` prefix — matching how their
+// field access already works under `using self`.
+//
+// Limitations: no scope awareness. A local variable that shadows a
+// method name with the same identifier will also be rewritten. We
+// trade that off for simplicity; in practice methods rarely share
+// names with locals.
+gb_internal void rewrite_method_calls_to_self(AstFile *f, Ast *node, Array<String> const &method_names);
+
+gb_internal bool string_in_list(String const &s, Array<String> const &xs) {
+	for (String const &x : xs) {
+		if (x == s) return true;
+	}
+	return false;
+}
+
+gb_internal void rewrite_method_calls_in_array(AstFile *f, Slice<Ast *> const &nodes, Array<String> const &method_names) {
+	for (Ast *n : nodes) rewrite_method_calls_to_self(f, n, method_names);
+}
+
+gb_internal void rewrite_method_calls_to_self(AstFile *f, Ast *node, Array<String> const &method_names) {
+	if (node == nullptr) return;
+
+	switch (node->kind) {
+	case Ast_CallExpr: {
+		Ast *proc = node->CallExpr.proc;
+		if (proc != nullptr && proc->kind == Ast_Ident) {
+			String name = proc->Ident.token.string;
+			if (string_in_list(name, method_names)) {
+				Token self_tok = {};
+				self_tok.kind = Token_Ident;
+				self_tok.string = str_lit("self");
+				self_tok.pos = proc->Ident.token.pos;
+				Ast *self_ident = ast_ident(f, self_tok);
+				Token dot_tok = {};
+				dot_tok.kind = Token_Period;
+				dot_tok.string = str_lit(".");
+				dot_tok.pos = proc->Ident.token.pos;
+				Ast *new_proc = ast_selector_expr(f, dot_tok, self_ident, proc);
+				node->CallExpr.proc = new_proc;
+			}
+		}
+		rewrite_method_calls_to_self(f, node->CallExpr.proc, method_names);
+		rewrite_method_calls_in_array(f, node->CallExpr.args, method_names);
+		break;
+	}
+
+	case Ast_BlockStmt:    rewrite_method_calls_in_array(f, node->BlockStmt.stmts, method_names); break;
+	case Ast_ExprStmt:     rewrite_method_calls_to_self(f, node->ExprStmt.expr, method_names); break;
+	case Ast_ReturnStmt:   rewrite_method_calls_in_array(f, node->ReturnStmt.results, method_names); break;
+	case Ast_DeferStmt:    rewrite_method_calls_to_self(f, node->DeferStmt.stmt, method_names); break;
+	case Ast_AssignStmt:
+		rewrite_method_calls_in_array(f, node->AssignStmt.lhs, method_names);
+		rewrite_method_calls_in_array(f, node->AssignStmt.rhs, method_names);
+		break;
+	case Ast_IfStmt:
+		rewrite_method_calls_to_self(f, node->IfStmt.init, method_names);
+		rewrite_method_calls_to_self(f, node->IfStmt.cond, method_names);
+		rewrite_method_calls_to_self(f, node->IfStmt.body, method_names);
+		rewrite_method_calls_to_self(f, node->IfStmt.else_stmt, method_names);
+		break;
+	case Ast_ForStmt:
+		rewrite_method_calls_to_self(f, node->ForStmt.init, method_names);
+		rewrite_method_calls_to_self(f, node->ForStmt.cond, method_names);
+		rewrite_method_calls_to_self(f, node->ForStmt.post, method_names);
+		rewrite_method_calls_to_self(f, node->ForStmt.body, method_names);
+		break;
+	case Ast_RangeStmt:
+		rewrite_method_calls_in_array(f, node->RangeStmt.vals, method_names);
+		rewrite_method_calls_to_self(f, node->RangeStmt.expr, method_names);
+		rewrite_method_calls_to_self(f, node->RangeStmt.body, method_names);
+		break;
+	case Ast_SwitchStmt:
+		rewrite_method_calls_to_self(f, node->SwitchStmt.init, method_names);
+		rewrite_method_calls_to_self(f, node->SwitchStmt.tag, method_names);
+		rewrite_method_calls_to_self(f, node->SwitchStmt.body, method_names);
+		break;
+	case Ast_TypeSwitchStmt:
+		rewrite_method_calls_to_self(f, node->TypeSwitchStmt.tag, method_names);
+		rewrite_method_calls_to_self(f, node->TypeSwitchStmt.body, method_names);
+		break;
+	case Ast_CaseClause:
+		rewrite_method_calls_in_array(f, node->CaseClause.list, method_names);
+		rewrite_method_calls_in_array(f, node->CaseClause.stmts, method_names);
+		break;
+	case Ast_WhenStmt:
+		rewrite_method_calls_to_self(f, node->WhenStmt.cond, method_names);
+		rewrite_method_calls_to_self(f, node->WhenStmt.body, method_names);
+		rewrite_method_calls_to_self(f, node->WhenStmt.else_stmt, method_names);
+		break;
+	case Ast_ValueDecl:
+		rewrite_method_calls_in_array(f, node->ValueDecl.values, method_names);
+		break;
+
+	case Ast_UnaryExpr:        rewrite_method_calls_to_self(f, node->UnaryExpr.expr, method_names); break;
+	case Ast_BinaryExpr:
+		rewrite_method_calls_to_self(f, node->BinaryExpr.left, method_names);
+		rewrite_method_calls_to_self(f, node->BinaryExpr.right, method_names);
+		break;
+	case Ast_ParenExpr:        rewrite_method_calls_to_self(f, node->ParenExpr.expr, method_names); break;
+	case Ast_SelectorExpr:     rewrite_method_calls_to_self(f, node->SelectorExpr.expr, method_names); break;
+	case Ast_IndexExpr:
+		rewrite_method_calls_to_self(f, node->IndexExpr.expr, method_names);
+		rewrite_method_calls_to_self(f, node->IndexExpr.index, method_names);
+		break;
+	case Ast_DerefExpr:        rewrite_method_calls_to_self(f, node->DerefExpr.expr, method_names); break;
+	case Ast_SliceExpr:
+		rewrite_method_calls_to_self(f, node->SliceExpr.expr, method_names);
+		rewrite_method_calls_to_self(f, node->SliceExpr.low, method_names);
+		rewrite_method_calls_to_self(f, node->SliceExpr.high, method_names);
+		break;
+	case Ast_CompoundLit:      rewrite_method_calls_in_array(f, node->CompoundLit.elems, method_names); break;
+	case Ast_FieldValue:
+		rewrite_method_calls_to_self(f, node->FieldValue.field, method_names);
+		rewrite_method_calls_to_self(f, node->FieldValue.value, method_names);
+		break;
+	case Ast_TernaryIfExpr:
+		rewrite_method_calls_to_self(f, node->TernaryIfExpr.x, method_names);
+		rewrite_method_calls_to_self(f, node->TernaryIfExpr.cond, method_names);
+		rewrite_method_calls_to_self(f, node->TernaryIfExpr.y, method_names);
+		break;
+	case Ast_TypeAssertion:    rewrite_method_calls_to_self(f, node->TypeAssertion.expr, method_names); break;
+	case Ast_TypeCast:
+		rewrite_method_calls_to_self(f, node->TypeCast.type, method_names);
+		rewrite_method_calls_to_self(f, node->TypeCast.expr, method_names);
+		break;
+	case Ast_AutoCast:         rewrite_method_calls_to_self(f, node->AutoCast.expr, method_names); break;
+	case Ast_OrElseExpr:
+		rewrite_method_calls_to_self(f, node->OrElseExpr.x, method_names);
+		rewrite_method_calls_to_self(f, node->OrElseExpr.y, method_names);
+		break;
+	case Ast_OrReturnExpr:     rewrite_method_calls_to_self(f, node->OrReturnExpr.expr, method_names); break;
+	case Ast_OrBranchExpr:     rewrite_method_calls_to_self(f, node->OrBranchExpr.expr, method_names); break;
+	case Ast_ProcLit:          rewrite_method_calls_to_self(f, node->ProcLit.body, method_names); break;
+	default: break;
+	}
+}
+
 // Builds a synthetic dispatcher value-decl:
 //
 //     <method_name> :: proc(<cloned params>) <-> <cloned results> {
@@ -7190,6 +7332,58 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 		Token struct_name_token = name_ident->Ident.token;
 		for (Ast *method : st->methods) {
 			array_add(&pending, PendingMethod{method, struct_name_token});
+		}
+	}
+
+	// Pass 1.25: rewrite bare-ident calls in each method body so a
+	// method can call another method on the same struct without an
+	// explicit `self.` — symmetric with how `using self` already makes
+	// fields directly accessible. Per-struct: only calls whose callee
+	// matches *this* struct's method names get rewritten.
+	{
+		struct StructMethodSet {
+			String        struct_name;
+			Array<String> method_names;
+		};
+		auto sets = array_make<StructMethodSet>(temporary_allocator());
+
+		for (PendingMethod const &pm : pending) {
+			Ast *method = pm.method;
+			if (method->kind != Ast_ValueDecl || method->ValueDecl.names.count != 1) continue;
+			Ast *name_ast = method->ValueDecl.names[0];
+			if (name_ast->kind != Ast_Ident) continue;
+			String mname = name_ast->Ident.token.string;
+			String sname = pm.struct_name_token.string;
+
+			StructMethodSet *sm = nullptr;
+			for (StructMethodSet &cand : sets) {
+				if (cand.struct_name == sname) { sm = &cand; break; }
+			}
+			if (sm == nullptr) {
+				StructMethodSet new_sm = {};
+				new_sm.struct_name  = sname;
+				new_sm.method_names = array_make<String>(temporary_allocator());
+				array_add(&sets, new_sm);
+				sm = &sets[sets.count - 1];
+			}
+			array_add(&sm->method_names, mname);
+		}
+
+		for (PendingMethod const &pm : pending) {
+			Ast *method = pm.method;
+			if (method->kind != Ast_ValueDecl || method->ValueDecl.values.count != 1) continue;
+			Ast *proc_lit = method->ValueDecl.values[0];
+			if (proc_lit->kind != Ast_ProcLit) continue;
+			Ast *body = proc_lit->ProcLit.body;
+			if (body == nullptr) continue;
+
+			String sname = pm.struct_name_token.string;
+			for (StructMethodSet const &sm : sets) {
+				if (sm.struct_name == sname) {
+					rewrite_method_calls_to_self(f, body, sm.method_names);
+					break;
+				}
+			}
 		}
 	}
 
