@@ -160,6 +160,65 @@ Entity :: struct {
 	name:       string,
 }
 
+// --- in-struct proc declarations ---
+//
+// Methods can be declared directly inside a struct body — the compiler
+// lifts each to a free `name :: proc(using self: ^Struct, ...) {...}`
+// at package scope, so the body reads fields directly (no `self.`
+// prefix) and the call site uses normal UFCS. Same machinery as a
+// hand-written free proc, just declared inline.
+
+Bullet :: struct {
+	x, y, vx, vy: f32,
+
+	tick :: proc(dt: f32) {
+		x += vx * dt
+		y += vy * dt
+	},
+
+	speed_squared :: proc() -> f32 {
+		return vx * vx + vy * vy
+	},
+}
+
+// `impl Type { ... }` is the second form — same desugaring, but the
+// methods live in a block separate from the struct decl. Useful when
+// you want to declare extra methods in a different file.
+
+Inventory :: struct {
+	items: [dynamic]string,
+}
+
+impl Inventory {
+	push_item :: proc(name: string) {
+		append(&items, name)
+	}
+
+	count :: proc() -> int {
+		return len(items)
+	}
+}
+
+// Cross-struct collision: two structs both declare `hit`. The
+// compiler mangles each lifted proc (`Knight__hit`, `Wizard__hit`)
+// and synthesises `hit :: proc { Knight__hit, Wizard__hit }` at
+// file scope. UFCS dispatches via overload resolution on the
+// first-arg type.
+
+Knight :: struct {
+	hp: int,
+	hit :: proc(amount: int) {
+		hp -= amount
+	},
+}
+
+Wizard :: struct {
+	hp: int,
+	hit :: proc(amount: int) {
+		hp -= amount * 2 // wizards have weak constitution
+	},
+}
+
 main :: proc() {
 	// --- methods on a user struct ---
 	p := Player {
@@ -253,6 +312,37 @@ main :: proc() {
 
 	fmt.printfln("entity %q: pos=(%v, %v) v=(%v, %v)", e.name, e.x, e.y, e.vx, e.vy)
 	fmt.assertf(e.vy == 10 && e.y == 5, "expected vy=10 y=5, got vy=%v y=%v", e.vy, e.y)
+
+	// --- in-struct procs ---
+	// `tick` and `speed_squared` are declared inside `Bullet`. The body
+	// reads `vx`/`vy` etc directly thanks to implicit `using self`.
+
+	b := Bullet{x = 0, y = 0, vx = 3, vy = 4}
+	b.tick(1.0)
+	fmt.printfln("bullet pos=(%v, %v) speed^2=%v", b.x, b.y, b.speed_squared())
+	fmt.assertf(b.x == 3 && b.y == 4 && b.speed_squared() == 25,
+		"expected pos=(3,4) speed^2=25, got pos=(%v,%v) speed^2=%v",
+		b.x, b.y, b.speed_squared())
+
+	// --- impl block ---
+
+	inv: Inventory
+	inv.push_item("torch")
+	inv.push_item("rope")
+	inv.push_item("map")
+	fmt.printfln("inventory count=%d (expected 3)", inv.count())
+	fmt.assertf(inv.count() == 3, "expected inventory count=3, got %d", inv.count())
+	delete(inv.items)
+
+	// --- collision becomes auto proc group ---
+
+	k := Knight{hp = 100}
+	w := Wizard{hp = 100}
+	k.hit(10)
+	w.hit(10)
+	fmt.printfln("knight hp=%d wizard hp=%d", k.hp, w.hp)
+	fmt.assertf(k.hp == 90 && w.hp == 80,
+		"expected knight=90 wizard=80, got %d / %d", k.hp, w.hp)
 
 	fmt.println("OK")
 }
