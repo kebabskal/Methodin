@@ -6949,16 +6949,34 @@ gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 	array_add(decls_out, method);
 }
 
+struct PendingMethod {
+	Ast *method;             // Ast_ValueDecl wrapping the proc literal
+	Token struct_name_token; // owning struct's name token
+};
+
+// Builds `Struct__name` as a permanent String for the mangled per-struct
+// alias of a method that participates in an auto-proc-group.
+gb_internal String mangle_method_name(String struct_name, String method_name) {
+	gbString s = gb_string_make(permanent_allocator(), "");
+	s = gb_string_append_fmt(s, "%.*s__%.*s", LIT(struct_name), LIT(method_name));
+	return make_string_c(s);
+}
+
 gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
+	// Pass 1: collect every in-struct / impl-block method along with the
+	// token of the struct it belongs to. We do this before any lifting
+	// so we can detect cross-struct name collisions and synthesise a
+	// proc-group instead of two clashing top-level decls.
+	auto pending = array_make<PendingMethod>(temporary_allocator());
+
 	isize original_count = decls_out->count;
 	for (isize i = 0; i < original_count; i++) {
 		Ast *decl = (*decls_out)[i];
 
-		// `impl <Type> { ... }` block: forward the methods to be lifted
-		// against the impl's target type. The target must be a simple
-		// identifier — qualified types like `pkg.T` are deferred to a
-		// later phase since lifting cross-package methods raises
-		// visibility / ownership questions of their own.
+		// `impl <Type> { ... }` block: collect methods against the
+		// impl's target type. Target must be a simple identifier —
+		// `pkg.T` targets raise visibility/ownership questions deferred
+		// to a later phase.
 		if (decl->kind == Ast_ImplBlock) {
 			Ast *te = decl->ImplBlock.type_expr;
 			if (te == nullptr || te->kind != Ast_Ident) {
@@ -6967,7 +6985,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			}
 			Token struct_name_token = te->Ident.token;
 			for (Ast *method : decl->ImplBlock.methods) {
-				lift_one_method(f, method, struct_name_token, decls_out);
+				array_add(&pending, PendingMethod{method, struct_name_token});
 			}
 			continue;
 		}
@@ -6987,10 +7005,91 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 		if (st->methods.count == 0) continue;
 
 		Token struct_name_token = name_ident->Ident.token;
-
 		for (Ast *method : st->methods) {
-			lift_one_method(f, method, struct_name_token, decls_out);
+			array_add(&pending, PendingMethod{method, struct_name_token});
 		}
+	}
+
+	// Pass 2: group by user-visible method name, lift each group.
+	// O(N^2) over collected methods — N is small in practice (the
+	// number of in-struct / impl methods declared in one file).
+	auto handled = array_make<bool>(temporary_allocator(), pending.count);
+
+	for (isize i = 0; i < pending.count; i++) {
+		if (handled[i]) continue;
+		Ast *method_i = pending[i].method;
+		if (method_i->kind != Ast_ValueDecl || method_i->ValueDecl.names.count != 1) {
+			handled[i] = true;
+			continue;
+		}
+		Ast *name_ast_i = method_i->ValueDecl.names[0];
+		if (name_ast_i->kind != Ast_Ident) {
+			handled[i] = true;
+			continue;
+		}
+		String method_name = name_ast_i->Ident.token.string;
+
+		auto group_indices = array_make<isize>(temporary_allocator());
+		array_add(&group_indices, i);
+		handled[i] = true;
+
+		for (isize j = i+1; j < pending.count; j++) {
+			if (handled[j]) continue;
+			Ast *mj = pending[j].method;
+			if (mj->kind != Ast_ValueDecl || mj->ValueDecl.names.count != 1) continue;
+			Ast *nj = mj->ValueDecl.names[0];
+			if (nj->kind != Ast_Ident) continue;
+			if (nj->Ident.token.string == method_name) {
+				array_add(&group_indices, j);
+				handled[j] = true;
+			}
+		}
+
+		if (group_indices.count == 1) {
+			// No collision — lift with the user-visible name.
+			lift_one_method(f, pending[i].method, pending[i].struct_name_token, decls_out);
+			continue;
+		}
+
+		// Collision: mangle each method to `<Struct>__<name>`, lift,
+		// then synthesise a `name :: proc { Struct1__name, ... }`
+		// group at file scope so unqualified UFCS calls still
+		// dispatch correctly via overload resolution.
+		auto group_members = array_make<Ast *>(ast_allocator(f));
+
+		for (isize idx : group_indices) {
+			PendingMethod pm = pending[idx];
+			Ast *name_ident = pm.method->ValueDecl.names[0];
+			Token mangled_tok = name_ident->Ident.token;
+			mangled_tok.string = mangle_method_name(pm.struct_name_token.string, method_name);
+			name_ident->Ident.token = mangled_tok;
+
+			lift_one_method(f, pm.method, pm.struct_name_token, decls_out);
+
+			array_add(&group_members, ast_ident(f, mangled_tok));
+		}
+
+		// `proc { ... }` group expression.
+		Token proc_tok = {};
+		proc_tok.kind = Token_proc;
+		proc_tok.string = str_lit("proc");
+		proc_tok.pos = pending[group_indices[0]].struct_name_token.pos;
+		Token open_tok = proc_tok; open_tok.kind = Token_OpenBrace; open_tok.string = str_lit("{");
+		Token close_tok = proc_tok; close_tok.kind = Token_CloseBrace; close_tok.string = str_lit("}");
+
+		Ast *group_expr = ast_proc_group(f, proc_tok, open_tok, close_tok, group_members);
+
+		// Wrap as `<name> :: proc { ... }` ValueDecl and append.
+		Token group_name_tok = pending[group_indices[0]].struct_name_token;
+		group_name_tok.kind = Token_Ident;
+		group_name_tok.string = method_name;
+
+		auto gn = array_make<Ast *>(ast_allocator(f), 0, 1);
+		array_add(&gn, ast_ident(f, group_name_tok));
+		auto gv = array_make<Ast *>(ast_allocator(f), 0, 1);
+		array_add(&gv, group_expr);
+		Ast *group_decl = ast_value_decl(f, gn, nullptr, gv, false, nullptr, nullptr);
+		array_add(decls_out, group_decl);
 	}
 }
 

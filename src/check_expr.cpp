@@ -5821,65 +5821,74 @@ gb_internal bool try_ufcs_resolve_at(CheckerContext *c, AstPackage *pkg,
 	}
 	if (!usable) return false;
 
-	Type *want_first = nullptr;
+	// Decide whether to pass the receiver as-is, &recv, or *recv. For a
+	// single Entity_Procedure we look at that proc's first-param type.
+	// For Entity_ProcGroup we scan every member, since the auto-generated
+	// groups for in-struct procs span different structs (^Player,
+	// ^Enemy, ...) and any one of them might be the intended overload.
+	auto try_match = [&](Type *want_first, Operand const &y, Operand const &z, bool can_deref, Operand const &w, bool can_addrof,
+	                     bool *out_asis, bool *out_deref, bool *out_addrof) {
+		if (want_first == nullptr) return;
+		if (is_type_polymorphic(want_first)) {
+			bool want_ptr = is_type_pointer(want_first);
+			bool recv_ptr = is_type_pointer(recv_type);
+			if (want_ptr == recv_ptr) *out_asis = true;
+			else if (want_ptr && can_addrof) *out_addrof = true;
+			else if (!want_ptr && can_deref) *out_deref = true;
+			return;
+		}
+		Operand y_local = y;
+		if (check_is_assignable_to(c, &y_local, want_first)) *out_asis = true;
+		if (can_deref) {
+			Operand z_local = z;
+			if (check_is_assignable_to(c, &z_local, want_first)) *out_deref = true;
+		}
+		if (can_addrof) {
+			Operand w_local = w;
+			if (check_is_assignable_to(c, &w_local, want_first)) *out_addrof = true;
+		}
+	};
+
+	Operand y = {};
+	y.mode  = recv_mode;
+	y.type  = recv_type;
+	y.value = recv_value;
+	Operand z = y;
+	z.type = type_deref(recv_type);
+	bool can_deref  = (z.type != recv_type);
+	Operand w = y;
+	w.type = alloc_type_pointer(recv_type);
+	bool can_addrof = (recv_mode == Addressing_Variable);
+
+	bool ok_asis = false, ok_deref = false, ok_addrof = false;
+
 	if (e->kind == Entity_Procedure) {
 		Type *pt = base_type(e->type);
 		if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.param_count > 0) {
-			want_first = pt->Proc.params->Tuple.variables[0]->type;
+			try_match(pt->Proc.params->Tuple.variables[0]->type,
+			          y, z, can_deref, w, can_addrof,
+			          &ok_asis, &ok_deref, &ok_addrof);
 		}
 	} else {
 		for (Entity *m : e->ProcGroup.entities) {
 			if (m == nullptr || m->type == nullptr) continue;
 			Type *pt = base_type(m->type);
-			if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.param_count > 0) {
-				want_first = pt->Proc.params->Tuple.variables[0]->type;
-				break;
-			}
+			if (pt == nullptr || pt->kind != Type_Proc || pt->Proc.param_count == 0) continue;
+			try_match(pt->Proc.params->Tuple.variables[0]->type,
+			          y, z, can_deref, w, can_addrof,
+			          &ok_asis, &ok_deref, &ok_addrof);
 		}
 	}
 
 	Ast *first_arg = recv_expr;
-	if (want_first != nullptr) {
-		// For polymorphic want_first (common with proc groups like `append`,
-		// whose first member has `^$T/[dynamic]$E`), we cannot use
-		// check_is_assignable_to: matching against a polymorphic type
-		// specialises it and that state persists on the shared type instance,
-		// so a later UFCS call with a different element type would fail.
-		// Decide structurally here and let real overload resolution validate
-		// the call.
-		if (is_type_polymorphic(want_first)) {
-			bool want_pointer     = is_type_pointer(want_first);
-			bool receiver_pointer = is_type_pointer(recv_type);
-			if (want_pointer && !receiver_pointer && recv_mode == Addressing_Variable) {
-				Token op = {Token_And};
-				first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
-			} else if (!want_pointer && receiver_pointer) {
-				Token op = {Token_Pointer};
-				first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
-			}
-		} else {
-			Operand y = {};
-			y.mode = recv_mode;
-			y.type = recv_type;
-			y.value = recv_value;
-			if (check_is_assignable_to(c, &y, want_first)) {
-				// Pass receiver as-is.
-			} else {
-				Operand z = y;
-				z.type = type_deref(y.type);
-				if (z.type != y.type && check_is_assignable_to(c, &z, want_first)) {
-					Token op = {Token_Pointer};
-					first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
-				} else if (y.mode == Addressing_Variable) {
-					Operand w = y;
-					w.type = alloc_type_pointer(y.type);
-					if (check_is_assignable_to(c, &w, want_first)) {
-						Token op = {Token_And};
-						first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
-					}
-				}
-			}
-		}
+	if (ok_asis) {
+		// Pass receiver as-is.
+	} else if (ok_addrof) {
+		Token op = {Token_And};
+		first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
+	} else if (ok_deref) {
+		Token op = {Token_Pointer};
+		first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
 	}
 
 	*out_entity = e;
