@@ -2593,6 +2593,23 @@ gb_internal void check_if_stmt(CheckerContext *ctx, Ast *node, u32 mod_flags) {
 	check_close_scope(ctx);
 }
 
+// True when `e` is reached through one or more `using` hops that
+// ultimately bottom out in a parameter of pointer type. Methodin's
+// in-struct procs always synthesise `using self: ^Struct` and then
+// have method bodies that touch struct fields by bare name — without
+// this exception, `return &voxels[i]` (which really means
+// `return &self.voxels[i]`) trips check_unsafe_return as if `voxels`
+// were a local array, even though it lives in caller-owned memory.
+gb_internal bool is_entity_using_field_via_pointer_param(Entity *e) {
+	if (e == nullptr) return false;
+	while (e != nullptr && (e->flags & EntityFlag_Using) != 0 && e->using_parent != nullptr) {
+		e = e->using_parent;
+	}
+	if (e == nullptr) return false;
+	if ((e->flags & EntityFlag_Param) == 0) return false;
+	return e->type != nullptr && is_type_pointer(e->type);
+}
+
 // NOTE(bill): This is very basic escape analysis
 // This needs to be improved tremendously, and a lot of it done during the
 // middle-end (or LLVM side) to improve checks and error messages
@@ -2622,27 +2639,27 @@ void check_unsafe_return(Operand const &o, Type *type, Ast *expr) {
 	} else if (expr->kind == Ast_UnaryExpr && expr->UnaryExpr.op.kind == Token_And) {
 		Ast *x = unparen_expr(expr->UnaryExpr.expr);
 		Entity *e = entity_of_node(x);
-		if (is_entity_local_variable(e)) {
+		if (is_entity_local_variable(e) && !is_entity_using_field_via_pointer_param(e)) {
 			unsafe_return_error(o, "the address of a local variable");
 		} else if (x->kind == Ast_CompoundLit) {
 			unsafe_return_error(o, "the address of a compound literal");
 		} else if (x->kind == Ast_IndexExpr) {
 			Entity *f = entity_of_node(x->IndexExpr.expr);
 			if (f && (is_type_array_like(f->type) || is_type_matrix(f->type))) {
-				if (is_entity_local_variable(f)) {
+				if (is_entity_local_variable(f) && !is_entity_using_field_via_pointer_param(f)) {
 					unsafe_return_error(o, "the address of an indexed variable", f->type);
 				}
 			}
 		} else if (x->kind == Ast_MatrixIndexExpr) {
 			Entity *f = entity_of_node(x->MatrixIndexExpr.expr);
-			if (f && (is_type_matrix(f->type) && is_entity_local_variable(f))) {
+			if (f && is_type_matrix(f->type) && is_entity_local_variable(f) && !is_entity_using_field_via_pointer_param(f)) {
 				unsafe_return_error(o, "the address of an indexed variable", f->type);
 			}
 		}
 	} else if (expr->kind == Ast_SliceExpr) {
 		Ast *x = unparen_expr(expr->SliceExpr.expr);
 		Entity *e = entity_of_node(x);
-		if (is_entity_local_variable(e) && is_type_array(e->type)) {
+		if (is_entity_local_variable(e) && is_type_array(e->type) && !is_entity_using_field_via_pointer_param(e)) {
 			unsafe_return_error(o, "a slice of a local variable");
 		} else if (x->kind == Ast_CompoundLit) {
 			unsafe_return_error(o, "a slice of a compound literal");
