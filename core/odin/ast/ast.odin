@@ -558,6 +558,19 @@ Foreign_Import_Decl :: struct {
 	comment:         ^Comment_Group, // possibly nil
 }
 
+// Methodin extension: `impl <Type> { name :: proc(...) {...} ... }`.
+// `impl` is contextual; only treated as a block introducer when the
+// shape is `Ident("impl") <Type-expr> {`. Method decls inside the
+// block are the same `name :: proc(...) {...}` value-decls used in
+// in-struct decl form.
+Impl_Block :: struct {
+	using node: Decl,
+	docs:        ^Comment_Group,
+	impl_tok:    tokenizer.Token,
+	type_expr:   ^Expr,
+	methods:     []^Stmt,
+}
+
 
 
 // Other things
@@ -812,6 +825,7 @@ Struct_Type :: struct {
 	is_simple:       bool,
 	fields:          ^Field_List,
 	name_count:      int,
+	methods:         []^Stmt,     // in-struct `name :: proc(...) {...}` decls
 }
 
 Union_Type_Kind :: enum u8 {
@@ -976,6 +990,7 @@ Any_Node :: union {
 	^Import_Decl,
 	^Foreign_Block_Decl,
 	^Foreign_Import_Decl,
+	^Impl_Block,
 
 	^Attribute,
 	^Field,
@@ -1066,4 +1081,5 @@ Any_Stmt :: union {
 	^Import_Decl,
 	^Foreign_Block_Decl,
 	^Foreign_Import_Decl,
+	^Impl_Block,
 }
