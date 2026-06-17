@@ -7781,6 +7781,15 @@ gb_internal void assemble_methodin_method_groups(AstPackage *pkg) {
 	for (isize i = 0; i < new_decls.count; i++) merged[old_count + i] = new_decls[i];
 	target->decls.data  = merged;
 	target->decls.count = old_count + new_decls.count;
+
+	// `pkg->exported_entity_queue` is sized from `f->total_file_decl_count`
+	// in the checker (mpmc_init in check_add_package_files). The synth
+	// decls add new top-level entities, so the file's decl count has to
+	// grow with them — otherwise the queue is too small and the worker
+	// dequeues null entries, SEGV'ing in check_export_entities_in_pkg.
+	for (Ast *d : new_decls) {
+		target->total_file_decl_count += calc_decl_count(d);
+	}
 }
 
 gb_internal bool parse_file(Parser *p, AstFile *f) {
