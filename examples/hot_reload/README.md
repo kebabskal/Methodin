@@ -38,9 +38,21 @@ hot_reloaded :: proc() {
 the agent calls it after swapping in the new code. It's entirely optional — omit it and
 reloads happen silently. Nothing else about your program needs to change.
 
+## Reloadable vs. restart
+
+Some changes can't be patched into a running native process. The agent detects these and
+**automatically restarts** the program (rebuilding with the new code) instead of swapping:
+
+- editing `main`'s body (the running loop can't be re-entered);
+- adding, removing, or changing the type of a package global (the layout would no longer
+  match the host's storage).
+
+Everything else — editing any other procedure's body — hot-reloads in place with global
+state preserved. Restarts necessarily lose in-memory state, which is unavoidable for a
+layout/loop change.
+
 ## Limitations
 
-- Edits to `main` itself (or any procedure currently on the call stack) only take effect on
-  the next call; the running `main` loop keeps executing its old body until restarted.
-- Adding/removing globals or changing a global's type/layout requires a restart.
+- Restart detection covers global layout and `main`; a procedure that is *currently on the
+  call stack* (other than `main`) still updates only on its next call.
 - Currently targets macOS/Linux. Reloads only the initial (user) package's procedures.

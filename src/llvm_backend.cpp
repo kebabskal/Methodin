@@ -304,6 +304,79 @@ gb_internal void lb_emit_hot_reload_manifest(lbModule *m) {
 	lb_hr_named_cstring(m, "odin_hr_odin_path", odin_exe);
 }
 
+// A content hash of everything about the initial package that CANNOT be live-patched:
+// the layout (name + byte size) of every package global, and the body of `main`. If this
+// differs between the running host and a freshly built reload library, the change is a
+// "rude edit" (added/removed/resized global, or an edit to the main loop) and the agent
+// must restart the program rather than swap code in. Computed purely from the checker info
+// and source, so the host and the reload dylib agree for identical source regardless of
+// which mode they were built in.
+gb_internal u64 lb_hot_reload_signature(CheckerInfo *info) {
+	u64 const FNV_OFFSET = 1469598103934665603ull;
+	u64 const FNV_PRIME  = 1099511628211ull;
+	auto fold = [](u64 h, u8 const *bytes, isize n) -> u64 {
+		for (isize i = 0; i < n; i++) { h ^= bytes[i]; h *= FNV_PRIME; }
+		return h;
+	};
+
+	// Globals: order-independent (XOR of per-global hashes) so it doesn't depend on entity
+	// iteration order, only on the set of (name, size).
+	u64 globals_acc = 0;
+	for_array(i, info->entities) {
+		Entity *e = info->entities[i];
+		if (e == nullptr || e->kind != Entity_Variable || e->pkg != info->init_package) {
+			continue;
+		}
+		if (e->Variable.is_foreign || e->type == nullptr) {
+			continue;
+		}
+		u64 gh = FNV_OFFSET;
+		gh = fold(gh, e->token.string.text, e->token.string.len);
+		// Hash the type identity (not just its size): int and f64 are both 8 bytes but
+		// reinterpreting one as the other across a reload would silently corrupt state.
+		u64 th = type_hash_canonical_type(e->type);
+		gh = fold(gh, cast(u8 const *)&th, gb_size_of(th));
+		globals_acc ^= gh;
+	}
+
+	u64 h = FNV_OFFSET;
+	h = fold(h, cast(u8 const *)&globals_acc, gb_size_of(globals_acc));
+
+	// `main`'s body: looked up by name (entry_point is null in reload builds), so both builds
+	// hash the same thing. Editing the loop changes the body tokens -> signature changes.
+	if (info->init_package != nullptr && info->init_package->scope != nullptr) {
+		Entity *m = scope_lookup_current(info->init_package->scope, string_interner_insert(str_lit("main")));
+		DeclInfo *d = (m != nullptr) ? decl_info_of_entity(m) : nullptr;
+		if (d != nullptr && d->proc_lit != nullptr && d->proc_lit->kind == Ast_ProcLit && d->proc_lit->ProcLit.body != nullptr && m->file != nullptr) {
+			Ast *body = d->proc_lit->ProcLit.body;
+			i32 lo = ast_token(body).pos.offset;
+			i32 hi = ast_end_token(body).pos.offset;
+			for (Token const &t : m->file->tokens) {
+				if (t.pos.offset >= lo && t.pos.offset <= hi) {
+					h = fold(h, t.string.text, t.string.len);
+					h = fold(h, cast(u8 const *)" ", 1);
+				}
+			}
+		}
+	}
+
+	return h;
+}
+
+// Emit the rude-edit signature as an exported symbol the agent compares across reloads.
+gb_internal void lb_emit_hot_reload_signature(lbModule *m) {
+	if (build_context.hot_reload_mode == HotReload_None) {
+		return;
+	}
+	u64 sig = lb_hot_reload_signature(m->info);
+	LLVMValueRef g = LLVMAddGlobal(m->mod, lb_type(m, t_u64), "odin_hr_signature");
+	LLVMSetInitializer(g, LLVMConstInt(lb_type(m, t_u64), sig, false));
+	LLVMSetLinkage(g, LLVMExternalLinkage);
+	LLVMSetVisibility(g, LLVMDefaultVisibility);
+	LLVMSetGlobalConstant(g, true);
+	lb_append_to_compiler_used(m, g);
+}
+
 gb_internal void lb_correct_entity_linkage(lbGenerator *gen) {
 	for (lbEntityCorrection ec = {}; mpsc_dequeue(&gen->entities_to_correct_linkage, &ec); /**/) {
 		LLVMValueRef other_global = nullptr;
@@ -3725,6 +3798,9 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		TIME_SECTION("LLVM Hot Reload Slots");
 		lb_create_hot_reload_slots(&gen->default_module);
 		lb_emit_hot_reload_manifest(&gen->default_module);
+	}
+	if (build_context.hot_reload_mode != HotReload_None) {
+		lb_emit_hot_reload_signature(&gen->default_module);
 	}
 
 	TIME_SECTION("LLVM Procedure Generation");
