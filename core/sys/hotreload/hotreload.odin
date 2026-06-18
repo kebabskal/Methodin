@@ -34,6 +34,7 @@ Entry :: struct {
 	src_path:  string,
 	odin_path: string,
 	is_file:   bool,
+	host_sig:  u64, // rude-edit signature of the running program; a mismatch forces a restart
 	gen:       int,
 }
 
@@ -60,6 +61,9 @@ _hot_reload_boot :: proc "contextless" () {
 	g.src_path  = _cstr(posix.dlsym(main, "odin_hr_src_path"))
 	g.odin_path = _cstr(posix.dlsym(main, "odin_hr_odin_path"))
 	g.is_file   = strings.has_suffix(g.src_path, ".odin")
+	if sig := cast(^u64)posix.dlsym(main, "odin_hr_signature"); sig != nil {
+		g.host_sig = sig^
+	}
 
 	if g.src_path == "" || g.odin_path == "" {
 		return
@@ -156,8 +160,21 @@ _reload :: proc() {
 
 	lib, ok := dynlib.load_library(out)
 	if !ok {
-		fmt.println("[hot-reload] failed to load rebuilt library")
+		// Most often this means the package's set of globals changed (a symbol the new code
+		// imports is not exported by the running host), which is a rude edit -> restart.
+		fmt.eprintln("[hot-reload] rebuilt library could not be loaded into the running program")
+		_restart()
 		return
+	}
+
+	// Rude-edit check: if the global layout or the main loop changed, the running process
+	// cannot be patched in place — restart it with the new code instead.
+	if sig, found := dynlib.symbol_address(lib, "odin_hr_signature"); found && sig != nil {
+		if (cast(^u64)sig)^ != g.host_sig {
+			fmt.eprintln("[hot-reload] non-reloadable change (globals or main loop) — restarting…")
+			_restart()
+			return
+		}
 	}
 
 	swapped := 0
@@ -178,6 +195,24 @@ _reload :: proc() {
 	if hook != nil {
 		(cast(proc())hook)()
 	}
+}
+
+// Replace the running process with a fresh `odin watch` of the same target. This rebuilds
+// the host with the new code (new globals/main) and runs it — program state is lost, which
+// is unavoidable for a layout/loop change.
+@(private)
+_restart :: proc() {
+	argv := make([dynamic]cstring, 0, 6, context.temp_allocator)
+	append(&argv, strings.clone_to_cstring(g.odin_path, context.temp_allocator))
+	append(&argv, "watch")
+	append(&argv, strings.clone_to_cstring(g.src_path, context.temp_allocator))
+	if g.is_file {
+		append(&argv, "-file")
+	}
+	append(&argv, nil) // execv requires a null-terminated argument vector
+	posix.execv(argv[0], raw_data(argv))
+	// execv only returns on failure.
+	fmt.eprintln("[hot-reload] restart failed; please re-run `odin watch` manually")
 }
 
 // True if a mangled proc symbol's final segment is the reserved hook name `hot_reloaded`.
