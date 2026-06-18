@@ -320,11 +320,23 @@ gb_internal u64 lb_hot_reload_signature(CheckerInfo *info) {
 	};
 
 	// Globals: order-independent (XOR of per-global hashes) so it doesn't depend on entity
-	// iteration order, only on the set of (name, size).
+	// iteration order, only on the set of (name, type).
+	//
+	// Iterate `variable_init_order` (the package-scope variables) rather than `entities`
+	// (every entity in the program). The latter also contains proc-locals — loop indices,
+	// `using` field bindings, etc. — many sharing a (name, type) like `i: int`. Because we
+	// XOR, an even count of an identical local cancels to 0; that parity is not stable
+	// across multithreaded builds (e.g. polymorphic instantiations created in a different
+	// order), so the signature changed build-to-build with no real edit, and the agent
+	// restarted on nearly every reload. The `ScopeFlag_File` check keeps only true
+	// package-scope globals (mirrors the global-variable emission loop below).
 	u64 globals_acc = 0;
-	for_array(i, info->entities) {
-		Entity *e = info->entities[i];
+	for (DeclInfo *d : info->variable_init_order) {
+		Entity *e = d->entity;
 		if (e == nullptr || e->kind != Entity_Variable || e->pkg != info->init_package) {
+			continue;
+		}
+		if (e->scope == nullptr || (e->scope->flags & ScopeFlag_File) == 0) {
 			continue;
 		}
 		if (e->Variable.is_foreign || e->type == nullptr) {
