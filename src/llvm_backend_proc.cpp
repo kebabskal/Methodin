@@ -227,12 +227,20 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 		lb_add_attribute_to_proc(m, p->value, "cold");
 	}
 
+	// Hot reload: in a reload dylib, every reloadable proc must be an exported dynamic symbol
+	// so the agent can dlsym it by name and patch the host's dispatch slot.
+	bool hot_export = build_context.hot_reload_mode == HotReload_Reload && !p->is_foreign && lb_is_hot_reloadable_entity(m, entity);
+
 	if (p->is_export) {
 		LLVMSetLinkage(p->value, LLVMDLLExportLinkage);
 		LLVMSetDLLStorageClass(p->value, LLVMDLLExportStorageClass);
 		LLVMSetVisibility(p->value, LLVMDefaultVisibility);
 
 		lb_set_wasm_export_attributes(p->value, p->name);
+	} else if (hot_export) {
+		LLVMSetLinkage(p->value, LLVMExternalLinkage);
+		LLVMSetVisibility(p->value, LLVMDefaultVisibility);
+		lb_append_to_compiler_used(m, p->value);
 	} else if (!p->is_foreign) {
 		if (USE_SEPARATE_MODULES) {
 			LLVMSetLinkage(p->value, LLVMExternalLinkage);
@@ -4832,7 +4840,18 @@ gb_internal lbValue lb_build_call_expr_internal(lbProcedure *p, Ast *expr, lbVal
 	if (is_objc_call) {
 		value.type = proc_tv.type;
 	} else if (value.value == nullptr) {
-		value = lb_build_expr(p, proc_expr);
+		// Hot reload: a direct call to a reloadable proc is dispatched through its writable
+		// slot so the reload agent can swap in new code. The loaded pointer is called with
+		// the same ABI as the direct call would have used.
+		lbValue *hr_slot = nullptr;
+		if (build_context.hot_reload_mode == HotReload_Host && proc_entity != nullptr && proc_entity->kind == Entity_Procedure) {
+			hr_slot = map_get(&m->hot_reload_slots, proc_entity);
+		}
+		if (hr_slot != nullptr) {
+			value = lb_emit_load(p, *hr_slot);
+		} else {
+			value = lb_build_expr(p, proc_expr);
+		}
 	}
 
 	GB_ASSERT(value.value != nullptr || is_objc_call);

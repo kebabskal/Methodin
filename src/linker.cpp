@@ -817,6 +817,21 @@ try_cross_linking:;
 				}
 			}
 
+			// Hot reload: the host executable must export its symbols so a reload dylib can
+			// bind to its globals; the reload dylib must allow its (imported) package globals
+			// to be resolved against the running host at load time.
+			if (build_context.hot_reload_mode == HotReload_Host) {
+				if (build_context.metrics.os == TargetOs_darwin) {
+					link_settings = gb_string_appendc(link_settings, "-Wl,-export_dynamic ");
+				} else {
+					link_settings = gb_string_appendc(link_settings, "-Wl,--export-dynamic ");
+				}
+			} else if (build_context.hot_reload_mode == HotReload_Reload) {
+				if (build_context.metrics.os == TargetOs_darwin) {
+					link_settings = gb_string_appendc(link_settings, "-Wl,-undefined,dynamic_lookup ");
+				}
+			}
+
 			gbString platform_lib_str = gb_string_make(heap_allocator(), "");
 			defer (gb_string_free(platform_lib_str));
 			if (build_context.metrics.os == TargetOs_darwin) {

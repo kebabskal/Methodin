@@ -179,15 +179,147 @@ gb_internal void lb_set_entity_from_other_modules_linkage_correctly(lbModule *ot
 	mpsc_enqueue(&other_module->gen->entities_to_correct_linkage, lbEntityCorrection{other_module, e, cname});
 }
 
+// Hot reload (Host mode): create one writable, exported dispatch slot per reloadable proc.
+// Calls to the proc are compiled to load-the-slot + indirect-call; the reload agent rewrites
+// the slot to point at freshly-compiled code. Must run single-threaded after all procedure
+// declarations exist but before parallel body codegen reads the slot map.
+gb_internal void lb_create_hot_reload_slots(lbModule *m) {
+	if (build_context.hot_reload_mode != HotReload_Host) {
+		return;
+	}
+	for (Entity *e : m->global_procedures_to_create) {
+		if (e == nullptr || e->kind != Entity_Procedure) {
+			continue;
+		}
+		if (!lb_is_hot_reloadable_entity(m, e)) {
+			continue;
+		}
+		if (e->Procedure.is_foreign) {
+			continue;
+		}
+		// `main` is on the stack for the whole run and is never re-entered, so a slot for it
+		// would never take effect — skip it (edits to main's body need a restart).
+		if (e == m->info->entry_point) {
+			continue;
+		}
+		if (e->type == nullptr || base_type(e->type)->kind != Type_Proc) {
+			continue;
+		}
+
+		lbValue proc_value = lb_find_procedure_value_from_entity(m, e);
+		if (proc_value.value == nullptr) {
+			continue;
+		}
+
+		String proc_symbol = lb_get_entity_name(m, e);
+
+		gbString slot_name = gb_string_make(permanent_allocator(), "__hr_slot$");
+		slot_name = gb_string_append_length(slot_name, proc_symbol.text, proc_symbol.len);
+
+		LLVMTypeRef slot_type = lb_type(m, e->type); // proc value == pointer (ptr)
+		LLVMValueRef slot = LLVMAddGlobal(m->mod, slot_type, slot_name);
+		LLVMSetInitializer(slot, LLVMConstBitCast(proc_value.value, slot_type));
+		LLVMSetLinkage(slot, LLVMExternalLinkage);
+		LLVMSetVisibility(slot, LLVMDefaultVisibility);
+		lb_append_to_compiler_used(m, slot);
+
+		lbValue slot_val = {};
+		slot_val.value = slot;
+		slot_val.type  = alloc_type_pointer(e->type);
+		map_set(&m->hot_reload_slots, e, slot_val);
+
+		lbHotReloadSlot entry = {};
+		entry.entity      = e;
+		entry.slot        = slot_val;
+		entry.proc_symbol = proc_symbol;
+		entry.slot_symbol = make_string(cast(u8 const *)slot_name, gb_string_length(slot_name));
+		array_add(&m->hot_reload_slot_list, entry);
+	}
+}
+
+// A private, null-terminated char array; returns an i8* to its first byte (for embedding
+// pointers-to-string inside the manifest array).
+gb_internal LLVMValueRef lb_hr_inline_cstring(lbModule *m, String s) {
+	LLVMValueRef str = LLVMConstStringInContext(m->ctx, cast(char const *)s.text, cast(unsigned)s.len, /*DontNullTerminate*/false);
+	LLVMValueRef gv = LLVMAddGlobal(m->mod, LLVMTypeOf(str), "hr_cstr");
+	LLVMSetInitializer(gv, str);
+	LLVMSetLinkage(gv, LLVMPrivateLinkage);
+	LLVMSetGlobalConstant(gv, true);
+	LLVMValueRef zero = LLVMConstInt(LLVMInt32TypeInContext(m->ctx), 0, false);
+	LLVMValueRef idx[2] = { zero, zero };
+	return LLVMConstInBoundsGEP2(LLVMTypeOf(str), gv, idx, 2);
+}
+
+// A named, exported, null-terminated char array. dlsym(name) on the host returns a pointer
+// to the string bytes, so the agent reads it directly as a cstring.
+gb_internal void lb_hr_named_cstring(lbModule *m, char const *name, String s) {
+	LLVMValueRef str = LLVMConstStringInContext(m->ctx, cast(char const *)s.text, cast(unsigned)s.len, false);
+	LLVMValueRef gv = LLVMAddGlobal(m->mod, LLVMTypeOf(str), name);
+	LLVMSetInitializer(gv, str);
+	LLVMSetLinkage(gv, LLVMExternalLinkage);
+	LLVMSetVisibility(gv, LLVMDefaultVisibility);
+	LLVMSetGlobalConstant(gv, true);
+	lb_append_to_compiler_used(m, gv);
+}
+
+// Emit the hot-reload manifest the agent (core:sys/hotreload) discovers at startup:
+//   odin_hr_entries      : [N]{cstring proc_name, ^rawptr slot}
+//   odin_hr_entry_count  : int
+//   odin_hr_src_path     : cstring (absolute path to rebuild)
+//   odin_hr_odin_path    : cstring (the odin compiler executable)
+gb_internal void lb_emit_hot_reload_manifest(lbModule *m) {
+	if (build_context.hot_reload_mode != HotReload_Host) {
+		return;
+	}
+
+	LLVMTypeRef ptr_ty   = lb_type(m, t_rawptr);
+	LLVMTypeRef field_tys[2] = { ptr_ty, ptr_ty };
+	LLVMTypeRef entry_ty = LLVMStructTypeInContext(m->ctx, field_tys, 2, false);
+
+	isize n = m->hot_reload_slot_list.count;
+	auto elems = array_make<LLVMValueRef>(temporary_allocator(), 0, n);
+	for (lbHotReloadSlot const &e : m->hot_reload_slot_list) {
+		LLVMValueRef name_ptr = lb_hr_inline_cstring(m, e.proc_symbol);
+		LLVMValueRef slot_ptr = LLVMConstBitCast(e.slot.value, ptr_ty);
+		LLVMValueRef vals[2]  = { name_ptr, slot_ptr };
+		array_add(&elems, LLVMConstStructInContext(m->ctx, vals, 2, false));
+	}
+
+	LLVMTypeRef arr_ty = LLVMArrayType(entry_ty, cast(unsigned)n);
+	LLVMValueRef arr = LLVMConstArray(entry_ty, elems.data, cast(unsigned)n);
+	LLVMValueRef entries_g = LLVMAddGlobal(m->mod, arr_ty, "odin_hr_entries");
+	LLVMSetInitializer(entries_g, arr);
+	LLVMSetLinkage(entries_g, LLVMExternalLinkage);
+	LLVMSetVisibility(entries_g, LLVMDefaultVisibility);
+	lb_append_to_compiler_used(m, entries_g);
+
+	LLVMValueRef count_g = LLVMAddGlobal(m->mod, lb_type(m, t_int), "odin_hr_entry_count");
+	LLVMSetInitializer(count_g, LLVMConstInt(lb_type(m, t_int), cast(u64)n, false));
+	LLVMSetLinkage(count_g, LLVMExternalLinkage);
+	LLVMSetVisibility(count_g, LLVMDefaultVisibility);
+	lb_append_to_compiler_used(m, count_g);
+
+	String odin_exe = concatenate_strings(permanent_allocator(), odin_root_dir(), str_lit("odin"));
+	lb_hr_named_cstring(m, "odin_hr_src_path",  build_context.hot_reload_source_path);
+	lb_hr_named_cstring(m, "odin_hr_odin_path", odin_exe);
+}
+
 gb_internal void lb_correct_entity_linkage(lbGenerator *gen) {
 	for (lbEntityCorrection ec = {}; mpsc_dequeue(&gen->entities_to_correct_linkage, &ec); /**/) {
 		LLVMValueRef other_global = nullptr;
 		if (ec.e->kind == Entity_Variable) {
 			other_global = LLVMGetNamedGlobal(ec.other_module->mod, ec.cname);
 			if (other_global && (LLVMGetInitializer(other_global) != nullptr || LLVMIsExternallyInitialized(other_global))) {
-				LLVM_SET_INTERNAL_WEAK_LINKAGE(other_global);
-				if (!ec.e->Variable.is_export && !ec.e->Variable.is_foreign) {
-					LLVMSetVisibility(other_global, LLVMHiddenVisibility);
+				// Hot reload: the host must keep its package globals as visible dynamic
+				// symbols (so a reload dylib can bind to them); do not downgrade them.
+				if (build_context.hot_reload_mode == HotReload_Host && lb_is_hot_reloadable_entity(ec.other_module, ec.e)) {
+					LLVMSetLinkage(other_global, LLVMExternalLinkage);
+					LLVMSetVisibility(other_global, LLVMDefaultVisibility);
+				} else {
+					LLVM_SET_INTERNAL_WEAK_LINKAGE(other_global);
+					if (!ec.e->Variable.is_export && !ec.e->Variable.is_foreign) {
+						LLVMSetVisibility(other_global, LLVMHiddenVisibility);
+					}
 				}
 			}
 		} else if (ec.e->kind == Entity_Procedure) {
@@ -3387,6 +3519,12 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		bool is_foreign = e->Variable.is_foreign;
 		bool is_export  = e->Variable.is_export;
 
+		// Hot reload: the host exports its package globals; a reload dylib imports them
+		// (no local definition) so both reference the same storage and state survives.
+		bool hot_reloadable   = lb_is_hot_reloadable_entity(&gen->default_module, e);
+		bool import_from_host = hot_reloadable && build_context.hot_reload_mode == HotReload_Reload && !is_foreign;
+		bool export_to_host   = hot_reloadable && build_context.hot_reload_mode == HotReload_Host   && !is_foreign && !is_export;
+
 		lbModule *default_module = &gen->default_module;
 
 		lbModule *m = default_module;
@@ -3406,7 +3544,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		g.type = alloc_type_pointer(e->type);
 		g.value = LLVMAddGlobal(m->mod, lb_type(m, e->type), alloc_cstring(permanent_allocator(), name));
 
-		if (decl->init_expr != nullptr) {
+		if (decl->init_expr != nullptr && !import_from_host) {
 			TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
 			if (!is_type_any(e->type)) {
 				if (tav.mode != Addressing_Invalid) {
@@ -3450,13 +3588,28 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			LLVMSetDLLStorageClass(g.value, LLVMDLLImportStorageClass);
 			LLVMSetExternallyInitialized(g.value, true);
 			lb_add_foreign_library_path(m, e->Variable.foreign_library);
+		} else if (import_from_host) {
+			// Imported from the running host at dlopen (resolved via -undefined dynamic_lookup).
+			// Leave it as a pure external declaration with default visibility, and make sure
+			// the dylib's startup never (re)initializes it — the host owns the storage/state.
+			LLVMSetLinkage(g.value, LLVMExternalLinkage);
+			LLVMSetVisibility(g.value, LLVMDefaultVisibility);
+			var.is_initialized = true;
 		} else if (LLVMGetInitializer(g.value) == nullptr) {
 			LLVMSetInitializer(g.value, LLVMConstNull(lb_type(m, e->type)));
 		}
-		if (is_export) {
+		if (export_to_host) {
+			// Must be a visible dynamic symbol (like a normal exported proc) so a reload
+			// dylib can bind to it. Plain external linkage + default visibility + keep it
+			// from being internalized.
+			LLVMSetLinkage(g.value, LLVMExternalLinkage);
+			LLVMSetVisibility(g.value, LLVMDefaultVisibility);
+			LLVMSetDLLStorageClass(g.value, LLVMDefaultStorageClass);
+			lb_append_to_compiler_used(m, g.value);
+		} else if (is_export) {
 			LLVMSetLinkage(g.value, LLVMDLLExportLinkage);
 			LLVMSetDLLStorageClass(g.value, LLVMDLLExportStorageClass);
-		} else if (!is_foreign) {
+		} else if (!is_foreign && !import_from_host) {
 			LLVM_SET_INTERNAL_WEAK_LINKAGE(g.value);
 		}
 		lb_set_linkage_from_entity_flags(m, g.value, e->flags);
@@ -3565,6 +3718,14 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 	TIME_SECTION("LLVM Global Procedures and Types");
 	lb_create_global_procedures_and_types(gen, info, do_threading);
+
+	// Hot reload: create dispatch slots before bodies are generated (call-site codegen reads
+	// the slot map lock-free). Single module is forced in hot-reload mode, so use default_module.
+	if (build_context.hot_reload_mode == HotReload_Host) {
+		TIME_SECTION("LLVM Hot Reload Slots");
+		lb_create_hot_reload_slots(&gen->default_module);
+		lb_emit_hot_reload_manifest(&gen->default_module);
+	}
 
 	TIME_SECTION("LLVM Procedure Generation");
 	lb_generate_procedures(gen, do_threading);

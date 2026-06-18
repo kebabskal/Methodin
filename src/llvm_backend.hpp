@@ -203,6 +203,20 @@ struct lbModule {
 
 	BlockingMutex pad_types_mutex;
 	Array<lbPadType> pad_types;
+
+	// Hot reload (Host mode): one writable dispatch slot per reloadable proc. Calls to the
+	// proc load the slot and call indirectly; the reload agent overwrites the slot to swap
+	// in newly-compiled code. Pre-created single-threaded before parallel body codegen, so
+	// reads during codegen are lock-free.
+	PtrMap<Entity *, lbValue> hot_reload_slots;        // Entity* (proc) -> slot global (^proc_type)
+	Array<struct lbHotReloadSlot> hot_reload_slot_list;
+};
+
+struct lbHotReloadSlot {
+	Entity *entity;
+	lbValue slot;          // the writable global holding the function pointer
+	String  proc_symbol;   // mangled symbol of the proc (looked up by the agent in the reload dylib)
+	String  slot_symbol;   // exported symbol of the slot itself ("__hr_slot$" + proc_symbol)
 };
 
 struct lbEntityCorrection {

@@ -270,6 +270,7 @@ gb_internal void usage(String argv0, String argv1 = {}) {
 	print_usage_line(1, "build             Compiles directory of .odin files, as an executable.");
 	print_usage_line(1, "                  One must contain the program's entry point, all must be in the same package.");
 	print_usage_line(1, "run               Same as 'build', but also then runs the newly compiled executable.");
+	print_usage_line(1, "watch             Builds a package as a hot-reloadable library and live-reloads it on source change.");
 	print_usage_line(1, "bundle            Bundles a directory in a specific layout for that platform.");
 	print_usage_line(1, "check             Parses and type checks a directory of .odin files.");
 	print_usage_line(1, "strip-semicolon   Parses, type checks, and removes unneeded semicolons from the entire program.");
@@ -348,6 +349,7 @@ enum BuildFlagKind {
 	BuildFlag_IgnoreUnknownAttributes,
 	BuildFlag_ExtraLinkerFlags,
 	BuildFlag_ExtraAssemblerFlags,
+	BuildFlag_HotReload,
 	BuildFlag_Microarch,
 	BuildFlag_TargetFeatures,
 	BuildFlag_StrictTargetFeatures,
@@ -582,6 +584,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_CustomAttribute,         str_lit("custom-attribute"),          BuildFlagParam_String,  Command__does_check, true);
 	add_flag(&build_flags, BuildFlag_IgnoreUnknownAttributes, str_lit("ignore-unknown-attributes"), BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_ExtraLinkerFlags,        str_lit("extra-linker-flags"),        BuildFlagParam_String,  Command__does_build);
+	add_flag(&build_flags, BuildFlag_HotReload,               str_lit("hot-reload"),               BuildFlagParam_String,  Command_build);
 	add_flag(&build_flags, BuildFlag_ExtraAssemblerFlags,     str_lit("extra-assembler-flags"),     BuildFlagParam_String,  Command__does_build);
 	add_flag(&build_flags, BuildFlag_Microarch,               str_lit("microarch"),                 BuildFlagParam_String,  Command__does_build);
 	add_flag(&build_flags, BuildFlag_TargetFeatures,          str_lit("target-features"),           BuildFlagParam_String,  Command__does_build);
@@ -1392,6 +1395,24 @@ gb_internal bool parse_build_flags(Array<String> args) {
 						case BuildFlag_ExtraAssemblerFlags:
 							GB_ASSERT(value.kind == ExactValue_String);
 							build_context.extra_assembler_flags = value.value_string;
+							break;
+						case BuildFlag_HotReload:
+							GB_ASSERT(value.kind == ExactValue_String);
+							// `-hot-reload:reload` is used internally by the reload agent when it
+							// rebuilds the watched package as a dylib. `-hot-reload:host` mirrors
+							// what `odin watch` sets up (rarely needed directly).
+							if (value.value_string == "reload") {
+								build_context.hot_reload_mode = HotReload_Reload;
+								// A reload dylib must NOT run the user's `main` on dlopen (it would
+								// execute the program's loop inside the loading thread). Suppress the
+								// entry point; the agent only dlsym's the individual procedures.
+								build_context.no_entry_point = true;
+							} else if (value.value_string == "host") {
+								build_context.hot_reload_mode = HotReload_Host;
+							} else {
+								gb_printf_err("Invalid value for '-hot-reload': '%.*s' (expected 'host' or 'reload')\n", LIT(value.value_string));
+								bad_flags = true;
+							}
 							break;
 						case BuildFlag_Microarch: {
 							GB_ASSERT(value.kind == ExactValue_String);
@@ -2535,6 +2556,18 @@ gb_internal int print_show_help(String const arg0, String command, String option
 		print_usage_line(3, "odin run .                     Builds and runs package in current directory.");
 		print_usage_line(3, "odin run <dir>                 Builds and runs package in <dir>.");
 		print_usage_line(3, "odin run filename.odin -file   Builds and runs single-file package, must contain entry point.");
+	} else if (command == "watch") {
+		print_usage_header_once();
+		print_usage_line(1, "watch   Builds and runs a package, then live-reloads it when its source changes.");
+		print_usage_line(2, "No special structure is required: an ordinary package with a normal entry point.");
+		print_usage_line(2, "Editing a procedure body and saving swaps in the new code in the running program;");
+		print_usage_line(2, "package-global state is preserved across reloads.");
+		print_usage_line(2, "Note: edits to the program's main loop itself require a restart, as do changes");
+		print_usage_line(2, "to global types/layout.");
+		print_usage_line(2, "Examples:");
+		print_usage_line(3, "odin watch .                     Watches and hot-reloads package in current directory.");
+		print_usage_line(3, "odin watch <dir>                 Watches and hot-reloads package in <dir>.");
+		print_usage_line(3, "odin watch main.odin -file       Watches and hot-reloads a single-file package.");
 	} else if (command == "check") {
 		print_usage_header_once();
 		print_usage_line(1, "check   Parses and type checks directory of .odin files.");
@@ -2573,8 +2606,8 @@ gb_internal int print_show_help(String const arg0, String command, String option
 	}
 
 	bool doc             = command == "doc";
-	bool build           = command == "build";
-	bool run_or_build    = command == "run" || command == "build" || command == "test";
+	bool build           = command == "build" || command == "watch";
+	bool run_or_build    = command == "run" || command == "build" || command == "test" || command == "watch";
 	bool test_only       = command == "test";
 	bool strip_semicolon = command == "strip-semicolon";
 	bool check_only      = command == "check" || strip_semicolon;
@@ -3684,6 +3717,26 @@ int main(int arg_count, char const **arg_ptr) {
 		}
 		build_context.command_kind = Command_build;
 		init_filename = args[2];
+	} else if (command == "watch") {
+		if (args.count < 3) {
+			usage(args[0]);
+			return 1;
+		}
+		// `watch` builds the package as a normal executable ("host") but in hot-reload
+		// codegen mode: package globals are exported, calls to package procs go through
+		// dispatch slots, and a reload-agent thread is started before main. The agent
+		// rebuilds the package as a dylib (`-hot-reload:reload`) on source change and
+		// swaps the slots live, preserving global state.
+		build_context.command_kind = Command_watch;
+		build_context.build_mode = BuildMode_Executable;
+		build_context.hot_reload_mode = HotReload_Host;
+		init_filename = args[2];
+		// The reload agent re-invokes `odin build` on this path; make it absolute so it
+		// works regardless of the host's current working directory.
+		build_context.hot_reload_source_path = path_to_full_path(permanent_allocator(), init_filename);
+		// Like `run`, `watch` launches the built host; its embedded agent then watches the
+		// sources and hot-reloads on change until the program exits.
+		run_output = true;
 	} else if (command == "check") {
 		if (args.count < 3) {
 			usage(args[0]);

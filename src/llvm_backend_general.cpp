@@ -115,6 +115,8 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 
 	array_init(&m->global_procedures_to_create, a, 0, 1024);
 	array_init(&m->global_types_to_create, a, 0, 1024);
+	map_init(&m->hot_reload_slots);
+	array_init(&m->hot_reload_slot_list, a, 0, 0);
 	mpsc_init(&m->missing_procedures_to_check, a);
 	map_init(&m->debug_values);
 
@@ -3655,6 +3657,24 @@ gb_internal lbAddr lb_add_local_generated_temp(lbProcedure *p, Type *type, i64 m
 	return res;
 }
 
+
+// An entity is "hot-reloadable" if it lives in the initial (user) package while building
+// in a hot-reload mode. Such procs are dispatched through writable slots in the host and
+// re-bound on reload; such globals are exported by the host and imported by reload dylibs
+// so that program state is preserved across reloads.
+gb_internal bool lb_is_hot_reloadable_entity(lbModule *m, Entity *e) {
+	if (build_context.hot_reload_mode == HotReload_None) {
+		return false;
+	}
+	if (e == nullptr || m->info == nullptr) {
+		return false;
+	}
+	AstPackage *epkg = e->pkg;
+	if (epkg == nullptr && e->scope != nullptr) {
+		epkg = e->scope->pkg;
+	}
+	return epkg == m->info->init_package;
+}
 
 gb_internal void lb_set_linkage_from_entity_flags(lbModule *m, LLVMValueRef value, u64 flags) {
 	if (flags & EntityFlag_CustomLinkage_Internal) {

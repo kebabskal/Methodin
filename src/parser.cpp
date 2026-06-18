@@ -8058,6 +8058,17 @@ gb_internal ParseFileError parse_packages(Parser *p, String init_filename) {
 			}
 			try_add_import_path(p, s, s, init_pos, Package_Normal);
 		}
+
+		// Hot reload (host): pull in the reload agent. Its @(init) proc discovers the
+		// compiler-emitted manifest and starts the file-watch/rebuild/reload thread.
+		if (build_context.hot_reload_mode == HotReload_Host) {
+			bool ok = false;
+			String s = get_fullpath_core_collection(permanent_allocator(), str_lit("sys/hotreload"), &ok);
+			if (!ok) {
+				compiler_error("Unable to find the 'core:sys/hotreload' package. Is the ODIN_ROOT set up correctly?");
+			}
+			try_add_import_path(p, s, s, init_pos, Package_Normal);
+		}
 		
 
 		for (String const &path : build_context.extra_packages) {

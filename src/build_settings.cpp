@@ -207,6 +207,19 @@ enum BuildModeKind {
 	BuildMode_COUNT,
 };
 
+// Hot reload (transparent live reload via `odin watch`):
+//   None  - normal build, no hot-reload codegen.
+//   Host  - the initial executable: package globals are exported as dynamic symbols,
+//           calls to reloadable (initial-package) procs go through writable dispatch
+//           slots, and a reload-agent thread is started before main.
+//   Reload - a rebuilt dylib loaded into a running Host: package globals are emitted as
+//           external imports (bound to the host's at dlopen) so state is preserved.
+enum HotReloadMode {
+	HotReload_None = 0,
+	HotReload_Host,
+	HotReload_Reload,
+};
+
 enum CommandKind : u64 {
 	Command_run             = 1<<0,
 	Command_build           = 1<<1,
@@ -223,8 +236,10 @@ enum CommandKind : u64 {
 	Command_bundle_ios     = 1<<10,
 	Command_bundle_orca    = 1<<11,
 
-	Command__does_check = Command_run|Command_build|Command_check|Command_doc|Command_test|Command_strip_semicolon,
-	Command__does_build = Command_run|Command_build|Command_test,
+	Command_watch          = 1<<12,
+
+	Command__does_check = Command_run|Command_build|Command_check|Command_doc|Command_test|Command_strip_semicolon|Command_watch,
+	Command__does_build = Command_run|Command_build|Command_test|Command_watch,
 	Command_all = ~(CommandKind)0,
 };
 
@@ -241,6 +256,7 @@ gb_global char const *odin_command_strings[32] = {
 	"bundle macos",
 	"bundle ios",
 	"bundle orca",
+	"watch",
 };
 
 
@@ -507,6 +523,8 @@ struct BuildContext {
 	String extra_assembler_flags;
 	String microarch;
 	BuildModeKind build_mode;
+	HotReloadMode hot_reload_mode;
+	String hot_reload_source_path; // absolute path to the watched package/file (for the agent's rebuilds)
 	bool   keep_executable;
 	bool   generate_docs;
 	bool   custom_optimization_level;
@@ -2042,6 +2060,12 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 	}
 
 	if (build_context.use_single_module) {
+		bc->use_separate_modules = false;
+	}
+
+	// Hot reload relies on a single dispatch table and a single set of exported globals,
+	// so codegen must place everything in one module.
+	if (bc->hot_reload_mode != HotReload_None) {
 		bc->use_separate_modules = false;
 	}
 

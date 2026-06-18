@@ -1324,6 +1324,7 @@ gb_internal void init_universal(void) {
 	add_global_bool_constant("ODIN_USE_SEPARATE_MODULES",       bc->use_separate_modules);
 	add_global_bool_constant("ODIN_TEST",                       bc->command_kind == Command_test);
 	add_global_bool_constant("ODIN_NO_ENTRY_POINT",             bc->no_entry_point);
+	add_global_bool_constant("ODIN_HOT_RELOAD",                 bc->hot_reload_mode != HotReload_None);
 	add_global_bool_constant("ODIN_FOREIGN_ERROR_PROCEDURES",   bc->ODIN_FOREIGN_ERROR_PROCEDURES);
 	add_global_bool_constant("ODIN_NO_RTTI",                    bc->no_rtti);
 
@@ -3062,6 +3063,40 @@ gb_internal void generate_minimum_dependency_set_internal(Checker *c, Entity *st
 	} else if (start != nullptr) {
 		start->flags |= EntityFlag_Used;
 		add_to_set(c, start);
+	}
+
+	// Hot reload: keep every procedure and global of the initial package alive and reachable,
+	// even if the program's current `main` does not reference them. This way the host always
+	// has a dispatch slot for each proc and exports every global, so a later edit that starts
+	// calling a previously-unused proc (or a reload hook) works, and reload dylibs can always
+	// resolve the package's globals against the host. Applies to both the host build and the
+	// reload dylib (which additionally has no entry point).
+	if (build_context.hot_reload_mode != HotReload_None) {
+		for_array(i, c->info.entities) {
+			Entity *e = c->info.entities[i];
+			if (e == nullptr || e->pkg != c->info.init_package) {
+				continue;
+			}
+			if (e->token.string == "_" || e->token.string.len == 0) {
+				continue;
+			}
+			if (e->kind == Entity_Procedure) {
+				if (e->Procedure.is_foreign) {
+					continue;
+				}
+				if (e->type == nullptr || base_type(e->type)->kind != Type_Proc || base_type(e->type)->Proc.is_polymorphic) {
+					continue;
+				}
+			} else if (e->kind == Entity_Variable) {
+				if (e->Variable.is_foreign) {
+					continue;
+				}
+			} else {
+				continue;
+			}
+			e->flags |= EntityFlag_Used;
+			add_to_set(c, e);
+		}
 	}
 }
 
