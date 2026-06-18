@@ -1,0 +1,46 @@
+# Transparent hot reloading (`odin watch`)
+
+`odin watch` builds and runs a package, then live-reloads its code when the source
+changes — **without restarting the program and without losing global state.**
+
+```sh
+odin watch examples/hot_reload
+```
+
+While it runs, edit the `fmt.printfln` line in [`main.odin`](main.odin) and save. The
+running loop immediately starts using the new code; `counter` keeps counting.
+
+## What makes it transparent
+
+No special program structure is required — it is an ordinary `package main` with a normal
+`main`. In `watch` (hot-reload) builds the compiler:
+
+- routes every call to a package-level procedure through a writable **dispatch slot**
+  (a function pointer) instead of a direct call;
+- **exports** package globals as dynamic symbols.
+
+On a source change the embedded reload agent rebuilds the package as a shared library
+(`-build-mode:dll -hot-reload:reload`) in which the package globals are *imported* from the
+running host. It `dlopen`s the result and overwrites each dispatch slot with the address of
+the freshly-compiled procedure. Because globals were never reloaded — the new code binds to
+the host's existing storage — program state is preserved automatically.
+
+## Detecting a reload (optional)
+
+If your package defines a proc named `hot_reloaded`:
+
+```odin
+hot_reloaded :: proc() {
+    // called once after every successful reload
+}
+```
+
+the agent calls it after swapping in the new code. It's entirely optional — omit it and
+reloads happen silently. Nothing else about your program needs to change.
+
+## Limitations
+
+- Edits to `main` itself (or any procedure currently on the call stack) only take effect on
+  the next call; the running `main` loop keeps executing its old body until restarted.
+- Adding/removing globals or changing a global's type/layout requires a restart.
+- Currently targets macOS/Linux. Reloads only the initial (user) package's procedures.
