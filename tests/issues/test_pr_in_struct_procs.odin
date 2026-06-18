@@ -386,3 +386,54 @@ test_using_pointer_param_address_of_field :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(r), 3)
 	testing.expect_value(t, r[2], 11)
 }
+
+// A hand-written package-scope proc may share its name with lifted in-struct
+// methods. Previously the synthesised method proc-group and the user's free
+// proc both claimed `tick` -> "Redeclaration of 'tick'". The user's proc is now
+// folded into the group: an unqualified `tick()` overload-resolves to it, while
+// `x.tick()` (UFCS) still dispatches to a method.
+Engine_Clock :: struct {
+	frame: int,
+
+	tick :: proc() {
+		frame += 1
+	},
+}
+
+World_Sim :: struct {
+	step: int,
+
+	tick :: proc() {
+		step += 2
+	},
+}
+
+clock_glob: Engine_Clock
+world_glob: World_Sim
+free_tick_calls: int
+
+// Free proc colliding with both `Engine_Clock.tick` and `World_Sim.tick`.
+tick :: proc() {
+	free_tick_calls += 1
+	clock_glob.tick()
+	world_glob.tick()
+}
+
+@test
+test_free_proc_collides_with_method_name :: proc(t: ^testing.T) {
+	free_tick_calls = 0
+	clock_glob = {}
+	world_glob = {}
+
+	tick()           // no args -> the free proc
+	tick()
+
+	testing.expect_value(t, free_tick_calls, 2)
+	testing.expect_value(t, clock_glob.frame, 2) // each free tick() ran the method
+	testing.expect_value(t, world_glob.step, 4)
+
+	clock_glob.tick()                            // UFCS -> Engine_Clock.tick
+	testing.expect_value(t, clock_glob.frame, 3)
+	world_glob.tick()                            // UFCS -> World_Sim.tick
+	testing.expect_value(t, world_glob.step, 6)
+}
