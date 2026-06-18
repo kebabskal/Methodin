@@ -8912,7 +8912,20 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 				// bound to the resolved free procedure. The backend then sees
 				// a plain procedure reference instead of a selector that would
 				// fail lookup_field.
-				Ast *new_proc = ast_ident(call->file(), ufcs_e->token);
+				// Anchor the synthesised callee at the call site (the `.field` the
+				// user actually wrote) rather than at `ufcs_e`'s declaration. Errors
+				// about this call (e.g. "no matching overload for procedure group")
+				// are reported against this node, so without this they land on the
+				// method's declaration instead of where the call was written.
+				Token callee_tok = ufcs_e->token;
+				if (proc->kind == Ast_SelectorExpr) {
+					Ast *field = proc->SelectorExpr.selector;
+					if (field != nullptr && field->kind == Ast_Ident) {
+						callee_tok.pos    = field->Ident.token.pos;
+						callee_tok.string = field->Ident.token.string;
+					}
+				}
+				Ast *new_proc = ast_ident(call->file(), callee_tok);
 				add_entity_use(c, new_proc, ufcs_e);
 				AddressingMode mode = (ufcs_e->kind == Entity_ProcGroup) ? Addressing_ProcGroup : Addressing_Value;
 				Type *t = ufcs_e->type;
