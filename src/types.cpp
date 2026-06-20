@@ -174,6 +174,7 @@ struct TypeUnion {
 
 	Ast *            node;
 	Scope *          scope;
+	Type *           auto_union_base; // Methodin: for `auto_union(T)`, the shared offset-0 base T (member promotion)
 
 	std::atomic<i64> variant_block_size;
 	i64              custom_align;
@@ -3838,7 +3839,12 @@ gb_internal Selection lookup_field_with_selection(Type *type_, InternedString fi
 		}
 
 	} else if (type->kind == Type_Union) {
-
+		// Methodin: `auto_union(T)` promotes T's members (fields and methods),
+		// which live at offset 0 of every variant — and thus at offset 0 of the
+		// union's payload.
+		if (type->Union.auto_union_base != nullptr) {
+			return lookup_field_with_selection(type->Union.auto_union_base, field_name, is_type, sel, allow_blank_ident);
+		}
 	} else if (type->kind == Type_Struct) {
 		if (has_type_got_objc_class_attribute(original_type) && original_type->kind == Type_Named) {
 			Entity *e = original_type->Named.type_name;

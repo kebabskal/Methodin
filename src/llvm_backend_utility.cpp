@@ -1528,6 +1528,16 @@ gb_internal lbValue lb_emit_deep_field_gep(lbProcedure *p, lbValue e, Selection 
 		}
 		type = core_type(type);
 
+		// Methodin: `auto_union(T)` promotes T's members. T lives at offset 0 of
+		// the union's payload, so reinterpret the union pointer as ^T and apply
+		// the (T-relative) indices against it. No index is consumed here.
+		while (type->kind == Type_Union && type->Union.auto_union_base != nullptr) {
+			Type *bt = type->Union.auto_union_base;
+			GB_ASSERT(is_type_pointer(e.type));
+			e = lb_emit_transmute(p, e, alloc_type_pointer(bt));
+			type = core_type(bt);
+		}
+
 		if (type->kind == Type_SoaPointer) {
 			lbValue addr = lb_emit_struct_ep(p, e, 0);
 			lbValue index = lb_emit_struct_ep(p, e, 1);

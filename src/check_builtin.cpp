@@ -3362,8 +3362,9 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		}
 
 		Type *ut = alloc_type_union();
-		ut->Union.scope = c->scope;
-		ut->Union.kind  = UnionType_Normal;
+		ut->Union.scope           = c->scope;
+		ut->Union.kind            = UnionType_Normal;
+		ut->Union.auto_union_base = target; // enables offset-0 member promotion
 		wait_signal_set(&ut->Union.polymorphic_wait_signal);
 
 		// All top-level entities are collected before global checking, so the
