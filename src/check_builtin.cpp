@@ -3394,9 +3394,18 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		// All top-level entities are collected before global checking, so the
 		// variant set is complete and order-independent: we force-resolve each
 		// candidate's *type* (not its size) to inspect its first field.
-		auto variants = array_make<Type *>(permanent_allocator(), 0, 8);
+		//
+		// Snapshot the entity list first: force-resolving a candidate below can
+		// append to c->info.entities (e.g. polymorphic instantiations), which
+		// would realloc the array out from under a live iteration and crash.
+		auto candidates = array_make<Entity *>(temporary_allocator(), 0, c->info->entities.count);
 		for_array(i, c->info->entities) {
-			Entity *e = c->info->entities[i];
+			array_add(&candidates, c->info->entities[i]);
+		}
+
+		auto variants = array_make<Type *>(permanent_allocator(), 0, 8);
+		for_array(i, candidates) {
+			Entity *e = candidates[i];
 			if (e == nullptr || e->kind != Entity_TypeName) {
 				continue;
 			}
