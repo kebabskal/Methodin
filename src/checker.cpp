@@ -6059,15 +6059,7 @@ gb_internal void check_create_file_scopes(Checker *c) {
 			total_pkg_decl_count += f->total_file_decl_count;
 		}
 
-		// Methodin: in-struct/impl methods are lifted to free procs *and* folded
-		// into per-name proc-groups, so a package exports more entities than its
-		// source decl count. The fixed-capacity exported_entity_queue is filled
-		// concurrently (one worker per file) and its grow path is not safe under
-		// concurrent enqueue, so an undersized queue grows mid-collection and
-		// corrupts — surfacing as a nondeterministic SIGSEGV (null entity) in
-		// check_export_entities_in_pkg. Size with headroom (the lifting expansion
-		// is bounded by a small constant factor) so it never grows in parallel.
-		mpmc_init(&pkg->exported_entity_queue, gb_max((isize)64, 4*total_pkg_decl_count));
+		mpmc_init(&pkg->exported_entity_queue, total_pkg_decl_count);
 	}
 }
 
