@@ -2,88 +2,86 @@ package main
 
 import "core:fmt"
 
+// A base "class" with in-struct methods (Methodin). Methods operate on the
+// implicit `self`, so they read/write the struct's own fields directly.
 Entity :: struct {
-	hp: int,
+	hp:    int,
+	alive: bool,
+
+	take_damage :: proc(amount: int) {
+		hp -= amount
+		if hp <= 0 {
+			alive = false
+		}
+	},
 
 	describe :: proc() -> string {
-		return fmt.tprintf("hp=%d", hp)
+		return fmt.tprintf("hp=%d alive=%t", hp, alive)
 	},
 }
 
+// Subtypes embed the base at offset 0 via `using` (single inheritance).
 Player :: struct {
 	using entity: Entity,
-	score: int,
+	score:        int,
 }
 
 Enemy :: struct {
 	using entity: Entity,
-	damage: int,
+	power:        int,
 }
 
 ExploderEnemy :: struct {
-	using enemy: Enemy, // transitive: Enemy -> Entity at offset 0
-	radius: f32,
+	using enemy: Enemy, // transitive: Enemy -> Entity, still at offset 0
+	radius:      f32,
 }
 
-// Not an entity: embeds something else, must NOT be collected.
-Widget :: struct {
-	label: string,
-}
-
-// Stores an auto_union by value in an unrelated struct (size must be correct).
-Inventory :: struct {
-	holder: BaseEntity,
-}
-
+// The polymorphic value type: a tagged union of every struct that `using`-embeds
+// Entity. Sized to the largest variant; stored inline, no pointers/boxing.
 BaseEntity :: auto_union(Entity)
-
-take_enemy :: proc(en: Enemy) {
-	fmt.printfln("take_enemy: hp=%d damage=%d", en.hp, en.damage)
-}
 
 main :: proc() {
 	entities: [dynamic]BaseEntity
 	defer delete(entities)
 
-	append(&entities, Player{entity = {hp = 100}, score = 5})
-	append(&entities, Enemy{entity = {hp = 30}, damage = 7})
-	append(&entities, ExploderEnemy{enemy = {entity = {hp = 10}, damage = 50}, radius = 2.5})
+	// UFCS: `entities.append(...)` instead of `append(&entities, ...)`.
+	entities.append(Player{entity = {hp = 100, alive = true}, score = 0})
+	entities.append(Enemy{entity = {hp = 40, alive = true}, power = 8})
+	entities.append(ExploderEnemy{enemy = {entity = {hp = 20, alive = true}, power = 25}, radius = 3})
 
-	// (1) method on a concrete value: promoted through `using` (works today)
-	p := Player{entity = {hp = 100}, score = 5}
-	fmt.printfln("Player.describe() = %s", p.describe())
+	// Shared-base fields are promoted onto the union (offset-0): no switch, no
+	// narrowing. `for &e` gives a pointer into each slot, so writes land.
+	for &e in entities {
+		e.hp += 5
+		e.alive = true
+	}
 
-	// (2) method on a variant recovered from the union via a type switch.
-	// NOTE: calling the method directly on the switch capture `v` currently
-	// fails (Methodin UFCS doesn't take the address of a switch binding for
-	// `self`); copying into a local works. Tracked as a Methodin gap.
-	for e in entities {
-		#partial switch v in e {
+	// Methods on a concrete value are promoted through `using` and mutate in
+	// place (self is a pointer).
+	p := Player{entity = {hp = 30, alive = true}}
+	p.take_damage(5)
+	fmt.println("player:", p.describe())
+
+	// Variant-specific behavior: narrow to the variant, then call its (promoted)
+	// method through the in-place pointer so mutation writes back to the slot.
+	for &e in entities {
+		#partial switch _ in e {
 		case Player:
-			inst := v
-			fmt.printfln("Player %s score=%d", inst.describe(), inst.score)
+			(&e.(Player)).take_damage(1)
 		case Enemy:
-			inst := v
-			fmt.printfln("Enemy %s damage=%d", inst.describe(), inst.damage)
+			(&e.(Enemy)).take_damage(2)
 		case ExploderEnemy:
-			inst := v
-			fmt.printfln("ExploderEnemy %s damage=%d radius=%.1f", inst.describe(), inst.damage, inst.radius)
+			(&e.(ExploderEnemy)).take_damage(3)
 		}
 	}
 
-	// (3) passing a union value to a proc that takes a *subtype*: must narrow
-	// with a type assertion (checked). Implicit `take_enemy(some_base)` is an
-	// error, because the union might hold a different variant.
-	be: BaseEntity = Enemy{entity = {hp = 30}, damage = 9}
-	take_enemy(be.(Enemy)) // checked assertion
-	if en, ok := be.(Enemy); ok {
-		take_enemy(en) // safe form
+	// Read the promoted base fields directly off each union value (no narrowing).
+	// NOTE: a base *method* call on the union (e.g. `e.describe()`) is not yet
+	// supported -- that needs method promotion through the union receiver. Field
+	// promotion (`e.hp`, `e.alive`) works today.
+	for e in entities {
+		fmt.printfln("entity: hp=%d alive=%t", e.hp, e.alive)
 	}
 
-	// NOTE: a method call directly on the union value (e.describe()) is not yet
-	// supported -- that needs offset-0 member promotion on the union itself.
-
-	inv: Inventory
-	inv.holder = Player{entity = {hp = 1}}
-	fmt.printfln("sizeof(BaseEntity)=%d sizeof(Inventory)=%d", size_of(BaseEntity), size_of(Inventory))
+	fmt.printfln("sizeof(BaseEntity)=%d", size_of(BaseEntity))
 }
