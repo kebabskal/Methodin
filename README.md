@@ -148,6 +148,48 @@ Nothing here is dynamic dispatch — every call resolves statically to a
 known procedure (or one variant of a procedure group), and the inliner
 sees through it.
 
+## `odin watch` — transparent hot reload
+
+`odin watch` builds and runs a package, then live-reloads its code when the
+source changes — **without restarting the program and without losing global
+state.**
+
+```sh
+odin watch examples/hot_reload
+```
+
+While it runs, edit a procedure body and save; the running program
+immediately starts using the new code, and globals keep their values. No
+special program structure or contract is required — an ordinary
+`package main` with a normal `main` just works.
+
+How it works (all guarded so normal builds are unaffected):
+
+- In a `watch` build the compiler routes every call to a package-level
+  procedure through a writable **dispatch slot** (a function pointer) instead
+  of a direct call, and **exports** package globals as dynamic symbols.
+- On a source change an embedded reload agent rebuilds the package as a shared
+  library whose package globals are *imported* from the running host, `dlopen`s
+  it, and overwrites each dispatch slot with the new procedure address. Because
+  globals are never reloaded, program state is preserved automatically.
+
+An optional `hot_reloaded :: proc()` in your package is called once after each
+successful reload — handy for re-deriving cached state. Omit it and reloads
+happen silently.
+
+Some edits can't be patched into a running native process. The agent detects
+these via a compiler-emitted signature and **automatically restarts** (losing
+in-memory state) instead of corrupting it:
+
+- editing `main`'s body (the running loop can't be re-entered);
+- adding, removing, or changing the type of a package global (the layout would
+  no longer match the host's storage).
+
+Everything else — editing any other procedure's body — hot-reloads in place.
+Both directory and single-file (`-file`) packages work. Currently targets
+macOS/Linux and reloads the initial package only. See
+[`examples/hot_reload`](examples/hot_reload) for a runnable demo.
+
 ---
 
 <p align="center">
