@@ -40,6 +40,16 @@ ExploderEnemy :: struct {
 // Entity. Sized to the largest variant; stored inline, no pointers/boxing.
 BaseEntity :: auto_union(Entity)
 
+// Non-embedder structs may reference the union (by value or in a container)
+// without being collected as variants — this must not trip the collector into a
+// "not a type" / declaration-cycle error while the union is being resolved.
+Inventory :: struct {
+	holder: BaseEntity,
+}
+World :: struct {
+	entities: [dynamic]BaseEntity,
+}
+
 main :: proc() {
 	entities: [dynamic]BaseEntity
 	defer delete(entities)
@@ -78,5 +88,10 @@ main :: proc() {
 		fmt.println("entity:", e.describe())
 	}
 
-	fmt.printfln("sizeof(BaseEntity)=%d", size_of(BaseEntity))
+	fmt.printfln(
+		"sizeof(BaseEntity)=%d Inventory=%d World=%d",
+		size_of(BaseEntity),
+		size_of(Inventory),
+		size_of(World),
+	)
 }

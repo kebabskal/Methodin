@@ -2771,6 +2771,30 @@ gb_internal bool check_builtin_procedure_directive(CheckerContext *c, Operand *o
 	return true;
 }
 
+// Methodin: cheap AST pre-filter for auto_union collection. Only a struct whose
+// *first* field is a `using` field can embed the base at offset 0, so only those
+// are worth force-resolving. Crucially this avoids force-resolving unrelated
+// types whose (later) fields reference the in-progress auto_union itself — e.g.
+// `World :: struct { ...; entities: [dynamic]BaseEntity }` — which would
+// otherwise be reported as "not a type" or a spurious declaration cycle.
+gb_internal bool auto_union_candidate_first_field_using(Entity *e) {
+	if (e == nullptr || e->decl_info == nullptr) {
+		return false;
+	}
+	Ast *init = unparen_expr(e->decl_info->init_expr);
+	if (init == nullptr || init->kind != Ast_StructType) {
+		return false;
+	}
+	if (init->StructType.fields.count == 0) {
+		return false;
+	}
+	Ast *f0 = init->StructType.fields[0];
+	if (f0 == nullptr || f0->kind != Ast_Field) {
+		return false;
+	}
+	return (f0->Field.flags & FieldFlag_using) != 0;
+}
+
 // Methodin: does struct `s` have, as its first field, a `using`-embedded field
 // whose type is `target` (directly, or transitively through further first-field
 // `using` embeds) — i.e. is `target` guaranteed to live at offset 0 of `s`?
@@ -3380,6 +3404,11 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 				// Skips the auto_union being defined and anything mid-resolution
 				// (a real embedder never depends on the auto_union, so is never
 				// in-progress here).
+				continue;
+			}
+			if (!auto_union_candidate_first_field_using(e)) {
+				// Not a possible embedder; don't force-resolve it (it may itself
+				// reference this in-progress auto_union).
 				continue;
 			}
 			if (e->type == nullptr) {
