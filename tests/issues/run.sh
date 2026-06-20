@@ -76,6 +76,10 @@ $ODIN check ../test_issue_6484.odin -no-entry-point $COMMON
 
 $ODIN test ../test_pr_in_struct_procs.odin $COMMON
 
+# UFCS in-scope resolution: methods reachable via the call-site's imports
+# (e.g. `v.normalize()` on a [3]f32 routing to core:math/linalg).
+$ODIN test ../test_pr_ufcs_in_scope.odin $COMMON
+
 # Cross-file in-struct method collision — needs a full package, not -file.
 $ODIN test ../test_pr_in_struct_procs_cross_file -define:ODIN_TEST_FANCY=false -vet -strict-style -ignore-unused-defineables
 

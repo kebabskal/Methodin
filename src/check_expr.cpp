@@ -5806,7 +5806,8 @@ gb_internal bool try_ufcs_resolve_at(CheckerContext *c, AstPackage *pkg,
                                       InternedString name, u32 hash,
                                       Ast *recv_expr, Type *recv_type,
                                       AddressingMode recv_mode, ExactValue recv_value,
-                                      Entity **out_entity, Ast **out_first_arg) {
+                                      Entity **out_entity, Ast **out_first_arg,
+                                      bool *out_type_matched = nullptr) {
 	if (pkg == nullptr || recv_expr == nullptr || recv_type == nullptr) return false;
 	Entity *e = scope_lookup_current(pkg->scope, name, hash);
 	if (e == nullptr) return false;
@@ -5889,6 +5890,17 @@ gb_internal bool try_ufcs_resolve_at(CheckerContext *c, AstPackage *pkg,
 	} else if (ok_deref) {
 		Token op = {Token_Pointer};
 		first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
+	}
+
+	// Whether the receiver actually fits the first parameter (as-is, &recv, or
+	// *recv). Callers that search by name across many packages (the in-scope
+	// import tier) use this to reject same-named procs that don't accept the
+	// receiver — e.g. core:math.normalize (scalar floats) vs
+	// core:math/linalg.normalize (vectors). The single-package tiers ignore it
+	// and keep matching by name so the real call checker can report a precise
+	// argument-type error.
+	if (out_type_matched != nullptr) {
+		*out_type_matched = ok_asis || ok_addrof || ok_deref;
 	}
 
 	*out_entity = e;
@@ -6254,7 +6266,106 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 			}
 		}
 
+		// Final tier: search the packages that are in scope at the call site —
+		// the current file's own package plus everything it imports. This is
+		// what lets a method live in a package the receiver type has no nominal
+		// link to: e.g. `v.normalize()` where `v` is a [3]f32 and `normalize`
+		// lives in core:math/linalg. The receiver type's own owning package
+		// (root_pkg) was already tried above, so we skip it here. Mirrors the
+		// extension-method model of C#/Nim: a free proc is callable as a method
+		// because the package providing it is imported into this file.
+		Entity *resolved_import = nullptr; // the ImportName entity to mark used, if resolved via an import
+		if (resolved == nullptr) {
+			Scope *file_scope = c->scope;
+			while (file_scope != nullptr && (file_scope->flags & ScopeFlag_File) == 0) {
+				file_scope = file_scope->parent;
+			}
+			if (file_scope != nullptr) {
+				gbAllocator ufcs_arena = heap_allocator();
+				// Candidate packages to search, each paired with the ImportName
+				// entity it came through (nullptr for the file's own package, an
+				// import is implicitly used). On a hit through an import we must
+				// mark that import used, otherwise the unused-import check fires.
+				struct UFCSPkg { AstPackage *pkg; Entity *import_entity; };
+				auto search_pkgs = array_make<UFCSPkg>(ufcs_arena);
+				defer (array_free(&search_pkgs));
+
+				// The file's own package (its parent scope), then each import.
+				Scope *own_pkg_scope = file_scope->parent;
+				if (own_pkg_scope != nullptr && (own_pkg_scope->flags & ScopeFlag_Pkg) != 0 && own_pkg_scope->pkg != nullptr) {
+					array_add(&search_pkgs, UFCSPkg{own_pkg_scope->pkg, nullptr});
+				}
+				for (auto const &entry : file_scope->elements) {
+					Entity *ie = entry.value;
+					if (ie == nullptr || ie->kind != Entity_ImportName) continue;
+					Scope *isc = ie->ImportName.scope;
+					if (isc != nullptr && (isc->flags & ScopeFlag_Pkg) != 0 && isc->pkg != nullptr) {
+						array_add(&search_pkgs, UFCSPkg{isc->pkg, ie});
+					}
+				}
+
+				auto hit_entities = array_make<Entity *>(ufcs_arena);
+				auto hit_args = array_make<Ast *>(ufcs_arena);
+				auto hit_imports = array_make<Entity *>(ufcs_arena);
+				defer (array_free(&hit_entities));
+				defer (array_free(&hit_args));
+				defer (array_free(&hit_imports));
+
+				for (UFCSPkg const &cand : search_pkgs) {
+					if (cand.pkg == root_pkg) continue; // already tried above
+					Entity *he = nullptr; Ast *ha = nullptr; bool tmatch = false;
+					// Strict here: only a proc whose first parameter actually
+					// accepts the receiver counts. A by-name-only match (e.g.
+					// math.normalize taking f32 when the receiver is [3]f32)
+					// must not register as a candidate, or importing both
+					// core:math and core:math/linalg would make every shared
+					// name spuriously ambiguous.
+					if (try_ufcs_resolve_at(c, cand.pkg, sel_name, sel_hash,
+					                         op_expr, operand->type, operand->mode, operand->value,
+					                         &he, &ha, &tmatch) && tmatch) {
+						bool dup = false;
+						for (Entity *prev : hit_entities) {
+							if (prev == he) { dup = true; break; }
+						}
+						if (!dup) {
+							array_add(&hit_entities, he);
+							array_add(&hit_args, ha);
+							array_add(&hit_imports, cand.import_entity);
+						}
+					}
+				}
+
+				if (hit_entities.count == 1) {
+					resolved = hit_entities[0];
+					resolved_arg = hit_args[0];
+					resolved_import = hit_imports[0];
+				} else if (hit_entities.count > 1) {
+					ERROR_BLOCK();
+					gbString sel_str = expr_to_string(selector);
+					gbString op_str  = expr_to_string(op_expr);
+					error(op_expr, "Ambiguous method call '%s.%s': '%s' is provided by multiple packages in scope",
+					      op_str, sel_str, sel_str);
+					for (Entity *he : hit_entities) {
+						if (he->pkg != nullptr) {
+							error_line("\tas %.*s.%s\n", LIT(he->pkg->name), sel_str);
+						}
+					}
+					error_line("\tDisambiguate with an explicit call, e.g. `pkg.%s(%s, ...)`\n", sel_str, op_str);
+					gb_string_free(op_str);
+					gb_string_free(sel_str);
+					operand->mode = Addressing_Invalid;
+					expr_entity = nullptr;
+					return nullptr;
+				}
+			}
+		}
+
 		if (resolved != nullptr) {
+			if (resolved_import != nullptr) {
+				// Resolved through an import — record the use so the import is
+				// not reported as unused (mirrors the `pkg.foo` selector path).
+				add_entity_use(c, nullptr, resolved_import);
+			}
 			c->ufcs_first_arg = resolved_arg;
 			c->ufcs_entity = resolved;
 			entity = resolved;
