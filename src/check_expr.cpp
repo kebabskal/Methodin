@@ -6180,6 +6180,35 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 		u32 sel_hash = selector->Ident.hash;
 		Type *deref_type = type_deref(operand->type);
 
+		// Methodin: `auto_union(T)` method promotion. Reinterpret the union
+		// receiver as its offset-0 base T — `(transmute(^T)(&e))^`, an lvalue
+		// aliasing the slot — so base methods resolve and a `^self` method
+		// writes through. Requires an addressable receiver (e.g. `for &e in a`).
+		if (deref_type != nullptr && deref_type->kind == Type_Union &&
+		    deref_type->Union.auto_union_base != nullptr &&
+		    operand->mode == Addressing_Variable) {
+			Type *base = deref_type->Union.auto_union_base;
+			if (base->kind == Type_Named && base->Named.type_name != nullptr) {
+				AstFile *file   = op_expr->file();
+				Token caret     = {Token_Pointer,   0, str_lit("^")};
+				Token amp       = {Token_And,        0, str_lit("&")};
+				Token tmute_tok = {Token_transmute,  0, str_lit("transmute")};
+				Ast *base_ident = ast_ident(file, base->Named.type_name->token);
+				Ast *ptr_type   = ast_pointer_type(file, caret, base_ident);
+				Ast *addr       = ast_unary_expr(file, amp, op_expr);
+				Ast *tcast      = ast_type_cast(file, tmute_tok, ptr_type, addr);
+				Ast *base_lval  = ast_deref_expr(file, tcast, caret);
+
+				Operand base_op = {};
+				check_expr(c, &base_op, base_lval);
+				if (base_op.mode != Addressing_Invalid && base_op.type != nullptr) {
+					op_expr    = base_lval;
+					*operand   = base_op;
+					deref_type = type_deref(operand->type);
+				}
+			}
+		}
+
 		// First try the receiver's own package.
 		Entity *resolved = nullptr;
 		Ast *resolved_arg = nullptr;

@@ -47,7 +47,9 @@ main :: proc() {
 	// UFCS: `entities.append(...)` instead of `append(&entities, ...)`.
 	entities.append(Player{entity = {hp = 100, alive = true}, score = 0})
 	entities.append(Enemy{entity = {hp = 40, alive = true}, power = 8})
-	entities.append(ExploderEnemy{enemy = {entity = {hp = 20, alive = true}, power = 25}, radius = 3})
+	entities.append(
+		ExploderEnemy{enemy = {entity = {hp = 20, alive = true}, power = 25}, radius = 3},
+	)
 
 	// Shared-base fields are promoted onto the union (offset-0): no switch, no
 	// narrowing. `for &e` gives a pointer into each slot, so writes land.
@@ -58,29 +60,22 @@ main :: proc() {
 
 	// Methods on a concrete value are promoted through `using` and mutate in
 	// place (self is a pointer).
-	p := Player{entity = {hp = 30, alive = true}}
+	p := Player {
+		entity = {hp = 30, alive = true},
+	}
 	p.take_damage(5)
 	fmt.println("player:", p.describe())
 
-	// Variant-specific behavior: narrow to the variant, then call its (promoted)
-	// method through the in-place pointer so mutation writes back to the slot.
+	// Base methods are promoted onto the union too: call `take_damage` directly
+	// on each slot, switch-free. `for &e` gives a pointer, so self writes back.
 	for &e in entities {
-		#partial switch _ in e {
-		case Player:
-			(&e.(Player)).take_damage(1)
-		case Enemy:
-			(&e.(Enemy)).take_damage(2)
-		case ExploderEnemy:
-			(&e.(ExploderEnemy)).take_damage(3)
-		}
+		e.take_damage(5)
 	}
 
-	// Read the promoted base fields directly off each union value (no narrowing).
-	// NOTE: a base *method* call on the union (e.g. `e.describe()`) is not yet
-	// supported -- that needs method promotion through the union receiver. Field
-	// promotion (`e.hp`, `e.alive`) works today.
-	for e in entities {
-		fmt.printfln("entity: hp=%d alive=%t", e.hp, e.alive)
+	// Base method returning a value, called directly on each slot (`for &e` so
+	// the receiver is addressable, which promotion needs to reinterpret as ^T).
+	for &e in entities {
+		fmt.println("entity:", e.describe())
 	}
 
 	fmt.printfln("sizeof(BaseEntity)=%d", size_of(BaseEntity))
