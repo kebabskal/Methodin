@@ -2853,6 +2853,10 @@ gb_internal void add_dependency_to_set_threaded(Checker *c, Entity *entity) {
 	if (entity == nullptr) {
 		return;
 	}
+	if (build_context.no_threaded_checker) {
+		add_dependency_to_set_worker(entity); // serial: see init_build_context
+		return;
+	}
 	thread_pool_add_task(add_dependency_to_set_worker, entity);
 }
 
@@ -6102,9 +6106,15 @@ gb_internal void check_collect_entities_all(Checker *c) {
 
 	for (auto const &entry : c->info.files) {
 		AstFile *f = entry.value;
-		thread_pool_add_task(check_collect_entities_all_worker_proc, f);
+		if (build_context.no_threaded_checker) {
+			check_collect_entities_all_worker_proc(f); // serial: see init_build_context
+		} else {
+			thread_pool_add_task(check_collect_entities_all_worker_proc, f);
+		}
 	}
-	thread_pool_wait();
+	if (!build_context.no_threaded_checker) {
+		thread_pool_wait();
+	}
 }
 
 gb_internal void check_export_entities_in_pkg(CheckerContext *ctx, AstPackage *pkg, UntypedExprInfoMap *untyped) {
@@ -6142,9 +6152,15 @@ gb_internal void check_export_entities(Checker *c) {
 
 	for (auto const &entry : c->info.packages) {
 		AstPackage *pkg = entry.value;
-		thread_pool_add_task(check_export_entities_worker_proc, pkg);
+		if (build_context.no_threaded_checker) {
+			check_export_entities_worker_proc(pkg); // serial: see init_build_context
+		} else {
+			thread_pool_add_task(check_export_entities_worker_proc, pkg);
+		}
 	}
-	thread_pool_wait();
+	if (!build_context.no_threaded_checker) {
+		thread_pool_wait();
+	}
 }
 
 gb_internal void check_import_entities(Checker *c) {
