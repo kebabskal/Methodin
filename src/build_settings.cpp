@@ -1750,7 +1750,17 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 
 	gb_affinity_init(&bc->affinity);
 	if (bc->thread_count == 0) {
-		bc->thread_count = gb_max(bc->affinity.thread_count, 1);
+		// Methodin: the parallel compiler pipeline is not currently thread-safe
+		// with this fork. Method proc-groups funnel every method call through
+		// polymorphic overload resolution, which binds a candidate's *shared*
+		// Generic type/scope in place (is_polymorphic_type_assignable /
+		// polymorphic_assign_index); resolving the same procedure from many proc
+		// bodies in parallel races on that shared state. Further races exist in
+		// entity collection/export and in downstream codegen over the corrupted
+		// types. The result is nondeterministic SIGSEGV / "double free" on
+		// build/run/watch. Until the polymorphic binding is made thread-local,
+		// default to single-threaded compilation. Override with -thread-count:N.
+		bc->thread_count = 1;
 	}
 
 	bc->ODIN_VENDOR  = str_lit("odin");
