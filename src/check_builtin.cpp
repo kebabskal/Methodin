@@ -2771,6 +2771,27 @@ gb_internal bool check_builtin_procedure_directive(CheckerContext *c, Operand *o
 	return true;
 }
 
+// Methodin: does struct `s` have, as its first field, a `using`-embedded field
+// whose type is `target` (directly, or transitively through further first-field
+// `using` embeds) — i.e. is `target` guaranteed to live at offset 0 of `s`?
+gb_internal bool type_embeds_at_offset0(Type *s, Type *target) {
+	for (isize depth = 0; depth < 64; depth++) {
+		Type *bt = base_type(s);
+		if (bt == nullptr || bt->kind != Type_Struct || bt->Struct.fields.count == 0) {
+			return false;
+		}
+		Entity *f0 = bt->Struct.fields[0];
+		if (f0 == nullptr || (f0->flags & EntityFlag_Using) == 0 || f0->type == nullptr) {
+			return false;
+		}
+		if (are_types_identical(f0->type, target)) {
+			return true;
+		}
+		s = f0->type;
+	}
+	return false;
+}
+
 gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, Ast *call, i32 id, Type *type_hint) {
 	ast_node(ce, CallExpr, call);
 	if (ce->inlining != ProcInlining_none) {
@@ -2803,6 +2824,7 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 	case BuiltinProc_offset_of_by_string:
 	case BuiltinProc_type_info_of:
 	case BuiltinProc_typeid_of:
+	case BuiltinProc_auto_union:
 	case BuiltinProc_len:
 	case BuiltinProc_cap:
 	case BuiltinProc_min:
@@ -3317,6 +3339,65 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		}
 		operand->mode = Addressing_Type;
 		operand->type = o.type;
+		break;
+	}
+
+	case BuiltinProc_auto_union: {
+		// auto_union :: proc(T: typeid) -> type(union)
+		// Methodin: produces a tagged union of every named struct in the
+		// program that `using`-embeds T at offset 0 (directly or transitively).
+		Ast *expr = ce->args[0];
+		Operand o = {};
+		check_expr_or_type(c, &o, expr);
+		if (o.mode != Addressing_Type || o.type == nullptr || o.type == t_invalid) {
+			error(expr, "'auto_union' expects a named struct type as its argument");
+			return false;
+		}
+		Type *target = o.type;
+		if (!is_type_struct(base_type(target))) {
+			gbString s = type_to_string(target);
+			error(expr, "'auto_union' expects a struct type, got '%s'", s);
+			gb_string_free(s);
+			return false;
+		}
+
+		Type *ut = alloc_type_union();
+		ut->Union.scope = c->scope;
+		ut->Union.kind  = UnionType_Normal;
+		wait_signal_set(&ut->Union.polymorphic_wait_signal);
+
+		// All top-level entities are collected before global checking, so the
+		// variant set is complete and order-independent: we force-resolve each
+		// candidate's *type* (not its size) to inspect its first field.
+		auto variants = array_make<Type *>(permanent_allocator(), 0, 8);
+		for_array(i, c->info->entities) {
+			Entity *e = c->info->entities[i];
+			if (e == nullptr || e->kind != Entity_TypeName) {
+				continue;
+			}
+			if (e->state == EntityState_InProgress) {
+				// Skips the auto_union being defined and anything mid-resolution
+				// (a real embedder never depends on the auto_union, so is never
+				// in-progress here).
+				continue;
+			}
+			if (e->type == nullptr) {
+				if (e->decl_info == nullptr) {
+					continue;
+				}
+				check_entity_decl(c, e, nullptr, nullptr);
+			}
+			if (e->type == nullptr || !is_type_struct(base_type(e->type))) {
+				continue;
+			}
+			if (type_embeds_at_offset0(e->type, target)) {
+				array_add(&variants, e->type);
+			}
+		}
+		ut->Union.variants = slice_from_array(variants);
+
+		operand->mode = Addressing_Type;
+		operand->type = ut;
 		break;
 	}
 

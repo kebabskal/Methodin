@@ -13,7 +13,9 @@ enum BuiltinProcId {
 	BuiltinProc_type_of,
 	BuiltinProc_type_info_of,
 	BuiltinProc_typeid_of,
-	
+
+	BuiltinProc_auto_union, // Methodin: union of all structs that `using`-embed T at offset 0
+
 
 	BuiltinProc_swizzle,
 
@@ -420,6 +422,8 @@ gb_global BuiltinProc builtin_procs[BuiltinProc_COUNT] = {
 	{STR_LIT("type_of"),          1, false, Expr_Expr, BuiltinProcPkg_builtin},
 	{STR_LIT("type_info_of"),     1, false, Expr_Expr, BuiltinProcPkg_builtin},
 	{STR_LIT("typeid_of"),        1, false, Expr_Expr, BuiltinProcPkg_builtin},
+
+	{STR_LIT("auto_union"),       1, false, Expr_Expr, BuiltinProcPkg_builtin},
 
 	{STR_LIT("swizzle"),          1, true,  Expr_Expr, BuiltinProcPkg_builtin},
 
