@@ -34,6 +34,7 @@ Entry :: struct {
 	src_path:  string,
 	odin_path: string,
 	is_file:   bool,
+	host_debug: bool, // host was built with -debug; mirror it into reload dylibs so they stay debuggable
 	host_sig:  u64, // rude-edit signature of the running program; a mismatch forces a restart
 	gen:       int,
 }
@@ -63,6 +64,9 @@ _hot_reload_boot :: proc "contextless" () {
 	g.is_file   = strings.has_suffix(g.src_path, ".odin")
 	if sig := cast(^u64)posix.dlsym(main, "odin_hr_signature"); sig != nil {
 		g.host_sig = sig^
+	}
+	if dbg := cast(^int)posix.dlsym(main, "odin_hr_debug"); dbg != nil {
+		g.host_debug = dbg^ != 0
 	}
 
 	if g.src_path == "" || g.odin_path == "" {
@@ -143,6 +147,10 @@ _reload :: proc() {
 		append(&cmd, "-file")
 	}
 	append(&cmd, "-build-mode:dll", "-hot-reload:reload", fmt.tprintf("-out:%s", out))
+	if g.host_debug {
+		// Match the host's debug info so breakpoints in reloaded procs keep binding.
+		append(&cmd, "-debug")
+	}
 
 	fmt.eprintln("[hot-reload] change detected, rebuilding…")
 	state, _, stderr, err := os.process_exec({command = cmd[:]}, context.temp_allocator)
