@@ -6187,6 +6187,11 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 		if (deref_type != nullptr && deref_type->kind == Type_Union &&
 		    deref_type->Union.auto_union_base != nullptr &&
 		    operand->mode == Addressing_Variable) {
+			// Remember the (addressable) union receiver and its type so the call
+			// assembly can dispatch to the variant override. The base reinterpret
+			// below still runs as the fallback (and confirms the method exists).
+			c->ufcs_auto_union_recv = op_expr;
+			c->ufcs_auto_union_type = deref_type;
 			Type *base = deref_type->Union.auto_union_base;
 			if (base->kind == Type_Named && base->Named.type_name != nullptr) {
 				AstFile *file   = op_expr->file();
@@ -8997,6 +9002,95 @@ gb_internal void check_objc_call_expr(CheckerContext *c, Operand *operand, Ast *
 	add_objc_proc_type(c, call, return_type, param_types);
 }
 
+// Methodin: build an inline dispatcher proc-literal for a method call on an
+// `auto_union(T)` value, so the call dispatches to each variant's override in
+// ANY position (if-condition, RHS, argument), returning a value. Produces:
+//
+//   proc(self: ^X, <user params>) -> <results> {
+//       switch &v in self^ {
+//       case V0: [<ret> =] v.method(<user params>)
+//       ...
+//       }
+//       return   // when results exist (named, zero-defaulted)
+//   }
+//
+// where X is the union's alias. `v.method(...)` is plain UFCS, so an overriding
+// variant gets its override and a non-overriding one the inherited base method.
+// Returns nullptr (caller falls back to base promotion) when the union is
+// unnamed, variant-less, or the signature can't be recovered.
+gb_internal Ast *make_auto_union_dispatch_proc_lit(CheckerContext *c, Type *union_type, Ast *proc_selector, Entity *resolved) {
+	if (union_type == nullptr || union_type->kind != Type_Union) return nullptr;
+	if (union_type->Union.auto_union_alias == nullptr)           return nullptr;
+	if (union_type->Union.variants.count == 0)                   return nullptr;
+	if (proc_selector == nullptr || proc_selector->kind != Ast_SelectorExpr) return nullptr;
+	Ast *sel = proc_selector->SelectorExpr.selector;
+	if (sel == nullptr || sel->kind != Ast_Ident) return nullptr;
+	String method_name = sel->Ident.token.string;
+
+	// Recover the user-facing signature from the resolved base method. Methods are
+	// grouped by name, so `resolved` is usually the proc group; any member carries
+	// the right params/results (self is dropped below).
+	Entity *m = resolved;
+	if (m != nullptr && m->kind == Entity_ProcGroup) {
+		if (m->ProcGroup.entities.count == 0) return nullptr;
+		m = m->ProcGroup.entities[0];
+	}
+	if (m == nullptr || m->kind != Entity_Procedure) return nullptr;
+	DeclInfo *di = decl_info_of_entity(m);
+	if (di == nullptr || di->proc_lit == nullptr || di->proc_lit->kind != Ast_ProcLit) return nullptr;
+	Ast *base_pt = di->proc_lit->ProcLit.type;
+	if (base_pt == nullptr || base_pt->kind != Ast_ProcType) return nullptr;
+	if (base_pt->ProcType.params == nullptr || base_pt->ProcType.params->kind != Ast_FieldList) return nullptr;
+
+	AstFile *f = proc_selector->file();
+	Token alias_tok = union_type->Union.auto_union_alias->token;
+	auto tok = [&](TokenKind kind, char const *s) -> Token {
+		Token t = {}; t.kind = kind; t.string = make_string_c(s); t.pos = alias_tok.pos; return t;
+	};
+
+	// Sample proc-lit holding just the user params (drop self at index 0) + results,
+	// for build_union_dispatcher to clone its signature + synthesise the switch body.
+	Ast *cloned_pt = clone_ast(base_pt, f);
+	auto const &plist = cloned_pt->ProcType.params->FieldList.list;
+	if (plist.count < 1) return nullptr; // must at least have the self param
+	auto user_fields = array_make<Ast *>(ast_allocator(f), 0, plist.count - 1);
+	for (isize i = 1; i < plist.count; i++) array_add(&user_fields, plist[i]);
+	cloned_pt->ProcType.params->FieldList.list = slice_from_array(user_fields);
+
+	auto no_stmts = array_make<Ast *>(ast_allocator(f));
+	Ast *empty_body = ast_block_stmt(f, no_stmts, tok(Token_OpenBrace, "{"), tok(Token_CloseBrace, "}"));
+	auto wc = array_make<Ast *>(ast_allocator(f));
+	Ast *sample_pl = ast_proc_lit(f, cloned_pt, empty_body, 0, Token{}, wc);
+	auto vd_names  = array_make<Ast *>(ast_allocator(f), 0, 1); array_add(&vd_names, ast_ident(f, sel->Ident.token));
+	auto vd_values = array_make<Ast *>(ast_allocator(f), 0, 1); array_add(&vd_values, sample_pl);
+	Ast *sample_vd = ast_value_decl(f, vd_names, nullptr, vd_values, false, nullptr, nullptr);
+
+	auto variant_idents = array_make<Ast *>(ast_allocator(f), 0, union_type->Union.variants.count);
+	for (Type *vt : union_type->Union.variants) {
+		if (vt == nullptr || vt->kind != Type_Named || vt->Named.type_name == nullptr) return nullptr;
+		array_add(&variant_idents, ast_ident(f, vt->Named.type_name->token));
+	}
+
+	Ast *disp_vd = build_union_dispatcher(f, alias_tok, method_name, slice_from_array(variant_idents), sample_vd);
+	if (disp_vd == nullptr || disp_vd->kind != Ast_ValueDecl || disp_vd->ValueDecl.values.count != 1) return nullptr;
+	Ast *disp_pl = disp_vd->ValueDecl.values[0];
+	if (disp_pl->kind != Ast_ProcLit) return nullptr;
+
+	// Prepend `self: ^X` (the dispatcher body references `self^`).
+	Ast *self_ptr = ast_pointer_type(f, tok(Token_Pointer, "^"), ast_ident(f, alias_tok));
+	auto self_names = array_make<Ast *>(ast_allocator(f), 0, 1);
+	array_add(&self_names, ast_ident(f, tok(Token_Ident, "self")));
+	Ast *self_field = ast_field(f, self_names, self_ptr, nullptr, 0, Token{}, nullptr, nullptr);
+
+	Ast *disp_params = disp_pl->ProcLit.type->ProcType.params;
+	auto new_list = array_make<Ast *>(ast_allocator(f), 0, disp_params->FieldList.list.count + 1);
+	array_add(&new_list, self_field);
+	for (Ast *fld : disp_params->FieldList.list) array_add(&new_list, fld);
+	disp_params->FieldList.list = slice_from_array(new_list);
+
+	return disp_pl;
+}
+
 gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *call, Ast *proc, Slice<Ast *> const &args, ProcInlining inlining, ProcTailing tailing, Type *type_hint) {
 	if (proc != nullptr &&
 	    proc->kind == Ast_BasicDirective) {
@@ -9038,16 +9132,57 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 			bool   prev_ufcs_call_context = c->ufcs_call_context;
 			Ast *  prev_ufcs_first_arg    = c->ufcs_first_arg;
 			Entity *prev_ufcs_entity      = c->ufcs_entity;
+			Ast *  prev_ufcs_au_recv      = c->ufcs_auto_union_recv;
+			Type * prev_ufcs_au_type      = c->ufcs_auto_union_type;
 			bool try_ufcs = proc->kind == Ast_SelectorExpr && proc->SelectorExpr.token.kind == Token_Period;
 			if (try_ufcs) {
 				c->ufcs_call_context = true;
 				c->ufcs_first_arg    = nullptr;
 				c->ufcs_entity       = nullptr;
+				c->ufcs_auto_union_recv = nullptr;
+				c->ufcs_auto_union_type = nullptr;
 			}
 			check_expr_or_type(c, operand, proc);
 			if (try_ufcs && c->ufcs_first_arg != nullptr && c->ufcs_entity != nullptr) {
 				ast_node(ce, CallExpr, call);
 				Entity *ufcs_e = c->ufcs_entity;
+
+				// Methodin: dispatch an `auto_union(T)` method call to the variant
+				// override via a synthesised type-switch proc, in any position.
+				// `ce->args` here is still the user args (the receiver prepend
+				// happens below), so we prepend `&recv` ourselves.
+				if (c->ufcs_auto_union_recv != nullptr) {
+					Ast *disp = make_auto_union_dispatch_proc_lit(c, c->ufcs_auto_union_type, proc, ufcs_e);
+					if (disp != nullptr) {
+						Operand lit_op = {};
+						check_expr(c, &lit_op, disp);
+						if (lit_op.mode != Addressing_Invalid && lit_op.type != nullptr) {
+							Ast *recv = c->ufcs_auto_union_recv;
+							Token amp = {}; amp.kind = Token_And; amp.string = str_lit("&");
+							amp.pos = ast_token(recv).pos;
+							Ast *addr = ast_unary_expr(call->file(), amp, clone_ast(recv, call->file()));
+
+							auto au_args = permanent_slice_make<Ast *>(ce->args.count + 1);
+							au_args[0] = addr;
+							slice_copy(&au_args, ce->args, 1);
+							ce->args = au_args;
+							ce->split_args = nullptr;
+							ce->proc = disp;
+
+							operand->expr  = disp;
+							operand->mode  = lit_op.mode;
+							operand->type  = lit_op.type;
+							operand->value = {};
+
+							c->ufcs_call_context = prev_ufcs_call_context;
+							c->ufcs_first_arg    = prev_ufcs_first_arg;
+							c->ufcs_entity       = prev_ufcs_entity;
+							c->ufcs_auto_union_recv = prev_ufcs_au_recv;
+							c->ufcs_auto_union_type = prev_ufcs_au_type;
+							goto ufcs_done;
+						}
+					}
+				}
 				// Replace the selector callee with a freshly synthesised Ident
 				// bound to the resolved free procedure. The backend then sees
 				// a plain procedure reference instead of a selector that would
@@ -9093,6 +9228,9 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 			c->ufcs_call_context = prev_ufcs_call_context;
 			c->ufcs_first_arg    = prev_ufcs_first_arg;
 			c->ufcs_entity       = prev_ufcs_entity;
+			c->ufcs_auto_union_recv = prev_ufcs_au_recv;
+			c->ufcs_auto_union_type = prev_ufcs_au_type;
+			ufcs_done:;
 		} else {
 			GB_ASSERT(operand->expr != nullptr);
 		}
