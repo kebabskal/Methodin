@@ -504,6 +504,16 @@ gb_internal void check_type_decl(CheckerContext *ctx, Entity *e, Ast *init_expr,
 		named->Named.base = bt;
 	}
 
+	// Methodin: record the alias that names an `auto_union(T)`. The union itself is
+	// anonymous, so this is the only handle a synthesised dispatcher has to spell its
+	// receiver type (`^X`). First alias wins.
+	{
+		Type *ubt = base_type(bt);
+		if (ubt != nullptr && ubt->kind == Type_Union && ubt->Union.auto_union_base != nullptr && ubt->Union.auto_union_alias == nullptr) {
+			ubt->Union.auto_union_alias = e;
+		}
+	}
+
 	e->TypeName.is_type_alias = !is_distinct;
 
 	if (decl->type_expr != nullptr) {

@@ -174,7 +174,8 @@ struct TypeUnion {
 
 	Ast *            node;
 	Scope *          scope;
-	Type *           auto_union_base; // Methodin: for `auto_union(T)`, the shared offset-0 base T (member promotion)
+	Type *           auto_union_base;  // Methodin: for `auto_union(T)`, the shared offset-0 base T (member promotion)
+	Entity *         auto_union_alias; // Methodin: the `X :: auto_union(T)` alias TypeName, so the (anonymous) union can be named in synthesised dispatchers
 
 	std::atomic<i64> variant_block_size;
 	i64              custom_align;
