@@ -61,6 +61,8 @@ gb_internal bool contains_deferred_call(Ast *node) {
 	return false;
 }
 
+gb_internal Ast *build_auto_union_dispatch_stmt(CheckerContext *ctx, Ast *call);
+
 gb_internal void check_stmt_list(CheckerContext *ctx, Slice<Ast *> const &stmts, u32 flags) {
 	if (stmts.count == 0) {
 		return;
@@ -96,6 +98,16 @@ gb_internal void check_stmt_list(CheckerContext *ctx, Slice<Ast *> const &stmts,
 		Ast *n = stmts[i];
 		if (n->kind == Ast_EmptyStmt) {
 			continue;
+		}
+		// Methodin: rewrite an `auto_union` method-call statement into a
+		// type-switch that dispatches to the variant override. Done here (not
+		// in the ExprStmt case) so the new node replaces the old one in this
+		// list — AST nodes are variant-sized, so it can't be swapped in place.
+		if (n->kind == Ast_ExprStmt) {
+			if (Ast *dispatch = build_auto_union_dispatch_stmt(ctx, n->ExprStmt.expr)) {
+				n = dispatch;
+				stmts.data[i] = dispatch;
+			}
 		}
 		u32 new_flags = flags;
 		if (ft_ok && i+1 == max) {
@@ -2815,6 +2827,117 @@ gb_internal void check_for_stmt(CheckerContext *ctx, Ast *node, u32 mod_flags) {
 	check_close_scope(ctx);
 }
 
+
+// Methodin: virtual dispatch for a method call on an `auto_union(T)` receiver.
+//
+// `recv.method(args)` used as a statement is rewritten to a type-switch that
+// forwards to each variant's own method:
+//
+//     switch &v in recv {       // `recv^` when recv is a pointer
+//     case Variant0: v.method(args)
+//     case Variant1: v.method(args)
+//     }
+//
+// This mirrors the dispatcher the parser synthesises for explicitly-declared
+// unions (`build_union_dispatcher`), but here the variant set is only known at
+// check time. Without it the call resolves through the offset-0 base promotion
+// and always invokes T's own method instead of the variant override. The
+// per-case `v.method(args)` is plain UFCS, so a variant that overrides the
+// method gets its override and one that doesn't falls back to the inherited
+// base method — exactly the desired behaviour.
+//
+// Returns the synthesised type-switch, or nullptr if `call` is not a method
+// call on an addressable auto_union (the caller then checks it normally).
+gb_internal Ast *build_auto_union_dispatch_stmt(CheckerContext *ctx, Ast *call) {
+	if (call == nullptr || call->kind != Ast_CallExpr) {
+		return nullptr;
+	}
+	ast_node(ce, CallExpr, call);
+	Ast *proc = ce->proc;
+	if (proc == nullptr || proc->kind != Ast_SelectorExpr || proc->SelectorExpr.token.kind != Token_Period) {
+		return nullptr;
+	}
+	Ast *recv = proc->SelectorExpr.expr;
+	Ast *sel  = proc->SelectorExpr.selector;
+	if (recv == nullptr || sel == nullptr || sel->kind != Ast_Ident) {
+		return nullptr;
+	}
+
+	// Skip package-qualified calls (`pkg.proc(...)`): the receiver is an import
+	// name, not a value, and checking it as an expression below would emit a
+	// spurious "import name not in the form of 'x.y'" error.
+	if (recv->kind == Ast_Ident) {
+		Entity *re = scope_lookup(ctx->scope, recv->Ident.interned, recv->Ident.hash);
+		if (re != nullptr && (re->kind == Entity_ImportName || re->kind == Entity_LibraryName)) {
+			return nullptr;
+		}
+	}
+
+	// Determine the receiver type. (The cloned receiver is re-checked below as
+	// the switch tag; only the switch is code-generated.)
+	Operand recv_op = {};
+	check_expr(ctx, &recv_op, recv);
+	if (recv_op.mode == Addressing_Invalid || recv_op.type == nullptr) {
+		return nullptr;
+	}
+	bool is_ptr  = is_type_pointer(recv_op.type);
+	Type *ut     = base_type(type_deref(recv_op.type));
+	if (ut == nullptr || ut->kind != Type_Union || ut->Union.auto_union_base == nullptr) {
+		return nullptr;
+	}
+	if (ut->Union.variants.count == 0) {
+		return nullptr;
+	}
+	// `&v` requires an addressable union so a `^self` method writes through.
+	if (!is_ptr && recv_op.mode != Addressing_Variable) {
+		return nullptr;
+	}
+
+	AstFile *f = call->file();
+	TokenPos pos = sel->Ident.token.pos;
+	auto tok = [&](TokenKind kind, char const *s) -> Token {
+		Token t = {}; t.kind = kind; t.string = make_string_c(s); t.pos = pos; return t;
+	};
+
+	// Switch source: `recv^` if recv is a pointer, else `recv`.
+	Ast *switch_src = clone_ast(recv, f);
+	if (is_ptr) {
+		switch_src = ast_deref_expr(f, switch_src, tok(Token_Pointer, "^"));
+	}
+
+	// Cases: `case <Variant>: v.<method>(<args>)`, one per union variant.
+	auto cases = array_make<Ast *>(ast_allocator(f), 0, ut->Union.variants.count);
+	for (Type *vt : ut->Union.variants) {
+		if (vt == nullptr || vt->kind != Type_Named || vt->Named.type_name == nullptr) {
+			return nullptr; // unnamed variant — fall back to the default path
+		}
+		Ast *v_ident      = ast_ident(f, tok(Token_Ident, "v"));
+		Ast *method_ident = ast_ident(f, sel->Ident.token);
+		Ast *selector     = ast_selector_expr(f, tok(Token_Period, "."), v_ident, method_ident);
+
+		auto call_args = array_make<Ast *>(ast_allocator(f), 0, ce->args.count);
+		for (Ast *arg : ce->args) {
+			array_add(&call_args, clone_ast(arg, f));
+		}
+		Ast *vcall = ast_call_expr(f, selector, call_args, tok(Token_OpenParen, "("), tok(Token_CloseParen, ")"), Token{});
+		Ast *stmt  = ast_expr_stmt(f, vcall);
+
+		auto list  = array_make<Ast *>(ast_allocator(f), 0, 1);
+		array_add(&list, ast_ident(f, vt->Named.type_name->token));
+		auto stmts = array_make<Ast *>(ast_allocator(f), 0, 1);
+		array_add(&stmts, stmt);
+		array_add(&cases, ast_case_clause(f, tok(Token_case, "case"), list, stmts));
+	}
+	Ast *switch_body = ast_block_stmt(f, cases, tok(Token_OpenBrace, "{"), tok(Token_CloseBrace, "}"));
+
+	// `&v in switch_src`
+	Ast *amp_v = ast_unary_expr(f, tok(Token_And, "&"), ast_ident(f, tok(Token_Ident, "v")));
+	auto lhs = array_make<Ast *>(ast_allocator(f), 0, 1); array_add(&lhs, amp_v);
+	auto rhs = array_make<Ast *>(ast_allocator(f), 0, 1); array_add(&rhs, switch_src);
+	Ast *tag = ast_assign_stmt(f, tok(Token_in, "in"), lhs, rhs);
+
+	return ast_type_switch_stmt(f, tok(Token_switch, "switch"), tag, switch_body);
+}
 
 gb_internal void check_stmt_internal(CheckerContext *ctx, Ast *node, u32 flags) {
 	u32 mod_flags = flags & (~Stmt_FallthroughAllowed);
