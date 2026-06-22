@@ -3013,12 +3013,8 @@ gb_internal void check_stmt_internal(CheckerContext *ctx, Ast *node, u32 flags) 
 			return;
 		}
 
-		u64 feature_flags = check_feature_flags(ctx, node);
-		if ((feature_flags & OptInFeatureFlag_UsingStmt) == 0) {
-			ERROR_BLOCK();
-			error(node, "'using' has been disallowed as it is considered bad practice to use as a statement outside of immediate refactoring");
-			error_line("\tIf you do require it for refactoring purposes or legacy code, it can be enabled on a per-file basis with '#+feature using-stmt'\n");
-		}
+		// The `using` statement is enabled by default in this fork. `#+feature using-stmt`
+		// remains accepted (now redundant), and `-vet-using-stmt` still warns on request.
 
 		for (Ast *expr : us->list) {
 			expr = unparen_expr(expr);
