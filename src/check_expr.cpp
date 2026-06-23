@@ -9033,7 +9033,27 @@ gb_internal Ast *make_auto_union_dispatch_proc_lit(CheckerContext *c, Type *unio
 	Entity *m = resolved;
 	if (m != nullptr && m->kind == Entity_ProcGroup) {
 		if (m->ProcGroup.entities.count == 0) return nullptr;
-		m = m->ProcGroup.entities[0];
+		// The group merges every same-named method across unrelated structs, in a
+		// resolution-order-dependent order. The dispatcher must mirror the BASE
+		// method — the member whose receiver is the union's `auto_union_base` (T) —
+		// so pick it explicitly. Using entities[0] would non-deterministically grab
+		// a same-named method on an unrelated struct (e.g. World.raycast) whose
+		// signature differs, producing a wrong dispatcher result type.
+		Type *want_base = union_type->Union.auto_union_base;
+		Entity *picked = nullptr;
+		for (Entity *cand : m->ProcGroup.entities) {
+			if (cand == nullptr || cand->kind != Entity_Procedure || cand->type == nullptr) continue;
+			Type *pt = base_type(cand->type);
+			if (pt == nullptr || pt->kind != Type_Proc || pt->Proc.param_count == 0) continue;
+			Type *recv = type_deref(pt->Proc.params->Tuple.variables[0]->type);
+			if (want_base != nullptr && are_types_identical(recv, want_base)) {
+				picked = cand;
+				break;
+			}
+		}
+		// No base-matching overload: fall back to base promotion (return nullptr).
+		if (picked == nullptr) return nullptr;
+		m = picked;
 	}
 	if (m == nullptr || m->kind != Entity_Procedure) return nullptr;
 	DeclInfo *di = decl_info_of_entity(m);
