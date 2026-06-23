@@ -9064,6 +9064,12 @@ gb_internal Ast *make_auto_union_dispatch_proc_lit(CheckerContext *c, Type *unio
 
 	AstFile *f = proc_selector->file();
 	Token alias_tok = union_type->Union.auto_union_alias->token;
+	// Retarget every synthesised node's position to the user's call site. alias_tok
+	// drives both the dispatcher proc-lit's token (hence ast_token(call), used for
+	// argument-error reporting) and the `^X` receiver ident. Keep its string (so the
+	// type still resolves by name) but point its position at the call, so a bad call
+	// reports at the call site instead of the `X :: auto_union(T)` declaration.
+	alias_tok.pos = ast_token(proc_selector).pos;
 	auto tok = [&](TokenKind kind, char const *s) -> Token {
 		Token t = {}; t.kind = kind; t.string = make_string_c(s); t.pos = alias_tok.pos; return t;
 	};
