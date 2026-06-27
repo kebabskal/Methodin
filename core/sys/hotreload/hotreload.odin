@@ -8,10 +8,14 @@
 // background thread that:
 //   1. watches the package's `.odin` files for modification,
 //   2. rebuilds the package as a dynamic library (`-build-mode:dll -hot-reload:reload`),
-//   3. dlopen's the result and overwrites each dispatch slot with the new proc address.
+//   3. loads the result and overwrites each dispatch slot with the new proc address.
 //
-// Package globals are exported by the host and imported by the reload dylib, so program
+// Package globals are exported by the host and imported by the reload library, so program
 // state (globals) is preserved across reloads — only code changes.
+//
+// This file is platform-neutral. The OS primitives it relies on — resolving symbols in the
+// running host, loading the reload library, naming a scratch path, and restarting the process
+// — live in `hotreload_unix.odin` / `hotreload_windows.odin`.
 package hot_reload
 
 import "base:runtime"
@@ -21,21 +25,21 @@ import "core:os"
 import "core:strings"
 import "core:thread"
 import "core:time"
-import "core:sys/posix"
 
 // Must match the struct the compiler emits for `odin_hr_entries` (see lb_emit_hot_reload_manifest).
 Entry :: struct {
-	name: cstring, // mangled proc symbol, looked up in the reload dylib
+	name: cstring, // mangled proc symbol, looked up in the reload library
 	slot: ^rawptr, // address of the host's writable dispatch slot to overwrite
 }
 
 @(private) State :: struct {
-	entries:   []Entry,
-	src_path:  string,
-	odin_path: string,
-	is_file:   bool,
-	host_sig:  u64, // rude-edit signature of the running program; a mismatch forces a restart
-	gen:       int,
+	entries:     []Entry,
+	src_path:    string,
+	odin_path:   string,
+	host_implib: string, // Windows: host import library the reload build links against; "" elsewhere
+	is_file:     bool,
+	host_sig:    u64, // rude-edit signature of the running program; a mismatch forces a restart
+	gen:         int,
 }
 
 @(private) g: State
@@ -44,24 +48,25 @@ Entry :: struct {
 _hot_reload_boot :: proc "contextless" () {
 	context = _ctx()
 
-	// The manifest symbols are exported by the host executable (built with -export_dynamic),
-	// so we can resolve them against the running program itself.
-	main := posix.dlopen(nil, {.LAZY})
-	if main == nil {
+	// The manifest symbols are exported by the host executable (via -export_dynamic on Unix or
+	// dllexport on Windows), so we can resolve them against the running program itself.
+	self := _self_module()
+	if self == nil {
 		return
 	}
 
-	count_ptr   := cast(^int)posix.dlsym(main, "odin_hr_entry_count")
-	entries_ptr := cast([^]Entry)posix.dlsym(main, "odin_hr_entries")
+	count_ptr   := cast(^int)_self_sym(self, "odin_hr_entry_count")
+	entries_ptr := cast([^]Entry)_self_sym(self, "odin_hr_entries")
 	if count_ptr == nil || entries_ptr == nil {
 		return // not a hot-reload host build
 	}
 
-	g.entries   = entries_ptr[:count_ptr^]
-	g.src_path  = _cstr(posix.dlsym(main, "odin_hr_src_path"))
-	g.odin_path = _cstr(posix.dlsym(main, "odin_hr_odin_path"))
-	g.is_file   = strings.has_suffix(g.src_path, ".odin")
-	if sig := cast(^u64)posix.dlsym(main, "odin_hr_signature"); sig != nil {
+	g.entries     = entries_ptr[:count_ptr^]
+	g.src_path    = _cstr(_self_sym(self, "odin_hr_src_path"))
+	g.odin_path   = _cstr(_self_sym(self, "odin_hr_odin_path"))
+	g.host_implib = _cstr(_self_sym(self, "odin_hr_host_implib"))
+	g.is_file     = strings.has_suffix(g.src_path, ".odin")
+	if sig := cast(^u64)_self_sym(self, "odin_hr_signature"); sig != nil {
 		g.host_sig = sig^
 	}
 
@@ -133,9 +138,9 @@ _latest_mtime :: proc() -> i64 {
 @(private)
 _reload :: proc() {
 	g.gen += 1
-	// A fresh path each reload: dlopen caches by path, so reusing a name would return the
+	// A fresh path each reload: the loader caches by path, so reusing a name would return the
 	// stale image instead of loading the newly-built one.
-	out := fmt.tprintf("/tmp/.odin_hot_reload_%d_%d.dylib", int(posix.getpid()), g.gen)
+	out := _temp_lib_path(g.gen)
 
 	cmd := make([dynamic]string, 0, 8, context.temp_allocator)
 	append(&cmd, g.odin_path, "build", g.src_path)
@@ -143,17 +148,21 @@ _reload :: proc() {
 		append(&cmd, "-file")
 	}
 	append(&cmd, "-build-mode:dll", "-hot-reload:reload", fmt.tprintf("-out:%s", out))
+	// Windows: the reload DLL imports the host's package globals through the host's import
+	// library (PE has no equivalent of ELF's runtime symbol interposition). Empty on Unix, where
+	// the loader binds the globals directly. The agent quotes this whole argument for the child
+	// process, but odin re-emits the bare value into its own linker command line, so a host path
+	// containing spaces would still need handling there.
+	if g.host_implib != "" {
+		append(&cmd, fmt.tprintf("-extra-linker-flags:%s", g.host_implib))
+	}
 
 	fmt.eprintln("[hot-reload] change detected, rebuilding…")
-	state, _, stderr, err := os.process_exec({command = cmd[:]}, context.temp_allocator)
-	if err != nil {
-		fmt.println("[hot-reload] could not start the compiler:", err)
-		return
-	}
-	if !state.exited || state.exit_code != 0 {
-		fmt.println("[hot-reload] build failed — keeping the running code")
-		if len(stderr) > 0 {
-			fmt.print(string(stderr))
+	build_ok, fail_output := _run_compiler(cmd[:])
+	if !build_ok {
+		fmt.eprintln("[hot-reload] build failed — keeping the running code")
+		if len(fail_output) > 0 {
+			fmt.eprint(fail_output)
 		}
 		return
 	}
@@ -195,24 +204,6 @@ _reload :: proc() {
 	if hook != nil {
 		(cast(proc())hook)()
 	}
-}
-
-// Replace the running process with a fresh `odin watch` of the same target. This rebuilds
-// the host with the new code (new globals/main) and runs it — program state is lost, which
-// is unavoidable for a layout/loop change.
-@(private)
-_restart :: proc() {
-	argv := make([dynamic]cstring, 0, 6, context.temp_allocator)
-	append(&argv, strings.clone_to_cstring(g.odin_path, context.temp_allocator))
-	append(&argv, "watch")
-	append(&argv, strings.clone_to_cstring(g.src_path, context.temp_allocator))
-	if g.is_file {
-		append(&argv, "-file")
-	}
-	append(&argv, nil) // execv requires a null-terminated argument vector
-	posix.execv(argv[0], raw_data(argv))
-	// execv only returns on failure.
-	fmt.eprintln("[hot-reload] restart failed; please re-run `odin watch` manually")
 }
 
 // True if a mangled proc symbol's final segment is the reserved hook name `hot_reloaded`.

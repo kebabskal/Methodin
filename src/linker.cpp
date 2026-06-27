@@ -278,7 +278,13 @@ try_cross_linking:;
 
 			if (build_context.build_mode == BuildMode_DynamicLibrary) {
 				link_settings = gb_string_append_fmt(link_settings, " /DLL");
-				if (build_context.no_entry_point) {
+				// A reload DLL keeps no_entry_point set (so the generated __entry_point never calls
+				// the user's `main` — only @(init)/global setup runs on load). But it still needs
+				// the standard DLL entry _DllMainCRTStartup, which pulls in the CRT that provides
+				// memset/memcpy/memmove; /NOENTRY would drop it. _DllMainCRTStartup calls our
+				// DllMain, which runs __entry_point — and with no_entry_point that does not run main.
+				bool hot_reload_dll = build_context.hot_reload_mode == HotReload_Reload;
+				if (build_context.no_entry_point && !hot_reload_dll) {
 					link_settings = gb_string_append_fmt(link_settings, " /NOENTRY");
 				}
 			} else {
@@ -287,6 +293,15 @@ try_cross_linking:;
 				if (!(build_context.metrics.arch == TargetArch_i386 && !build_context.no_crt)) {
 					link_settings = gb_string_append_fmt(link_settings, " /ENTRY:mainCRTStartup");
 				}
+			}
+
+			// Hot reload: the host EXE exports its package globals (and manifest) via dllexport,
+			// so the linker emits an import library next to it that the reload DLL binds against.
+			// Force a known path so the agent (which got it from the manifest) and the linker
+			// agree, and so the msvc branch below does not suppress it with /NOIMPLIB.
+			if (build_context.hot_reload_mode == HotReload_Host && build_context.build_mode == BuildMode_Executable) {
+				String implib = hot_reload_host_implib_path(heap_allocator());
+				link_settings = gb_string_append_fmt(link_settings, " /IMPLIB:\"%.*s\"", LIT(implib));
 			}
 
 			if (build_context.build_paths[BuildPath_Symbols].name != "") {
@@ -397,7 +412,11 @@ try_cross_linking:;
 				String linker_name = str_lit("link.exe");
 				switch (build_context.build_mode) {
 				case BuildMode_Executable:
-					link_settings = gb_string_append_fmt(link_settings, " /NOIMPLIB /NOEXP");
+					// A hot-reload host must keep its import library/export table so the reload
+					// DLL can bind to its exported globals; everything else gets neither.
+					if (build_context.hot_reload_mode != HotReload_Host) {
+						link_settings = gb_string_append_fmt(link_settings, " /NOIMPLIB /NOEXP");
+					}
 					break;
 				}
 

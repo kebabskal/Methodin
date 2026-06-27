@@ -2080,6 +2080,7 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 		bc->use_separate_modules = false;
 	}
 
+
 	if (bc->lto_kind == LTO_Thin || bc->lto_kind == LTO_Thin_Files) {
 #if LLVM_VERSION_MAJOR < 17
 		gb_printf_err("-lto:thin requires LLVM 17 or later\n");
@@ -2116,6 +2117,19 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 	if (bc->metrics.os == TargetOs_freestanding) {
 		bc->ODIN_DEFAULT_TO_NIL_ALLOCATOR = !bc->ODIN_DEFAULT_TO_PANIC_ALLOCATOR;
 	}
+}
+
+// Hot reload (Windows only): the import library the host EXE emits next to itself so a reload
+// DLL can bind to the host's exported package globals. Same directory/name as the output, with
+// a `.lib` extension. Computed identically in codegen (manifest) and the linker (/IMPLIB) so
+// they always agree.
+gb_internal String hot_reload_host_implib_path(gbAllocator a) {
+	Path out = build_context.build_paths[BuildPath_Output];
+	Path lib = {};
+	lib.basename = out.basename;
+	lib.name     = out.name;
+	lib.ext      = str_lit("lib");
+	return path_to_string(a, lib);
 }
 
 #if defined(GB_SYSTEM_WINDOWS)

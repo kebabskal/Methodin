@@ -250,8 +250,24 @@ gb_internal LLVMValueRef lb_hr_inline_cstring(lbModule *m, String s) {
 	return LLVMConstInBoundsGEP2(LLVMTypeOf(str), gv, idx, 2);
 }
 
-// A named, exported, null-terminated char array. dlsym(name) on the host returns a pointer
-// to the string bytes, so the agent reads it directly as a cstring.
+// True when the build targets Windows, whose PE/COFF format needs explicit dllexport/dllimport
+// storage classes for the agent's cross-module symbol lookup (unlike ELF/Mach-O, where external
+// linkage + default visibility under --export-dynamic / -undefined dynamic_lookup is enough).
+gb_internal bool lb_hot_reload_is_windows(void) {
+	return build_context.metrics.os == TargetOs_windows;
+}
+
+// On Windows, mark a host-side hot-reload symbol as dllexport so it lands in the EXE's export
+// table (and import library), where the agent's GetProcAddress / the reload DLL's loader can
+// find it. No-op elsewhere.
+gb_internal void lb_hot_reload_mark_host_export(LLVMValueRef gv) {
+	if (lb_hot_reload_is_windows()) {
+		LLVMSetDLLStorageClass(gv, LLVMDLLExportStorageClass);
+	}
+}
+
+// A named, exported, null-terminated char array. dlsym/GetProcAddress(name) on the host returns
+// a pointer to the string bytes, so the agent reads it directly as a cstring.
 gb_internal void lb_hr_named_cstring(lbModule *m, char const *name, String s) {
 	LLVMValueRef str = LLVMConstStringInContext(m->ctx, cast(char const *)s.text, cast(unsigned)s.len, false);
 	LLVMValueRef gv = LLVMAddGlobal(m->mod, LLVMTypeOf(str), name);
@@ -259,6 +275,7 @@ gb_internal void lb_hr_named_cstring(lbModule *m, char const *name, String s) {
 	LLVMSetLinkage(gv, LLVMExternalLinkage);
 	LLVMSetVisibility(gv, LLVMDefaultVisibility);
 	LLVMSetGlobalConstant(gv, true);
+	lb_hot_reload_mark_host_export(gv);
 	lb_append_to_compiler_used(m, gv);
 }
 
@@ -291,17 +308,28 @@ gb_internal void lb_emit_hot_reload_manifest(lbModule *m) {
 	LLVMSetInitializer(entries_g, arr);
 	LLVMSetLinkage(entries_g, LLVMExternalLinkage);
 	LLVMSetVisibility(entries_g, LLVMDefaultVisibility);
+	lb_hot_reload_mark_host_export(entries_g);
 	lb_append_to_compiler_used(m, entries_g);
 
 	LLVMValueRef count_g = LLVMAddGlobal(m->mod, lb_type(m, t_int), "odin_hr_entry_count");
 	LLVMSetInitializer(count_g, LLVMConstInt(lb_type(m, t_int), cast(u64)n, false));
 	LLVMSetLinkage(count_g, LLVMExternalLinkage);
 	LLVMSetVisibility(count_g, LLVMDefaultVisibility);
+	lb_hot_reload_mark_host_export(count_g);
 	lb_append_to_compiler_used(m, count_g);
 
 	String odin_exe = concatenate_strings(permanent_allocator(), odin_root_dir(), str_lit("odin"));
 	lb_hr_named_cstring(m, "odin_hr_src_path",  build_context.hot_reload_source_path);
 	lb_hr_named_cstring(m, "odin_hr_odin_path", odin_exe);
+
+	// Windows only: the reload DLL imports the host's package globals through the host's import
+	// library (PE has no equivalent of ELF's runtime symbol interposition). The agent reads this
+	// path and passes it to the reload build's linker. Empty on other targets, where the dynamic
+	// loader resolves the globals directly against the running host.
+	String host_implib = lb_hot_reload_is_windows()
+		? hot_reload_host_implib_path(permanent_allocator())
+		: str_lit("");
+	lb_hr_named_cstring(m, "odin_hr_host_implib", host_implib);
 }
 
 // A content hash of everything about the initial package that CANNOT be live-patched:
@@ -312,9 +340,9 @@ gb_internal void lb_emit_hot_reload_manifest(lbModule *m) {
 // and source, so the host and the reload dylib agree for identical source regardless of
 // which mode they were built in.
 gb_internal u64 lb_hot_reload_signature(CheckerInfo *info) {
-	u64 const FNV_OFFSET = 1469598103934665603ull;
-	u64 const FNV_PRIME  = 1099511628211ull;
+	constexpr u64 FNV_OFFSET = 1469598103934665603ull;
 	auto fold = [](u64 h, u8 const *bytes, isize n) -> u64 {
+		u64 const FNV_PRIME = 1099511628211ull;
 		for (isize i = 0; i < n; i++) { h ^= bytes[i]; h *= FNV_PRIME; }
 		return h;
 	};
@@ -386,6 +414,9 @@ gb_internal void lb_emit_hot_reload_signature(lbModule *m) {
 	LLVMSetLinkage(g, LLVMExternalLinkage);
 	LLVMSetVisibility(g, LLVMDefaultVisibility);
 	LLVMSetGlobalConstant(g, true);
+	// Exported by both the host and every reload DLL (the agent reads both and compares), so it
+	// needs dllexport on Windows in either mode.
+	lb_hot_reload_mark_host_export(g);
 	lb_append_to_compiler_used(m, g);
 }
 
@@ -3674,11 +3705,16 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			LLVMSetExternallyInitialized(g.value, true);
 			lb_add_foreign_library_path(m, e->Variable.foreign_library);
 		} else if (import_from_host) {
-			// Imported from the running host at dlopen (resolved via -undefined dynamic_lookup).
-			// Leave it as a pure external declaration with default visibility, and make sure
-			// the dylib's startup never (re)initializes it — the host owns the storage/state.
+			// Imported from the running host. On ELF/Mach-O this is a pure external declaration
+			// resolved at dlopen (via --export-dynamic / -undefined dynamic_lookup); on Windows
+			// PE it must be dllimport so it binds through the host's import library at load time.
+			// Either way the dylib's startup must never (re)initialize it — the host owns the
+			// storage/state.
 			LLVMSetLinkage(g.value, LLVMExternalLinkage);
 			LLVMSetVisibility(g.value, LLVMDefaultVisibility);
+			if (lb_hot_reload_is_windows()) {
+				LLVMSetDLLStorageClass(g.value, LLVMDLLImportStorageClass);
+			}
 			var.is_initialized = true;
 		} else if (LLVMGetInitializer(g.value) == nullptr) {
 			LLVMSetInitializer(g.value, LLVMConstNull(lb_type(m, e->type)));
@@ -3686,10 +3722,11 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		if (export_to_host) {
 			// Must be a visible dynamic symbol (like a normal exported proc) so a reload
 			// dylib can bind to it. Plain external linkage + default visibility + keep it
-			// from being internalized.
+			// from being internalized. On Windows it additionally needs dllexport so it lands
+			// in the host's export table / import library.
 			LLVMSetLinkage(g.value, LLVMExternalLinkage);
 			LLVMSetVisibility(g.value, LLVMDefaultVisibility);
-			LLVMSetDLLStorageClass(g.value, LLVMDefaultStorageClass);
+			LLVMSetDLLStorageClass(g.value, lb_hot_reload_is_windows() ? LLVMDLLExportStorageClass : LLVMDefaultStorageClass);
 			lb_append_to_compiler_used(m, g.value);
 		} else if (is_export) {
 			LLVMSetLinkage(g.value, LLVMDLLExportLinkage);

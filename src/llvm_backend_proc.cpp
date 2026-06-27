@@ -240,6 +240,11 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 	} else if (hot_export) {
 		LLVMSetLinkage(p->value, LLVMExternalLinkage);
 		LLVMSetVisibility(p->value, LLVMDefaultVisibility);
+		// On Windows the agent finds the proc with GetProcAddress, which only sees the DLL's
+		// export table — so it must be dllexport, not just externally linked.
+		if (build_context.metrics.os == TargetOs_windows) {
+			LLVMSetDLLStorageClass(p->value, LLVMDLLExportStorageClass);
+		}
 		lb_append_to_compiler_used(m, p->value);
 	} else if (!p->is_foreign) {
 		if (USE_SEPARATE_MODULES) {

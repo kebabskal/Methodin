@@ -7213,7 +7213,7 @@ gb_internal Ast *build_union_dispatcher(AstFile *f, Token union_name_token,
                                         Ast *sample_method) {
 	Token pos_tok = union_name_token;
 
-	auto blank_token = []() { Token t = {}; return t; };
+	auto make_blank_token = []() { Token t = {}; return t; };
 
 	// Clone the sample method's proc-type params and results so we
 	// don't share mutable AST with the sample method (which will get
@@ -7292,7 +7292,7 @@ gb_internal Ast *build_union_dispatcher(AstFile *f, Token union_name_token,
 
 		Token open_tok = {}; open_tok.kind = Token_OpenParen; open_tok.string = str_lit("("); open_tok.pos = pos_tok.pos;
 		Token close_tok = {}; close_tok.kind = Token_CloseParen; close_tok.string = str_lit(")"); close_tok.pos = pos_tok.pos;
-		Token ellipsis_tok = blank_token();
+		Token ellipsis_tok = make_blank_token();
 		Ast *call = ast_call_expr(f, selector, call_args, open_tok, close_tok, ellipsis_tok);
 
 		Ast *stmt;
@@ -7362,7 +7362,7 @@ gb_internal Ast *build_union_dispatcher(AstFile *f, Token union_name_token,
 	Ast *proc_type = ast_proc_type(f, proc_tok, cloned_params, cloned_results,
 	                                0, ProcCC_Odin, /*generic*/false, /*diverging*/false);
 	auto where_clauses = array_make<Ast *>(ast_allocator(f));
-	Ast *proc_lit = ast_proc_lit(f, proc_type, body, 0, blank_token(), where_clauses);
+	Ast *proc_lit = ast_proc_lit(f, proc_type, body, 0, make_blank_token(), where_clauses);
 
 	Token method_name_tok = {};
 	method_name_tok.kind = Token_Ident;
