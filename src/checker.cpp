@@ -6584,7 +6584,19 @@ gb_internal bool check_proc_info(Checker *c, ProcInfo *pi, UntypedExprInfoMap *u
 	CheckerContext ctx = {};
 	init_checker_context(&ctx, c);
 	defer (destroy_checker_context(&ctx));
-	reset_checker_context(&ctx, pi->file, untyped);
+	// Methodin: a method's body is queued with the file context of wherever its
+	// owning struct was resolved (which may be a different file than the one the
+	// body is written in). Per-file decisions inside the body (feature flags such
+	// as '#+feature dynamic-literals', error attribution) must follow the file the
+	// body physically lives in, so prefer the body's own file when available.
+	AstFile *body_file = pi->file;
+	if (pi->body != nullptr) {
+		AstFile *bf = pi->body->file();
+		if (bf != nullptr) {
+			body_file = bf;
+		}
+	}
+	reset_checker_context(&ctx, body_file, untyped);
 	ctx.decl = pi->decl;
 
 	bool bounds_check    = (pi->tags & ProcTag_bounds_check)    != 0;

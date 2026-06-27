@@ -38,6 +38,7 @@ Entry :: struct {
 	odin_path:   string,
 	host_implib: string, // Windows: host import library the reload build links against; "" elsewhere
 	is_file:     bool,
+	host_debug:  bool, // host was built with -debug; mirror it into reload dylibs so they stay debuggable
 	host_sig:    u64, // rude-edit signature of the running program; a mismatch forces a restart
 	gen:         int,
 }
@@ -68,6 +69,9 @@ _hot_reload_boot :: proc "contextless" () {
 	g.is_file     = strings.has_suffix(g.src_path, ".odin")
 	if sig := cast(^u64)_self_sym(self, "odin_hr_signature"); sig != nil {
 		g.host_sig = sig^
+	}
+	if dbg := cast(^int)_self_sym(self, "odin_hr_debug"); dbg != nil {
+		g.host_debug = dbg^ != 0
 	}
 
 	if g.src_path == "" || g.odin_path == "" {
@@ -148,6 +152,10 @@ _reload :: proc() {
 		append(&cmd, "-file")
 	}
 	append(&cmd, "-build-mode:dll", "-hot-reload:reload", fmt.tprintf("-out:%s", out))
+	if g.host_debug {
+		// Match the host's debug info so breakpoints in reloaded procs keep binding.
+		append(&cmd, "-debug")
+	}
 	// Windows: the reload DLL imports the host's package globals through the host's import
 	// library (PE has no equivalent of ELF's runtime symbol interposition). Empty on Unix, where
 	// the loader binds the globals directly. The agent quotes this whole argument for the child

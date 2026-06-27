@@ -3857,6 +3857,13 @@ int main(int arg_count, char const **arg_ptr) {
 		return 1;
 	}
 
+	// `watch` sets this above; mirror it for a plain `build -hot-reload:host` so the produced
+	// binary self-watches when launched directly (e.g. under a debugger from VS Code). Without
+	// a source path the embedded reload agent has nothing to rebuild and stays dormant.
+	if (build_context.hot_reload_mode == HotReload_Host && build_context.hot_reload_source_path.len == 0 && init_filename.len > 0) {
+		build_context.hot_reload_source_path = path_to_full_path(permanent_allocator(), init_filename);
+	}
+
 	if (build_context.show_help) {
 		return print_show_help(args[0], command);
 	}

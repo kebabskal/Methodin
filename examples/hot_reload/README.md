@@ -51,8 +51,30 @@ Everything else — editing any other procedure's body — hot-reloads in place 
 state preserved. Restarts necessarily lose in-memory state, which is unavoidable for a
 layout/loop change.
 
+## Debugging a hot-reload session
+
+The host is an ordinary native executable, so you can debug it — including reloaded code.
+Instead of `odin watch`, build a self-watching host directly and launch it under a debugger:
+
+```sh
+odin build examples/hot_reload -hot-reload:host -debug -out:hot_reload_host
+```
+
+A `-hot-reload:host` build self-watches its sources (same agent as `odin watch`), so launching
+the binary is equivalent to watching. Because it was built with `-debug`, the reload agent
+mirrors `-debug` into every rebuilt library, so each reloaded `.so` carries DWARF. Debuggers
+re-resolve file:line breakpoints against newly loaded modules, so a breakpoint in a proc you
+edited re-binds automatically on the next reload. (Break by file:line, not by symbol — reloaded
+calls are dispatched through a function-pointer slot to the new library's address.)
+
+In VS Code, use the CodeLLDB extension: a launch config whose `program` is the
+`-hot-reload:host -debug` binary above, with a matching build task, gives you breakpoints that
+survive reloads.
+
 ## Limitations
 
 - Restart detection covers global layout and `main`; a procedure that is *currently on the
   call stack* (other than `main`) still updates only on its next call.
 - Currently targets macOS/Linux. Reloads only the initial (user) package's procedures.
+- A "rude edit" (touching `main` or a global's layout) restarts the program, which also
+  detaches an attached debugger.

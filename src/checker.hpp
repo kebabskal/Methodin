@@ -849,6 +849,12 @@ struct CheckerContext {
 	bool       ufcs_call_context;
 	Ast *      ufcs_first_arg;
 	Entity *   ufcs_entity;
+	// Methodin: when a UFCS method call's receiver is an `auto_union(T)`, the call
+	// is dispatched to the variant override via a synthesised type-switch proc instead
+	// of the offset-0 base promotion. These carry the original union receiver + type
+	// from selector resolution to the call assembly.
+	Ast *      ufcs_auto_union_recv;
+	Type *     ufcs_auto_union_type;
 };
 
 gb_internal u64 check_vet_flags(CheckerContext *c);

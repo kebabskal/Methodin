@@ -284,6 +284,7 @@ gb_internal void lb_hr_named_cstring(lbModule *m, char const *name, String s) {
 //   odin_hr_entry_count  : int
 //   odin_hr_src_path     : cstring (absolute path to rebuild)
 //   odin_hr_odin_path    : cstring (the odin compiler executable)
+//   odin_hr_debug        : int (1 if the host was built with -debug, else 0)
 gb_internal void lb_emit_hot_reload_manifest(lbModule *m) {
 	if (build_context.hot_reload_mode != HotReload_Host) {
 		return;
@@ -330,6 +331,17 @@ gb_internal void lb_emit_hot_reload_manifest(lbModule *m) {
 		? hot_reload_host_implib_path(permanent_allocator())
 		: str_lit("");
 	lb_hr_named_cstring(m, "odin_hr_host_implib", host_implib);
+
+	// Tell the agent whether the host carries debug info so it can mirror -debug into each
+	// reload dylib; otherwise the rebuilt code has no DWARF and breakpoints in reloaded procs
+	// never bind (debuggers re-resolve file:line breakpoints on solib load, but only with info).
+	LLVMValueRef debug_g = LLVMAddGlobal(m->mod, lb_type(m, t_int), "odin_hr_debug");
+	LLVMSetInitializer(debug_g, LLVMConstInt(lb_type(m, t_int), build_context.ODIN_DEBUG ? 1 : 0, false));
+	LLVMSetLinkage(debug_g, LLVMExternalLinkage);
+	LLVMSetVisibility(debug_g, LLVMDefaultVisibility);
+	LLVMSetGlobalConstant(debug_g, true);
+	lb_hot_reload_mark_host_export(debug_g);
+	lb_append_to_compiler_used(m, debug_g);
 }
 
 // A content hash of everything about the initial package that CANNOT be live-patched:
