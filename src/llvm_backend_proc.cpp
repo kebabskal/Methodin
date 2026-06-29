@@ -230,6 +230,16 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 	// Hot reload: in a reload dylib, every reloadable proc must be an exported dynamic symbol
 	// so the agent can dlsym it by name and patch the host's dispatch slot.
 	bool hot_export = build_context.hot_reload_mode == HotReload_Reload && !p->is_foreign && lb_is_hot_reloadable_entity(m, entity);
+	if (hot_export && build_context.metrics.os == TargetOs_windows && is_type_polymorphic(entity->type)) {
+		// A polymorphic instantiation's canonical name embeds its full signature, e.g.
+		// `main::fields_of_type:proc(v:^main::Controls,Field:$main::Control)->(...)`. MSVC's
+		// /EXPORT directive syntax is `name[,@ordinal][,DATA]`, so link.exe reads the embedded
+		// comma as an ordinal and aborts with LNK1161 (invalid export specification). Don't export
+		// these on Windows — they are recompiled into each reload DLL and called directly, and the
+		// host skips slotting them too (lb_create_hot_reload_slots), so the two stay consistent.
+		// ELF/Mach-O accept these names verbatim, so the exclusion is Windows-only.
+		hot_export = false;
+	}
 
 	if (p->is_export) {
 		LLVMSetLinkage(p->value, LLVMDLLExportLinkage);

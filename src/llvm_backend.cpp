@@ -205,6 +205,14 @@ gb_internal void lb_create_hot_reload_slots(lbModule *m) {
 		if (e->type == nullptr || base_type(e->type)->kind != Type_Proc) {
 			continue;
 		}
+		// Windows: a polymorphic instantiation's canonical name embeds its full signature (commas,
+		// parens, brackets), which is not a valid COFF /EXPORT specification — link.exe fails the
+		// reload DLL with LNK1161. The reload side therefore cannot dllexport such procs, so don't
+		// slot them here either; they fall back to direct calls and need a restart to pick up body
+		// changes. ELF/Mach-O export these names fine, so this only applies on Windows.
+		if (build_context.metrics.os == TargetOs_windows && is_type_polymorphic(e->type)) {
+			continue;
+		}
 
 		lbValue proc_value = lb_find_procedure_value_from_entity(m, e);
 		if (proc_value.value == nullptr) {
@@ -342,6 +350,38 @@ gb_internal void lb_emit_hot_reload_manifest(lbModule *m) {
 	LLVMSetGlobalConstant(debug_g, true);
 	lb_hot_reload_mark_host_export(debug_g);
 	lb_append_to_compiler_used(m, debug_g);
+
+	// Forward the host's -define values to the reload build so it selects the same configuration.
+	// This matters for foreign libraries with global state: e.g. -define:RAYLIB_SHARED=true makes
+	// both the host and the reload DLL bind to a single shared raylib.dll, instead of each
+	// statically linking its own copy (the reload copy being uninitialized, which faults the moment
+	// reloaded code calls into it). Emitted as an exported cstring array (one preformatted
+	// "-define:NAME=VALUE" per entry) the agent appends verbatim to the reload command.
+	auto flag_elems = array_make<LLVMValueRef>(temporary_allocator(), 0, build_context.defined_values.count);
+	for (auto const &entry : build_context.defined_values) {
+		gbString f = gb_string_make(permanent_allocator(), "-define:");
+		f = gb_string_appendc(f, entry.key);
+		f = gb_string_appendc(f, "=");
+		f = write_exact_value_to_string(f, entry.value, 1<<20);
+		String fs = make_string(cast(u8 const *)f, gb_string_length(f));
+		array_add(&flag_elems, lb_hr_inline_cstring(m, fs));
+	}
+	isize nf = flag_elems.count;
+	LLVMTypeRef flags_arr_ty = LLVMArrayType(ptr_ty, cast(unsigned)nf);
+	LLVMValueRef flags_arr = LLVMConstArray(ptr_ty, flag_elems.data, cast(unsigned)nf);
+	LLVMValueRef flags_g = LLVMAddGlobal(m->mod, flags_arr_ty, "odin_hr_build_flags");
+	LLVMSetInitializer(flags_g, flags_arr);
+	LLVMSetLinkage(flags_g, LLVMExternalLinkage);
+	LLVMSetVisibility(flags_g, LLVMDefaultVisibility);
+	lb_hot_reload_mark_host_export(flags_g);
+	lb_append_to_compiler_used(m, flags_g);
+
+	LLVMValueRef flag_count_g = LLVMAddGlobal(m->mod, lb_type(m, t_int), "odin_hr_build_flag_count");
+	LLVMSetInitializer(flag_count_g, LLVMConstInt(lb_type(m, t_int), cast(u64)nf, false));
+	LLVMSetLinkage(flag_count_g, LLVMExternalLinkage);
+	LLVMSetVisibility(flag_count_g, LLVMDefaultVisibility);
+	lb_hot_reload_mark_host_export(flag_count_g);
+	lb_append_to_compiler_used(m, flag_count_g);
 }
 
 // A content hash of everything about the initial package that CANNOT be live-patched:

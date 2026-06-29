@@ -40,6 +40,7 @@ Entry :: struct {
 	is_file:     bool,
 	host_debug:  bool, // host was built with -debug; mirror it into reload dylibs so they stay debuggable
 	host_sig:    u64, // rude-edit signature of the running program; a mismatch forces a restart
+	build_flags: []cstring, // host's -define flags; replayed so the reload build picks the same config
 	gen:         int,
 }
 
@@ -72,6 +73,13 @@ _hot_reload_boot :: proc "contextless" () {
 	}
 	if dbg := cast(^int)_self_sym(self, "odin_hr_debug"); dbg != nil {
 		g.host_debug = dbg^ != 0
+	}
+	// The host's -define flags, so the reload build selects the same configuration (e.g. shared vs
+	// static foreign libs). Emitted by the compiler as a parallel count + cstring array.
+	fcount := cast(^int)_self_sym(self, "odin_hr_build_flag_count")
+	fptr   := cast([^]cstring)_self_sym(self, "odin_hr_build_flags")
+	if fcount != nil && fptr != nil {
+		g.build_flags = fptr[:fcount^]
 	}
 
 	if g.src_path == "" || g.odin_path == "" {
@@ -155,6 +163,12 @@ _reload :: proc() {
 	if g.host_debug {
 		// Match the host's debug info so breakpoints in reloaded procs keep binding.
 		append(&cmd, "-debug")
+	}
+	// Replay the host's -define flags so the reload DLL is built with the same configuration —
+	// crucially the same foreign-library selection (e.g. -define:RAYLIB_SHARED=true), so host and
+	// reload share one library instance instead of each linking a separate, divergent copy.
+	for f in g.build_flags {
+		append(&cmd, string(f))
 	}
 	// Windows: the reload DLL imports the host's package globals through the host's import
 	// library (PE has no equivalent of ELF's runtime symbol interposition). Empty on Unix, where
