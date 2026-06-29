@@ -45,12 +45,16 @@ Pet :: union {
 }
 
 main :: proc() {
-	rex     := Dog{animal = {name = "Rex"}}
-	mittens := Cat{animal = {name = "Mittens"}}
+	rex := Dog {
+		animal = {name = "Rex"},
+	}
+	zelda := Cat {
+		animal = {name = "Mittens"},
+	}
 
-	pets := []Pet{rex, mittens}
+	pets := []Pet{rex, zelda}
 	for &p in pets {
 		p.introduce() // union-dispatched even though `introduce` is inherited
-		p.speak()     // union-dispatched: Dog__speak vs Cat__speak
+		p.speak() // union-dispatched: Dog__speak vs Cat__speak
 	}
 }
