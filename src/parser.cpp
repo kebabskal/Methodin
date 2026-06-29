@@ -7723,12 +7723,15 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 // and `FpsCamera` declares `update` in another — the lift pass
 // always mangles, and this pass stitches the user-visible name back
 // together at package scope.
-// Find a user-written, package-scope, constant proc or proc-group declaration
-// (`name :: proc(...) {...}` or `name :: proc { ... }`) for `name`. Lifted
-// in-struct methods are already mangled to `<Struct>__<name>`, so they never
-// match here — only a hand-written declaration does. Returns the ValueDecl, or
-// nullptr if there is none.
-gb_internal Ast *methodin_find_user_proc_decl(AstPackage *pkg, String name) {
+// Collect every user-written, package-scope, constant proc or proc-group
+// declaration (`name :: proc(...) {...}` or `name :: proc { ... }`) for `name`.
+// Lifted in-struct method *procs* are already mangled to `<Struct>__<name>`, so
+// they never match here — but a hand-written free proc/group does, and so does
+// an in-struct `name :: proc { ... }` group (which `lift_one_method` lifts to
+// package scope keeping the user-visible name). There can be several at once
+// (e.g. a free `init :: proc()` plus an in-struct `init :: proc { ... }`), and
+// each one claims `name`, so the caller must fold them all into one group.
+gb_internal void methodin_collect_user_proc_decls(AstPackage *pkg, String name, Array<Ast *> *out) {
 	for (AstFile *f : pkg->files) {
 		if (f == nullptr) continue;
 		for (Ast *decl : f->decls) {
@@ -7742,11 +7745,10 @@ gb_internal Ast *methodin_find_user_proc_decl(AstPackage *pkg, String name) {
 			Ast *val = decl->ValueDecl.values[0];
 			if (val == nullptr) continue;
 			if (val->kind == Ast_ProcLit || val->kind == Ast_ProcGroup) {
-				return decl;
+				array_add(out, decl);
 			}
 		}
 	}
-	return nullptr;
 }
 
 gb_internal void assemble_methodin_method_groups(AstPackage *pkg) {
@@ -7776,37 +7778,40 @@ gb_internal void assemble_methodin_method_groups(AstPackage *pkg) {
 			}
 		}
 
-		// A user may also hand-write a package-scope proc of the same name as a
-		// lifted method (e.g. a free `update :: proc()` alongside structs whose
-		// `update` methods were lifted). Without folding, the synthesised group
-		// and the user's decl both claim `name` -> "Redeclaration of 'name'".
-		// Fold the user's declaration into the method group instead, so `name()`
-		// overload-resolves to the user's proc and `x.name()` (UFCS) resolves to
-		// a method.
-		Ast *user_decl = methodin_find_user_proc_decl(pkg, name);
-		if (user_decl != nullptr) {
+		// A user may also hand-write one or more package-scope decls of the same
+		// name as a lifted method, in any combination:
+		//   * a free `name :: proc()`             (Ast_ProcLit)
+		//   * a free `name :: proc { ... }` group (Ast_ProcGroup)
+		//   * an in-struct `name :: proc { ... }` group, which `lift_one_method`
+		//     lifts to package scope keeping the user-visible name (Ast_ProcGroup)
+		// Every one of them claims `name`, so without folding the synthesised
+		// group collides with them -> "Redeclaration of 'name'". Fold each into
+		// the single synthesised group — splice a group's members in, or add a
+		// proc-lit as one member — then rename the now-redundant decl to a unique
+		// name so it stops claiming `name`. Mutating the declaration ident's
+		// `token.string` is enough for entity collection (which reads
+		// token.string); member references use fresh ast_idents, which re-intern
+		// correctly for scope lookup. The result: `name()` overload-resolves
+		// across every member and `x.name()` (UFCS) resolves to a method.
+		auto user_decls = array_make<Ast *>(temporary_allocator());
+		methodin_collect_user_proc_decls(pkg, name, &user_decls);
+		for (isize ui = 0; ui < user_decls.count; ui++) {
+			Ast *user_decl  = user_decls[ui];
 			Ast *user_value = user_decl->ValueDecl.values[0];
+			Ast *user_name  = user_decl->ValueDecl.names[0];
 			if (user_value->kind == Ast_ProcGroup) {
-				// The user already wrote `name :: proc { ... }`. Append the
-				// lifted method members to that group and let it keep the
-				// user-visible name; do not synthesise a second `name` decl.
 				ast_node(upg, ProcGroup, user_value);
-				isize extra = group_members.count;
-				Ast **merged_args = gb_alloc_array(ast_allocator(target), Ast *, upg->args.count + extra);
-				for (isize k = 0; k < upg->args.count; k++) merged_args[k] = upg->args[k];
-				for (isize k = 0; k < extra; k++)          merged_args[upg->args.count + k] = group_members[k];
-				upg->args.data  = merged_args;
-				upg->args.count = upg->args.count + extra;
-				continue;
-			} else if (user_value->kind == Ast_ProcLit) {
-				// Rename the user's free proc to a unique mangled name and add it
-				// as a group member. Mutating the declaration ident's
-				// `token.string` is enough for entity collection (which reads
-				// token.string); the member reference below uses a fresh
-				// ast_ident, which re-interns correctly for scope lookup.
-				Ast *user_name = user_decl->ValueDecl.names[0];
+				for (isize k = 0; k < upg->args.count; k++) {
+					Ast *arg = upg->args[k];
+					if (arg == nullptr || arg->kind != Ast_Ident) continue;
+					array_add(&group_members, ast_ident(target, arg->Ident.token));
+				}
 				gbString s = gb_string_make(permanent_allocator(), "");
-				s = gb_string_append_fmt(s, "%.*s__methodin_free", LIT(name));
+				s = gb_string_append_fmt(s, "%.*s__methodin_group_%d", LIT(name), cast(int)ui);
+				user_name->Ident.token.string = make_string_c(s);
+			} else if (user_value->kind == Ast_ProcLit) {
+				gbString s = gb_string_make(permanent_allocator(), "");
+				s = gb_string_append_fmt(s, "%.*s__methodin_free_%d", LIT(name), cast(int)ui);
 				Token mangled = user_name->Ident.token;
 				mangled.string = make_string_c(s);
 				user_name->Ident.token.string = mangled.string;

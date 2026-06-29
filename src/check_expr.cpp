@@ -7617,6 +7617,39 @@ gb_internal bool check_call_arguments_single(CheckerContext *c, Ast *call, Opera
 }
 
 
+// Methodin: collapse a (possibly pointer-to, possibly polymorphic) type down to
+// the identity of the named record it ultimately refers to, or nullptr if it
+// isn't a struct/union. A polymorphic instantiation (`Spatial_Grid(aabb)`) and
+// the generic base (`Spatial_Grid($T)`) both resolve to the same base record,
+// so two receivers of the same parametric struct compare equal while unrelated
+// structs (and non-record types) do not.
+gb_internal Type *methodin_record_identity(Type *t) {
+	if (t == nullptr) {
+		return nullptr;
+	}
+	if (is_type_pointer(t)) {
+		t = type_deref(t);
+	}
+	Type *b = base_type(t);
+	if (b == nullptr) {
+		return nullptr;
+	}
+	if (b->kind == Type_Struct) {
+		if (b->Struct.polymorphic_parent != nullptr) {
+			return base_type(b->Struct.polymorphic_parent);
+		}
+		return b;
+	}
+	if (b->kind == Type_Union) {
+		if (b->Union.polymorphic_parent != nullptr) {
+			return base_type(b->Union.polymorphic_parent);
+		}
+		return b;
+	}
+	return nullptr;
+}
+
+
 gb_internal CallArgumentData check_call_arguments_proc_group(CheckerContext *c, Operand *operand, Ast *call) {
 	ast_node(ce, CallExpr, call);
 	GB_ASSERT(ce->split_args != nullptr);
@@ -7702,6 +7735,85 @@ gb_internal CallArgumentData check_call_arguments_proc_group(CheckerContext *c, 
 				continue;
 			}
 			proc_index++;
+		}
+	}
+
+	// Methodin: the auto-generated method group for a name (e.g. `init`) merges
+	// every struct's method of that name plus any free proc of the same name.
+	// For a UFCS method call `recv.name(args...)` the receiver is
+	// positional_args[0] and was already checked during selector resolution, so
+	// its type is cached on the AST. Drop candidates whose first parameter can't
+	// accept that receiver (e.g. a `^Mat` method when calling on a `^Ctrl`)
+	// *before* the arguments are typed — otherwise heterogeneous parameter types
+	// across unrelated structs leave untyped compound-literal args with no target
+	// type ("Missing type in compound literal"). Only the receiver carries a
+	// cached type at this point (ordinary call args aren't checked until
+	// check_unpack_arguments below), so this is inert for non-method proc-group
+	// calls and never narrows on an untyped argument.
+	if (procs.count > 1 && positional_args.count >= 1) {
+		Type *recv_t = nullptr;
+		Ast *a = unparen_expr(positional_args[0]);
+		if (a != nullptr) {
+			if (a->kind == Ast_UnaryExpr && a->UnaryExpr.op.kind == Token_And) {
+				Ast *inner = unparen_expr(a->UnaryExpr.expr);
+				if (inner != nullptr && inner->tav.type != nullptr && inner->tav.type != t_invalid) {
+					recv_t = alloc_type_pointer(inner->tav.type);
+				}
+			} else if (a->kind == Ast_DerefExpr) {
+				Ast *inner = unparen_expr(a->DerefExpr.expr);
+				if (inner != nullptr && inner->tav.type != nullptr && is_type_pointer(inner->tav.type)) {
+					recv_t = type_deref(inner->tav.type);
+				}
+			} else if (a->tav.type != nullptr && a->tav.type != t_invalid) {
+				recv_t = a->tav.type;
+			}
+		}
+		if (recv_t != nullptr && !is_type_untyped(recv_t)) {
+			for (isize pi = 0; pi < procs.count; /**/) {
+				bool drop = false;
+				Type *pt = base_type(procs[pi]->type);
+				if (pt != nullptr && is_type_proc(pt) && pt->Proc.param_count > 0) {
+					Type *first = pt->Proc.params->Tuple.variables[0]->type;
+					if (first != nullptr && is_type_polymorphic(first)) {
+						// Methods lifted from a parametric struct take a
+						// polymorphic record receiver (e.g. `^Spatial_Grid($T)`).
+						// `check_is_assignable_to` can't see through the type
+						// parameter, so it never drops such a candidate and the
+						// group stays ambiguous — which reintroduces the
+						// "Missing type in compound literal" failure on an
+						// unrelated receiver. Drop only when both the parameter
+						// and the receiver are named records of *different* base
+						// records: that is precisely the cross-struct method
+						// case and provably can't apply. Other polymorphic
+						// shapes (e.g. a generic array proc's `$T/[$N]$E`) are
+						// left untouched for the real resolver below.
+						Type *pr = methodin_record_identity(first);
+						Type *rr = methodin_record_identity(recv_t);
+						if (pr != nullptr && rr != nullptr && !are_types_identical(pr, rr)) {
+							drop = true;
+						}
+					} else if (first != nullptr) {
+						Operand ro = {};
+						ro.mode = Addressing_Value;
+						ro.type = recv_t;
+						if (!check_is_assignable_to(c, &ro, first)) {
+							drop = true;
+						}
+					}
+				}
+				if (drop) {
+					array_unordered_remove(&procs, pi);
+				} else {
+					pi++;
+				}
+			}
+			if (procs.count == 0) {
+				// Everything dropped (unexpected for an already-resolved method
+				// call) — restore the full set so the real call checker can
+				// report a precise argument error rather than a vacuous one.
+				array_free(&procs);
+				procs = proc_group_entities_cloned(c, *operand);
+			}
 		}
 	}
 
