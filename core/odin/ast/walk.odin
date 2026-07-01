@@ -403,6 +403,7 @@ walk :: proc(v: ^Visitor, node: ^Node) {
 		}
 		walk_expr_list(v, n.where_clauses)
 		walk(v, n.fields)
+		walk_stmt_list(v, n.methods) // Methodin: in-struct method decls
 	case ^Union_Type:
 		if n.poly_params != nil {
 			walk(v, n.poly_params)
