@@ -6918,7 +6918,7 @@ gb_internal Ast *parse_impl_block(AstFile *f) {
 // checker to bind against.
 gb_internal String mangle_method_name(String struct_name, String method_name);
 
-gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Ast *polymorphic_params, Array<Ast *> *decls_out, bool no_using_self = false) {
+gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Ast *polymorphic_params, Array<Ast *> *decls_out, bool no_using_self = false, bool self_polymorphic = false) {
 	if (method->kind != Ast_ValueDecl) return;
 	if (method->ValueDecl.values.count != 1) return;
 
@@ -6966,7 +6966,30 @@ gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 	Ast *struct_name_ref = ast_ident(f, struct_name_token);
 	Ast *elem = struct_name_ref;
 
-	if (polymorphic_params != nullptr && polymorphic_params->kind == Ast_FieldList) {
+	if (self_polymorphic && polymorphic_params == nullptr) {
+		// Receiver is `^$Self/Name` instead of `^Name`: the method calls a
+		// sibling method, so we want each concrete receiver type to monomorphise
+		// the body and re-resolve those sibling calls against its own overrides
+		// (virtual dispatch, no vtable). The `/Name` specialization confines
+		// `$Self` to `Name` and its offset-0 embedders (see the Type_Struct case
+		// in check_type_specialization_to), so this method never pollutes the
+		// shared proc-group for an unrelated struct that happens to share the
+		// method's name. `using` promotion + UFCS sibling calls resolve
+		// per-instantiation against the concrete `Self`.
+		Token dollar_tok = {};
+		dollar_tok.kind = Token_Dollar;
+		dollar_tok.string = str_lit("$");
+		dollar_tok.pos = struct_name_token.pos;
+
+		Token self_ty_tok = {};
+		self_ty_tok.kind = Token_Ident;
+		self_ty_tok.string = str_lit("Self");
+		self_ty_tok.pos = struct_name_token.pos;
+
+		Ast *self_ty_ident = ast_ident(f, self_ty_tok);
+		Ast *spec_ident    = ast_ident(f, struct_name_token);
+		elem = ast_poly_type(f, dollar_tok, self_ty_ident, /*specialization*/ spec_ident);
+	} else if (polymorphic_params != nullptr && polymorphic_params->kind == Ast_FieldList) {
 		// Build `Name($P1, $P2, ...)` — one Poly_Type arg per polymorphic
 		// param name. The struct's params themselves are parsed as
 		// PolyType-wrapped Idents (Field.names = [PolyType{Ident}]); we
@@ -7042,6 +7065,10 @@ struct PendingMethod {
 	Token struct_name_token; // owning struct's name token
 	Ast *polymorphic_params; // owning struct's polymorphic_params FieldList, or nullptr
 	bool no_using_self;      // true for union dispatchers: prepend `self: ^Union` without `using`
+	bool self_polymorphic;   // Methodin: method body calls a sibling method (`self.m()`), so lift with a
+	                         // polymorphic `^$Self` receiver — each concrete receiver monomorphises the
+	                         // body, re-resolving those sibling calls against the *actual* type (virtual
+	                         // dispatch without a vtable). Only set for methods on non-generic structs.
 };
 
 // Builds `Struct__name` as a permanent String for the mangled per-struct
@@ -7063,7 +7090,10 @@ gb_internal String mangle_method_name(String struct_name, String method_name) {
 // method name with the same identifier will also be rewritten. We
 // trade that off for simplicity; in practice methods rarely share
 // names with locals.
-gb_internal void rewrite_method_calls_to_self(AstFile *f, Ast *node, Array<String> const &method_names);
+// Returns true if it rewrote at least one bare sibling call into `self.<name>()`
+// anywhere in the subtree — the signal Methodin uses to decide whether the
+// enclosing method needs a polymorphic `^$Self` receiver (see PendingMethod).
+gb_internal bool rewrite_method_calls_to_self(AstFile *f, Ast *node, Array<String> const &method_names);
 
 gb_internal bool string_in_list(String const &s, Array<String> const &xs) {
 	for (String const &x : xs) {
@@ -7072,13 +7102,16 @@ gb_internal bool string_in_list(String const &s, Array<String> const &xs) {
 	return false;
 }
 
-gb_internal void rewrite_method_calls_in_array(AstFile *f, Slice<Ast *> const &nodes, Array<String> const &method_names) {
-	for (Ast *n : nodes) rewrite_method_calls_to_self(f, n, method_names);
+gb_internal bool rewrite_method_calls_in_array(AstFile *f, Slice<Ast *> const &nodes, Array<String> const &method_names) {
+	bool touched = false;
+	for (Ast *n : nodes) touched |= rewrite_method_calls_to_self(f, n, method_names);
+	return touched;
 }
 
-gb_internal void rewrite_method_calls_to_self(AstFile *f, Ast *node, Array<String> const &method_names) {
-	if (node == nullptr) return;
+gb_internal bool rewrite_method_calls_to_self(AstFile *f, Ast *node, Array<String> const &method_names) {
+	if (node == nullptr) return false;
 
+	bool touched = false;
 	switch (node->kind) {
 	case Ast_CallExpr: {
 		Ast *proc = node->CallExpr.proc;
@@ -7096,102 +7129,104 @@ gb_internal void rewrite_method_calls_to_self(AstFile *f, Ast *node, Array<Strin
 				dot_tok.pos = proc->Ident.token.pos;
 				Ast *new_proc = ast_selector_expr(f, dot_tok, self_ident, proc);
 				node->CallExpr.proc = new_proc;
+				touched = true;
 			}
 		}
-		rewrite_method_calls_to_self(f, node->CallExpr.proc, method_names);
-		rewrite_method_calls_in_array(f, node->CallExpr.args, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->CallExpr.proc, method_names);
+		touched |= rewrite_method_calls_in_array(f, node->CallExpr.args, method_names);
 		break;
 	}
 
-	case Ast_BlockStmt:    rewrite_method_calls_in_array(f, node->BlockStmt.stmts, method_names); break;
-	case Ast_ExprStmt:     rewrite_method_calls_to_self(f, node->ExprStmt.expr, method_names); break;
-	case Ast_ReturnStmt:   rewrite_method_calls_in_array(f, node->ReturnStmt.results, method_names); break;
-	case Ast_DeferStmt:    rewrite_method_calls_to_self(f, node->DeferStmt.stmt, method_names); break;
+	case Ast_BlockStmt:    touched |= rewrite_method_calls_in_array(f, node->BlockStmt.stmts, method_names); break;
+	case Ast_ExprStmt:     touched |= rewrite_method_calls_to_self(f, node->ExprStmt.expr, method_names); break;
+	case Ast_ReturnStmt:   touched |= rewrite_method_calls_in_array(f, node->ReturnStmt.results, method_names); break;
+	case Ast_DeferStmt:    touched |= rewrite_method_calls_to_self(f, node->DeferStmt.stmt, method_names); break;
 	case Ast_AssignStmt:
-		rewrite_method_calls_in_array(f, node->AssignStmt.lhs, method_names);
-		rewrite_method_calls_in_array(f, node->AssignStmt.rhs, method_names);
+		touched |= rewrite_method_calls_in_array(f, node->AssignStmt.lhs, method_names);
+		touched |= rewrite_method_calls_in_array(f, node->AssignStmt.rhs, method_names);
 		break;
 	case Ast_IfStmt:
-		rewrite_method_calls_to_self(f, node->IfStmt.init, method_names);
-		rewrite_method_calls_to_self(f, node->IfStmt.cond, method_names);
-		rewrite_method_calls_to_self(f, node->IfStmt.body, method_names);
-		rewrite_method_calls_to_self(f, node->IfStmt.else_stmt, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->IfStmt.init, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->IfStmt.cond, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->IfStmt.body, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->IfStmt.else_stmt, method_names);
 		break;
 	case Ast_ForStmt:
-		rewrite_method_calls_to_self(f, node->ForStmt.init, method_names);
-		rewrite_method_calls_to_self(f, node->ForStmt.cond, method_names);
-		rewrite_method_calls_to_self(f, node->ForStmt.post, method_names);
-		rewrite_method_calls_to_self(f, node->ForStmt.body, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->ForStmt.init, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->ForStmt.cond, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->ForStmt.post, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->ForStmt.body, method_names);
 		break;
 	case Ast_RangeStmt:
-		rewrite_method_calls_in_array(f, node->RangeStmt.vals, method_names);
-		rewrite_method_calls_to_self(f, node->RangeStmt.expr, method_names);
-		rewrite_method_calls_to_self(f, node->RangeStmt.body, method_names);
+		touched |= rewrite_method_calls_in_array(f, node->RangeStmt.vals, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->RangeStmt.expr, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->RangeStmt.body, method_names);
 		break;
 	case Ast_SwitchStmt:
-		rewrite_method_calls_to_self(f, node->SwitchStmt.init, method_names);
-		rewrite_method_calls_to_self(f, node->SwitchStmt.tag, method_names);
-		rewrite_method_calls_to_self(f, node->SwitchStmt.body, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->SwitchStmt.init, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->SwitchStmt.tag, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->SwitchStmt.body, method_names);
 		break;
 	case Ast_TypeSwitchStmt:
-		rewrite_method_calls_to_self(f, node->TypeSwitchStmt.tag, method_names);
-		rewrite_method_calls_to_self(f, node->TypeSwitchStmt.body, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->TypeSwitchStmt.tag, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->TypeSwitchStmt.body, method_names);
 		break;
 	case Ast_CaseClause:
-		rewrite_method_calls_in_array(f, node->CaseClause.list, method_names);
-		rewrite_method_calls_in_array(f, node->CaseClause.stmts, method_names);
+		touched |= rewrite_method_calls_in_array(f, node->CaseClause.list, method_names);
+		touched |= rewrite_method_calls_in_array(f, node->CaseClause.stmts, method_names);
 		break;
 	case Ast_WhenStmt:
-		rewrite_method_calls_to_self(f, node->WhenStmt.cond, method_names);
-		rewrite_method_calls_to_self(f, node->WhenStmt.body, method_names);
-		rewrite_method_calls_to_self(f, node->WhenStmt.else_stmt, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->WhenStmt.cond, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->WhenStmt.body, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->WhenStmt.else_stmt, method_names);
 		break;
 	case Ast_ValueDecl:
-		rewrite_method_calls_in_array(f, node->ValueDecl.values, method_names);
+		touched |= rewrite_method_calls_in_array(f, node->ValueDecl.values, method_names);
 		break;
 
-	case Ast_UnaryExpr:        rewrite_method_calls_to_self(f, node->UnaryExpr.expr, method_names); break;
+	case Ast_UnaryExpr:        touched |= rewrite_method_calls_to_self(f, node->UnaryExpr.expr, method_names); break;
 	case Ast_BinaryExpr:
-		rewrite_method_calls_to_self(f, node->BinaryExpr.left, method_names);
-		rewrite_method_calls_to_self(f, node->BinaryExpr.right, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->BinaryExpr.left, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->BinaryExpr.right, method_names);
 		break;
-	case Ast_ParenExpr:        rewrite_method_calls_to_self(f, node->ParenExpr.expr, method_names); break;
-	case Ast_SelectorExpr:     rewrite_method_calls_to_self(f, node->SelectorExpr.expr, method_names); break;
+	case Ast_ParenExpr:        touched |= rewrite_method_calls_to_self(f, node->ParenExpr.expr, method_names); break;
+	case Ast_SelectorExpr:     touched |= rewrite_method_calls_to_self(f, node->SelectorExpr.expr, method_names); break;
 	case Ast_IndexExpr:
-		rewrite_method_calls_to_self(f, node->IndexExpr.expr, method_names);
-		rewrite_method_calls_to_self(f, node->IndexExpr.index, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->IndexExpr.expr, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->IndexExpr.index, method_names);
 		break;
-	case Ast_DerefExpr:        rewrite_method_calls_to_self(f, node->DerefExpr.expr, method_names); break;
+	case Ast_DerefExpr:        touched |= rewrite_method_calls_to_self(f, node->DerefExpr.expr, method_names); break;
 	case Ast_SliceExpr:
-		rewrite_method_calls_to_self(f, node->SliceExpr.expr, method_names);
-		rewrite_method_calls_to_self(f, node->SliceExpr.low, method_names);
-		rewrite_method_calls_to_self(f, node->SliceExpr.high, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->SliceExpr.expr, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->SliceExpr.low, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->SliceExpr.high, method_names);
 		break;
-	case Ast_CompoundLit:      rewrite_method_calls_in_array(f, node->CompoundLit.elems, method_names); break;
+	case Ast_CompoundLit:      touched |= rewrite_method_calls_in_array(f, node->CompoundLit.elems, method_names); break;
 	case Ast_FieldValue:
-		rewrite_method_calls_to_self(f, node->FieldValue.field, method_names);
-		rewrite_method_calls_to_self(f, node->FieldValue.value, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->FieldValue.field, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->FieldValue.value, method_names);
 		break;
 	case Ast_TernaryIfExpr:
-		rewrite_method_calls_to_self(f, node->TernaryIfExpr.x, method_names);
-		rewrite_method_calls_to_self(f, node->TernaryIfExpr.cond, method_names);
-		rewrite_method_calls_to_self(f, node->TernaryIfExpr.y, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->TernaryIfExpr.x, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->TernaryIfExpr.cond, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->TernaryIfExpr.y, method_names);
 		break;
-	case Ast_TypeAssertion:    rewrite_method_calls_to_self(f, node->TypeAssertion.expr, method_names); break;
+	case Ast_TypeAssertion:    touched |= rewrite_method_calls_to_self(f, node->TypeAssertion.expr, method_names); break;
 	case Ast_TypeCast:
-		rewrite_method_calls_to_self(f, node->TypeCast.type, method_names);
-		rewrite_method_calls_to_self(f, node->TypeCast.expr, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->TypeCast.type, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->TypeCast.expr, method_names);
 		break;
-	case Ast_AutoCast:         rewrite_method_calls_to_self(f, node->AutoCast.expr, method_names); break;
+	case Ast_AutoCast:         touched |= rewrite_method_calls_to_self(f, node->AutoCast.expr, method_names); break;
 	case Ast_OrElseExpr:
-		rewrite_method_calls_to_self(f, node->OrElseExpr.x, method_names);
-		rewrite_method_calls_to_self(f, node->OrElseExpr.y, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->OrElseExpr.x, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->OrElseExpr.y, method_names);
 		break;
-	case Ast_OrReturnExpr:     rewrite_method_calls_to_self(f, node->OrReturnExpr.expr, method_names); break;
-	case Ast_OrBranchExpr:     rewrite_method_calls_to_self(f, node->OrBranchExpr.expr, method_names); break;
-	case Ast_ProcLit:          rewrite_method_calls_to_self(f, node->ProcLit.body, method_names); break;
+	case Ast_OrReturnExpr:     touched |= rewrite_method_calls_to_self(f, node->OrReturnExpr.expr, method_names); break;
+	case Ast_OrBranchExpr:     touched |= rewrite_method_calls_to_self(f, node->OrBranchExpr.expr, method_names); break;
+	case Ast_ProcLit:          touched |= rewrite_method_calls_to_self(f, node->ProcLit.body, method_names); break;
 	default: break;
 	}
+	return touched;
 }
 
 // Builds a synthetic dispatcher value-decl:
@@ -7557,7 +7592,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			array_add(&sm->method_names, mname);
 		}
 
-		for (PendingMethod const &pm : pending) {
+		for (PendingMethod &pm : pending) {
 			Ast *method = pm.method;
 			if (method->kind != Ast_ValueDecl || method->ValueDecl.values.count != 1) continue;
 			Ast *proc_lit = method->ValueDecl.values[0];
@@ -7568,7 +7603,15 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			String sname = pm.struct_name_token.string;
 			for (StructMethodSet const &sm : sets) {
 				if (sm.struct_name == sname) {
-					rewrite_method_calls_to_self(f, body, sm.method_names);
+					// A body that calls a sibling method (rewritten to `self.m()`)
+					// needs a polymorphic `^$Self` receiver so each concrete
+					// receiver re-resolves that call against its own overrides.
+					// Only non-generic structs (no polymorphic_params) — a generic
+					// struct already carries its own type params on the receiver.
+					bool touched = rewrite_method_calls_to_self(f, body, sm.method_names);
+					if (touched && pm.polymorphic_params == nullptr) {
+						pm.self_polymorphic = true;
+					}
 					break;
 				}
 			}
@@ -7701,7 +7744,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			mangled_tok.string = mangle_method_name(pm.struct_name_token.string, method_name);
 			name_ident->Ident.token = mangled_tok;
 
-			lift_one_method(f, pm.method, pm.struct_name_token, pm.polymorphic_params, decls_out, pm.no_using_self);
+			lift_one_method(f, pm.method, pm.struct_name_token, pm.polymorphic_params, decls_out, pm.no_using_self, pm.self_polymorphic);
 
 			if (pkg != nullptr) {
 				MethodinMethodEntry entry = {};

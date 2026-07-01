@@ -1592,6 +1592,19 @@ gb_internal bool check_type_specialization_to(CheckerContext *ctx, Type *special
 			return true;
 		}
 
+		// Methodin: a `^$Self/Base` method receiver (Base a plain, non-generic
+		// struct) also accepts any struct that `using`-embeds Base at offset 0,
+		// binding Self to the concrete derived type. This is what lets an
+		// inherited self-dispatching method resolve on a derived receiver and
+		// re-dispatch its sibling calls against the derived type's overrides,
+		// while staying inert for unrelated structs that merely share a method
+		// name (they don't embed Base, so this returns false and the candidate
+		// is dropped from the shared proc-group).
+		if (s->Struct.polymorphic_parent == nullptr &&
+		    type_embeds_at_offset0(type, specialization)) {
+			return true;
+		}
+
 		if (t->Struct.polymorphic_parent == s->Struct.polymorphic_parent &&
 		    s->Struct.polymorphic_params != nullptr &&
 		    t->Struct.polymorphic_params != nullptr) {
