@@ -7335,13 +7335,20 @@ gb_internal Ast *build_union_dispatcher(AstFile *f, Token union_name_token,
 
 	// Collect arg-name idents from the cloned params so the body can
 	// forward them by name. Fields can carry multiple names, so flatten.
+	// A variadic param (`xs: ..T`) arrives in the dispatcher as a slice and
+	// must be spread (`..xs`) when forwarded, or the checker rejects the
+	// synthesized call.
 	auto arg_idents = array_make<Ast *>(ast_allocator(f));
+	bool has_variadic = false;
 	if (cloned_params != nullptr) {
 		for (Ast *field : cloned_params->FieldList.list) {
 			for (Ast *name : field->Field.names) {
 				if (name->kind == Ast_Ident) {
 					array_add(&arg_idents, ast_ident(f, name->Ident.token));
 				}
+			}
+			if (field->Field.type != nullptr && field->Field.type->kind == Ast_Ellipsis) {
+				has_variadic = true;
 			}
 		}
 	}
@@ -7368,6 +7375,12 @@ gb_internal Ast *build_union_dispatcher(AstFile *f, Token union_name_token,
 		Token open_tok = {}; open_tok.kind = Token_OpenParen; open_tok.string = str_lit("("); open_tok.pos = pos_tok.pos;
 		Token close_tok = {}; close_tok.kind = Token_CloseParen; close_tok.string = str_lit(")"); close_tok.pos = pos_tok.pos;
 		Token ellipsis_tok = make_blank_token();
+		if (has_variadic) {
+			// The checker detects a spread via `ellipsis.pos.line != 0`.
+			ellipsis_tok.kind = Token_Ellipsis;
+			ellipsis_tok.string = str_lit("..");
+			ellipsis_tok.pos = pos_tok.pos;
+		}
 		Ast *call = ast_call_expr(f, selector, call_args, open_tok, close_tok, ellipsis_tok);
 
 		Ast *stmt;
@@ -7394,6 +7407,34 @@ gb_internal Ast *build_union_dispatcher(AstFile *f, Token union_name_token,
 		Token case_tok = {}; case_tok.kind = Token_case; case_tok.string = str_lit("case"); case_tok.pos = pos_tok.pos;
 		Ast *clause = ast_case_clause(f, case_tok, list, stmts);
 		array_add(&cases, clause);
+	}
+
+	// Default clause: without it a method call on a nil union value silently
+	// does nothing — and a returning method returns zeroed named results,
+	// which reads as impossible logic bugs downstream. Panic loudly instead.
+	{
+		Token panic_tok = {}; panic_tok.kind = Token_Ident; panic_tok.string = str_lit("panic"); panic_tok.pos = pos_tok.pos;
+		Ast *panic_ident = ast_ident(f, panic_tok);
+
+		gbString msg = gb_string_make(permanent_allocator(), "\"method call on nil union value: ");
+		msg = gb_string_append_length(msg, union_name_token.string.text, union_name_token.string.len);
+		msg = gb_string_appendc(msg, ".");
+		msg = gb_string_append_length(msg, method_name.text, method_name.len);
+		msg = gb_string_appendc(msg, "\"");
+		Token lit_tok = {}; lit_tok.kind = Token_String; lit_tok.string = make_string_c(msg); lit_tok.pos = pos_tok.pos;
+		Ast *lit = ast_basic_lit(f, lit_tok);
+
+		auto pargs = array_make<Ast *>(ast_allocator(f), 0, 1);
+		array_add(&pargs, lit);
+		Token p_open = {}; p_open.kind = Token_OpenParen; p_open.string = str_lit("("); p_open.pos = pos_tok.pos;
+		Token p_close = {}; p_close.kind = Token_CloseParen; p_close.string = str_lit(")"); p_close.pos = pos_tok.pos;
+		Ast *pcall = ast_call_expr(f, panic_ident, pargs, p_open, p_close, make_blank_token());
+
+		auto default_stmts = array_make<Ast *>(ast_allocator(f), 0, 1);
+		array_add(&default_stmts, ast_expr_stmt(f, pcall));
+		auto default_list = array_make<Ast *>(ast_allocator(f), 0, 0);
+		Token default_case_tok = {}; default_case_tok.kind = Token_case; default_case_tok.string = str_lit("case"); default_case_tok.pos = pos_tok.pos;
+		array_add(&cases, ast_case_clause(f, default_case_tok, default_list, default_stmts));
 	}
 
 	// Switch body: BlockStmt holding the case clauses.
