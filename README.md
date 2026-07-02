@@ -161,6 +161,23 @@ See [`examples/methods`](examples/methods) and
   like array sizes. `impl` works on non-struct named types too (a method
   whose first parameter names the target keeps its explicit receiver), so
   `impl Vec3 { UP :: Vec3{0, 1, 0} }` works on a `distinct [3]f32`.
+- **Rvalue receivers** — methods work on temporaries: function results
+  (`make_world().describe()`), constants (`Vec3.UP.scaled(2)`), struct
+  literals, and immutable parameters. A hidden local is materialized for the
+  `^self` receiver — but ONLY when the checker proves the method never
+  mutates its receiver. Calling a mutating method on a temporary is a
+  compile error that names the exact write that would be lost:
+
+  ```
+  Error: Cannot call 'take_damage' on 'make_world()', which is a temporary
+  value: the method mutates its receiver and the mutation would be lost
+      'hp' is written at world.odin(25:3)
+      Suggestion: store the value in a variable first, then call the method on it
+  ```
+
+  The analysis is transitive through sibling calls and conservative:
+  address-taken fields, slices of fields, passing `self` onward, and
+  anything it can't prove read-only count as mutating.
 - **Default struct field values** — `hp: int = 100` in a struct body, for
   any constant-expressible value (numbers, strings, compound literals,
   nested structs, fixed arrays). Applied wherever the compiler initializes
