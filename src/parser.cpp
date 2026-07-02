@@ -7224,6 +7224,27 @@ gb_internal bool rewrite_method_calls_to_self(AstFile *f, Ast *node, Array<Strin
 	case Ast_OrReturnExpr:     touched |= rewrite_method_calls_to_self(f, node->OrReturnExpr.expr, method_names); break;
 	case Ast_OrBranchExpr:     touched |= rewrite_method_calls_to_self(f, node->OrBranchExpr.expr, method_names); break;
 	case Ast_ProcLit:          touched |= rewrite_method_calls_to_self(f, node->ProcLit.body, method_names); break;
+	case Ast_UnrollRangeStmt:
+		touched |= rewrite_method_calls_to_self(f, node->UnrollRangeStmt.init, method_names);
+		touched |= rewrite_method_calls_in_array(f, node->UnrollRangeStmt.args, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->UnrollRangeStmt.expr, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->UnrollRangeStmt.body, method_names);
+		break;
+	case Ast_UsingStmt:        touched |= rewrite_method_calls_in_array(f, node->UsingStmt.list, method_names); break;
+	case Ast_SelectorCallExpr:
+		touched |= rewrite_method_calls_to_self(f, node->SelectorCallExpr.expr, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->SelectorCallExpr.call, method_names);
+		break;
+	case Ast_TernaryWhenExpr:
+		touched |= rewrite_method_calls_to_self(f, node->TernaryWhenExpr.x, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->TernaryWhenExpr.cond, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->TernaryWhenExpr.y, method_names);
+		break;
+	case Ast_MatrixIndexExpr:
+		touched |= rewrite_method_calls_to_self(f, node->MatrixIndexExpr.expr, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->MatrixIndexExpr.row_index, method_names);
+		touched |= rewrite_method_calls_to_self(f, node->MatrixIndexExpr.column_index, method_names);
+		break;
 	default: break;
 	}
 	return touched;

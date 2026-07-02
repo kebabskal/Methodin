@@ -330,6 +330,10 @@ clone_node :: proc(node: ^Node) -> ^Node {
 			r.min_field_align = clone(r.min_field_align)
 			r.max_field_align = clone(r.max_field_align)
 			r.fields = auto_cast clone(r.fields)
+			// Methodin: without this, a cloned struct type aliases the
+			// original's in-struct method decl nodes (Impl_Block below
+			// already clones its methods).
+			r.methods = clone(r.methods)
 		case ^Union_Type:
 			r.poly_params = auto_cast clone(r.poly_params)
 			r.align = clone(r.align)
