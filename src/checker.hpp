@@ -777,6 +777,12 @@ struct CheckerInfo {
 	BlockingMutex load_file_mutex;
 	StringMap<LoadFileCache *> load_file_cache;
 
+	// Methodin: checked auto_union dispatcher proc-lits, keyed by
+	// "<alias-entity-ptr>.<method>", so each (alias, method) pair is
+	// synthesized, checked, and codegen'd once instead of per call site.
+	BlockingMutex    auto_union_dispatch_mutex;
+	StringMap<Ast *> auto_union_dispatch_cache;
+
 	MPSCQueue<ProcInfo *> all_procedures_queue;
 	Array<ProcInfo *> all_procedures;
 

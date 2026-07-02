@@ -660,6 +660,14 @@ gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *
 	GB_ASSERT(is_type_struct(struct_type));
 	ast_node(st, StructType, node);
 
+	// Methodin: the file-scope lift consumes (and clears) a struct's method
+	// decls. Any that survive to here belong to a nested, anonymous, or
+	// proc-local struct, which the lift never visits — without this check
+	// they would silently not exist.
+	if (st->methods.count > 0) {
+		error(st->methods[0], "methods are only supported on named structs declared at file scope");
+	}
+
 	String context = str_lit("struct");
 
 	isize min_field_count = 0;
@@ -1562,7 +1570,7 @@ gb_internal bool check_type_specialization_to_internal(CheckerContext *ctx, Type
 	return true;
 }
 
-gb_internal bool check_type_specialization_to(CheckerContext *ctx, Type *specialization, Type *type, bool compound, bool modify_type) {
+gb_internal bool check_type_specialization_to(CheckerContext *ctx, Type *specialization, Type *type, bool compound, bool modify_type, bool allow_offset0_embed) {
 	if (type == nullptr ||
 	    type == t_invalid) {
 		return true;
@@ -1599,8 +1607,11 @@ gb_internal bool check_type_specialization_to(CheckerContext *ctx, Type *special
 		// re-dispatch its sibling calls against the derived type's overrides,
 		// while staying inert for unrelated structs that merely share a method
 		// name (they don't embed Base, so this returns false and the candidate
-		// is dropped from the shared proc-group).
-		if (s->Struct.polymorphic_parent == nullptr &&
+		// is dropped from the shared proc-group). Gated on the $Self generic
+		// (see is_polymorphic_type_assignable) so ordinary user `$T/Base`
+		// specializations keep upstream's exact-match semantics.
+		if (allow_offset0_embed &&
+		    s->Struct.polymorphic_parent == nullptr &&
 		    type_embeds_at_offset0(type, specialization)) {
 			return true;
 		}
