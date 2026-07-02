@@ -840,13 +840,18 @@ struct CheckerContext {
 	Ast *assignment_lhs_hint;
 
 	// UFCS: when checking a selector that is the callee of a CallExpr,
-	// ufcs_call_context is true. If x.foo doesn't resolve as a field but
+	// ufcs_call_node is the callee selector. If x.foo doesn't resolve as a field but
 	// foo is a free proc in x's type's owning package, check_selector
 	// resolves to that entity and stores the (possibly auto-&-wrapped)
 	// receiver here. check_call_expr then prepends ufcs_first_arg to the
 	// call's args and replaces the call's proc with a fresh Ident bound
 	// to ufcs_entity so the backend can resolve it normally.
-	bool       ufcs_call_context;
+	// The exact callee SelectorExpr of the call being checked. UFCS resolution
+	// only runs for THIS node — inner selectors of a chained callee
+	// (`a.b` in `a.b.c(x)`) must resolve as plain fields, or a stray inner
+	// UFCS hit leaves stale ufcs_entity state that check_call_expr would
+	// misuse after the outer selector fails.
+	Ast *      ufcs_call_node;
 	Ast *      ufcs_first_arg;
 	Entity *   ufcs_entity;
 	// Methodin: when a UFCS method call's receiver is an `auto_union(T)`, the call

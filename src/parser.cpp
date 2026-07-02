@@ -192,7 +192,9 @@ gb_internal Ast *clone_ast(Ast *node, AstFile *f) {
 
 	case Ast_Invalid:        break;
 	case Ast_Ident:
-		n->Ident.entity = nullptr;
+		if ((n->state_flags & StateFlag_PreResolvedIdent) == 0) {
+			n->Ident.entity = nullptr;
+		}
 		break;
 	case Ast_Implicit:       break;
 	case Ast_Uninit:         break;

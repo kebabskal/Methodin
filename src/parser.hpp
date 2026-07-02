@@ -351,6 +351,11 @@ enum StateFlag : u8 {
 	StateFlag_no_bounds_check = 1<<1,
 	StateFlag_type_assert     = 1<<2,
 	StateFlag_no_type_assert  = 1<<3,
+	// Methodin: this Ident was synthesized with Ident.entity already bound
+	// (e.g. auto_union dispatcher variants from other packages, which are not
+	// in scope at the call site); check_ident uses the binding instead of a
+	// name lookup, and clone_ast preserves it.
+	StateFlag_PreResolvedIdent = 1<<4,
 
 	StateFlag_SelectorCallExpr = 1<<5,
 	StateFlag_DirectiveWasFalse = 1<<6,

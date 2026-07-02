@@ -1844,7 +1844,13 @@ gb_internal Entity *check_ident(CheckerContext *c, Operand *o, Ast *n, Type *nam
 	o->expr = n;
 	auto name = n->Ident.token.string;
 
-	Entity *e = scope_lookup(c->scope, n->Ident.interned, n->Ident.hash);
+	Entity *e = nullptr;
+	if (n->state_flags & StateFlag_PreResolvedIdent) {
+		e = n->Ident.entity.load(std::memory_order_relaxed);
+	}
+	if (e == nullptr) {
+		e = scope_lookup(c->scope, n->Ident.interned, n->Ident.hash);
+	}
 	if (e == nullptr) {
 		if (is_blank_ident(name)) {
 			error(n, "'_' cannot be used as a value");
@@ -6162,7 +6168,7 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 	end_of_array_selector_swizzle:;
 	}
 
-	// UFCS: when this selector is the callee of a CallExpr (c->ufcs_call_context)
+	// UFCS: when this selector is the callee of a CallExpr (c->ufcs_call_node)
 	// and field lookup didn't find anything, try resolving `selector` as a free
 	// procedure declared in the receiver type's owning package. On success the
 	// receiver is stashed in c->ufcs_first_arg (with auto-&/auto-* applied) so
@@ -6171,7 +6177,7 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 	// When the receiver's own package has no match, walk `using` fields BFS-
 	// style — the first depth at which any lookup succeeds wins; multiple
 	// successes at that depth are an ambiguity error.
-	if (entity == nullptr && c->ufcs_call_context && selector->kind == Ast_Ident &&
+	if (entity == nullptr && c->ufcs_call_node == node && selector->kind == Ast_Ident &&
 	    operand->mode != Addressing_Type && operand->mode != Addressing_Invalid &&
 	    operand->mode != Addressing_Builtin && operand->mode != Addressing_ProcGroup &&
 	    operand->type != nullptr && operand->type != t_invalid) {
@@ -6198,7 +6204,12 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 				Token caret     = {Token_Pointer,   0, str_lit("^")};
 				Token amp       = {Token_And,        0, str_lit("&")};
 				Token tmute_tok = {Token_transmute,  0, str_lit("transmute")};
+				// Entity-bound: the base type's package may not be in scope
+				// at the call site (auto_union receivers travel across
+				// packages), and a same-named local must not capture it.
 				Ast *base_ident = ast_ident(file, base->Named.type_name->token);
+				base_ident->Ident.entity = base->Named.type_name;
+				base_ident->state_flags |= StateFlag_PreResolvedIdent;
 				Ast *ptr_type   = ast_pointer_type(file, caret, base_ident);
 				Ast *addr       = ast_unary_expr(file, amp, op_expr);
 				Ast *tcast      = ast_type_cast(file, tmute_tok, ptr_type, addr);
@@ -6217,10 +6228,29 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 		// First try the receiver's own package.
 		Entity *resolved = nullptr;
 		Ast *resolved_arg = nullptr;
+		// A by-name hit whose first parameter does NOT accept the receiver:
+		// kept as a last-resort fallback (the real call checker then reports a
+		// precise argument-type error against it), but it must not mask a
+		// type-correct candidate from a later tier — e.g. an imported
+		// extension method sharing the name with an unrelated proc in the
+		// receiver's own package.
+		Entity *fallback_resolved = nullptr;
+		Ast *fallback_arg = nullptr;
 		AstPackage *root_pkg = ufcs_owning_package(c, deref_type);
-		(void) try_ufcs_resolve_at(c, root_pkg, sel_name, sel_hash,
-		                            op_expr, operand->type, operand->mode, operand->value,
-		                            &resolved, &resolved_arg);
+		{
+			Entity *he = nullptr; Ast *ha = nullptr; bool tmatch = false;
+			if (try_ufcs_resolve_at(c, root_pkg, sel_name, sel_hash,
+			                         op_expr, operand->type, operand->mode, operand->value,
+			                         &he, &ha, &tmatch)) {
+				if (tmatch) {
+					resolved = he;
+					resolved_arg = ha;
+				} else {
+					fallback_resolved = he;
+					fallback_arg = ha;
+				}
+			}
+		}
 
 		// If still unresolved, BFS through `using` fields.
 		if (resolved == nullptr && deref_type != nullptr) {
@@ -6252,13 +6282,21 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 
 				for (UFCSFrontier const &fr : current) {
 					AstPackage *fr_pkg = ufcs_owning_package(c, type_deref(fr.type));
-					Entity *he = nullptr; Ast *ha = nullptr;
+					Entity *he = nullptr; Ast *ha = nullptr; bool tmatch = false;
 					if (try_ufcs_resolve_at(c, fr_pkg, sel_name, sel_hash,
 					                         fr.expr, fr.type, operand->mode, ExactValue{},
-					                         &he, &ha)) {
-						array_add(&hit_entities, he);
-						array_add(&hit_args, ha);
-						continue; // don't expand a frontier node that hit
+					                         &he, &ha, &tmatch)) {
+						if (tmatch) {
+							array_add(&hit_entities, he);
+							array_add(&hit_args, ha);
+							continue; // don't expand a frontier node that hit
+						}
+						// Name-only hit: remember for the error-message
+						// fallback and keep looking deeper/wider.
+						if (fallback_resolved == nullptr) {
+							fallback_resolved = he;
+							fallback_arg = ha;
+						}
 					}
 					enqueue_using_children(&next, fr.expr, fr.type);
 				}
@@ -6394,6 +6432,14 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 			}
 		}
 
+		if (resolved == nullptr && fallback_resolved != nullptr) {
+			// No tier produced a type-correct candidate; bind the by-name hit
+			// so the call checker reports a precise argument-type error
+			// against a real method instead of "has no field or method".
+			resolved = fallback_resolved;
+			resolved_arg = fallback_arg;
+		}
+
 		if (resolved != nullptr) {
 			if (resolved_import != nullptr) {
 				// Resolved through an import — record the use so the import is
@@ -6421,7 +6467,7 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 		} else {
 			ERROR_BLOCK();
 
-			if (c->ufcs_call_context) {
+			if (c->ufcs_call_node == node) {
 				error(op_expr, "'%s' of type '%s' has no field or method '%s'", op_str, type_str, sel_str);
 			} else {
 				error(op_expr, "'%s' of type '%s' has no field '%s'", op_str, type_str, sel_str);
@@ -9203,10 +9249,16 @@ gb_internal Ast *make_auto_union_dispatch_proc_lit(CheckerContext *c, Type *unio
 	auto vd_values = array_make<Ast *>(ast_allocator(f), 0, 1); array_add(&vd_values, sample_pl);
 	Ast *sample_vd = ast_value_decl(f, vd_names, nullptr, vd_values, false, nullptr, nullptr);
 
+	// Variants may be declared in packages that are not in scope at the call
+	// site (auto_union collects program-wide), and a same-named local at the
+	// call site must not capture the lookup — bind each ident to its entity.
 	auto variant_idents = array_make<Ast *>(ast_allocator(f), 0, union_type->Union.variants.count);
 	for (Type *vt : union_type->Union.variants) {
 		if (vt == nullptr || vt->kind != Type_Named || vt->Named.type_name == nullptr) return nullptr;
-		array_add(&variant_idents, ast_ident(f, vt->Named.type_name->token));
+		Ast *vi = ast_ident(f, vt->Named.type_name->token);
+		vi->Ident.entity = vt->Named.type_name;
+		vi->state_flags |= StateFlag_PreResolvedIdent;
+		array_add(&variant_idents, vi);
 	}
 
 	Ast *disp_vd = build_union_dispatcher(f, alias_tok, method_name, slice_from_array(variant_idents), sample_vd);
@@ -9214,8 +9266,13 @@ gb_internal Ast *make_auto_union_dispatch_proc_lit(CheckerContext *c, Type *unio
 	Ast *disp_pl = disp_vd->ValueDecl.values[0];
 	if (disp_pl->kind != Ast_ProcLit) return nullptr;
 
-	// Prepend `self: ^X` (the dispatcher body references `self^`).
-	Ast *self_ptr = ast_pointer_type(f, tok(Token_Pointer, "^"), ast_ident(f, alias_tok));
+	// Prepend `self: ^X` (the dispatcher body references `self^`). The alias
+	// ident is entity-bound like the variants: the alias may be declared in a
+	// package the call site doesn't name, or be shadowed there.
+	Ast *alias_ident = ast_ident(f, alias_tok);
+	alias_ident->Ident.entity = union_type->Union.auto_union_alias;
+	alias_ident->state_flags |= StateFlag_PreResolvedIdent;
+	Ast *self_ptr = ast_pointer_type(f, tok(Token_Pointer, "^"), alias_ident);
 	auto self_names = array_make<Ast *>(ast_allocator(f), 0, 1);
 	array_add(&self_names, ast_ident(f, tok(Token_Ident, "self")));
 	Ast *self_field = ast_field(f, self_names, self_ptr, nullptr, 0, Token{}, nullptr, nullptr);
@@ -9267,14 +9324,14 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 		}
 	} else {
 		if (proc != nullptr) {
-			bool   prev_ufcs_call_context = c->ufcs_call_context;
+			Ast *  prev_ufcs_call_node    = c->ufcs_call_node;
 			Ast *  prev_ufcs_first_arg    = c->ufcs_first_arg;
 			Entity *prev_ufcs_entity      = c->ufcs_entity;
 			Ast *  prev_ufcs_au_recv      = c->ufcs_auto_union_recv;
 			Type * prev_ufcs_au_type      = c->ufcs_auto_union_type;
 			bool try_ufcs = proc->kind == Ast_SelectorExpr && proc->SelectorExpr.token.kind == Token_Period;
 			if (try_ufcs) {
-				c->ufcs_call_context = true;
+				c->ufcs_call_node    = proc;
 				c->ufcs_first_arg    = nullptr;
 				c->ufcs_entity       = nullptr;
 				c->ufcs_auto_union_recv = nullptr;
@@ -9289,6 +9346,15 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 				// override via a synthesised type-switch proc, in any position.
 				// `ce->args` here is still the user args (the receiver prepend
 				// happens below), so we prepend `&recv` ourselves.
+				if (c->ufcs_auto_union_recv != nullptr &&
+				    c->ufcs_auto_union_type != nullptr &&
+				    c->ufcs_auto_union_type->Union.auto_union_alias == nullptr &&
+				    c->ufcs_auto_union_type->Union.variants.count > 0) {
+					// A dispatcher needs the union's named alias; without one
+					// the call would silently go to the base method with no
+					// virtual dispatch — make that visible.
+					warning(call, "method call on an unnamed 'auto_union' value calls the base method without virtual dispatch; bind the union to a named alias (`X :: auto_union(T)`) to dispatch to variant overrides");
+				}
 				if (c->ufcs_auto_union_recv != nullptr) {
 					Ast *disp = make_auto_union_dispatch_proc_lit(c, c->ufcs_auto_union_type, proc, ufcs_e);
 					if (disp != nullptr) {
@@ -9312,7 +9378,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 							operand->type  = lit_op.type;
 							operand->value = {};
 
-							c->ufcs_call_context = prev_ufcs_call_context;
+							c->ufcs_call_node    = prev_ufcs_call_node;
 							c->ufcs_first_arg    = prev_ufcs_first_arg;
 							c->ufcs_entity       = prev_ufcs_entity;
 							c->ufcs_auto_union_recv = prev_ufcs_au_recv;
@@ -9363,7 +9429,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 					operand->proc_group = ufcs_e;
 				}
 			}
-			c->ufcs_call_context = prev_ufcs_call_context;
+			c->ufcs_call_node    = prev_ufcs_call_node;
 			c->ufcs_first_arg    = prev_ufcs_first_arg;
 			c->ufcs_entity       = prev_ufcs_entity;
 			c->ufcs_auto_union_recv = prev_ufcs_au_recv;
