@@ -687,7 +687,7 @@ gb_internal bool find_or_generate_polymorphic_procedure_from_parameters(CheckerC
 	return find_or_generate_polymorphic_procedure(c, base_entity, nullptr, operands, poly_def_node, poly_proc_data);
 }
 
-gb_internal bool check_type_specialization_to(CheckerContext *c, Type *specialization, Type *type, bool compound, bool modify_type);
+gb_internal bool check_type_specialization_to(CheckerContext *c, Type *specialization, Type *type, bool compound, bool modify_type, bool allow_offset0_embed = false);
 gb_internal bool is_polymorphic_type_assignable(CheckerContext *c, Type *poly, Type *source, bool compound, bool modify_type);
 gb_internal bool check_cast_internal(CheckerContext *c, Operand *x, Type *type);
 gb_internal bool check_proc_params_assignable(CheckerContext *c, Type *x, Type *y);
@@ -1464,7 +1464,13 @@ gb_internal bool is_polymorphic_type_assignable(CheckerContext *c, Type *poly, T
 	case Type_Generic: {
 		if (poly->Generic.specialized != nullptr) {
 			Type *s = poly->Generic.specialized;
-			if (!check_type_specialization_to(c, s, source, compound, modify_type)) {
+			// Only the synthesized `^$Self/Base` method receiver accepts
+			// offset-0 embedders of its specialization; a user's ordinary
+			// `$T/Base` keeps upstream's exact-match semantics. ($Self as a
+			// user-written param name opts into the same behavior, which is
+			// the documented convention.)
+			bool allow_offset0_embed = poly->Generic.name == "Self";
+			if (!check_type_specialization_to(c, s, source, compound, modify_type, allow_offset0_embed)) {
 				return false;
 			}
 		}
@@ -9384,10 +9390,54 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 					warning(call, "method call on an unnamed 'auto_union' value calls the base method without virtual dispatch; bind the union to a named alias (`X :: auto_union(T)`) to dispatch to variant overrides");
 				}
 				if (c->ufcs_auto_union_recv != nullptr) {
-					Ast *disp = make_auto_union_dispatch_proc_lit(c, c->ufcs_auto_union_type, proc, ufcs_e);
+					// One dispatcher per (alias, method): a fresh proc-lit per
+					// call site meant N call sites x M variants of duplicate
+					// type-switch IR, all re-checked and re-codegen'd (the
+					// backend dedups by ProcLit node, so a cached node emits
+					// one procedure).
+					String cache_key = {};
+					Type *au_type = c->ufcs_auto_union_type;
+					if (au_type != nullptr && au_type->Union.auto_union_alias != nullptr &&
+					    proc->kind == Ast_SelectorExpr &&
+					    proc->SelectorExpr.selector != nullptr &&
+					    proc->SelectorExpr.selector->kind == Ast_Ident) {
+						gbString k = gb_string_make(temporary_allocator(), "");
+						k = gb_string_append_fmt(k, "%p.%.*s",
+						                         cast(void *)au_type->Union.auto_union_alias,
+						                         LIT(proc->SelectorExpr.selector->Ident.token.string));
+						cache_key = make_string_c(k);
+					}
+
+					Ast *disp = nullptr;
+					bool disp_from_cache = false;
+					if (cache_key.len != 0) {
+						mutex_lock(&c->info->auto_union_dispatch_mutex);
+						Ast **found = string_map_get(&c->info->auto_union_dispatch_cache, cache_key);
+						if (found != nullptr) {
+							disp = *found;
+							disp_from_cache = true;
+						}
+						mutex_unlock(&c->info->auto_union_dispatch_mutex);
+					}
+					if (disp == nullptr) {
+						disp = make_auto_union_dispatch_proc_lit(c, c->ufcs_auto_union_type, proc, ufcs_e);
+					}
 					if (disp != nullptr) {
 						Operand lit_op = {};
-						check_expr(c, &lit_op, disp);
+						if (disp_from_cache) {
+							TypeAndValue tav = type_and_value_of_expr(disp);
+							lit_op.mode = tav.mode;
+							lit_op.type = tav.type;
+						} else {
+							check_expr(c, &lit_op, disp);
+							if (cache_key.len != 0 &&
+							    lit_op.mode != Addressing_Invalid && lit_op.type != nullptr) {
+								String pkey = copy_string(permanent_allocator(), cache_key);
+								mutex_lock(&c->info->auto_union_dispatch_mutex);
+								string_map_set(&c->info->auto_union_dispatch_cache, pkey, disp);
+								mutex_unlock(&c->info->auto_union_dispatch_mutex);
+							}
+						}
 						if (lit_op.mode != Addressing_Invalid && lit_op.type != nullptr) {
 							Ast *recv = c->ufcs_auto_union_recv;
 							Token amp = {}; amp.kind = Token_And; amp.string = str_lit("&");

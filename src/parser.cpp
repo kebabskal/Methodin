@@ -7639,6 +7639,12 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 		for (Ast *method : st->methods) {
 			array_add(&pending, PendingMethod{method, struct_name_token, st->polymorphic_params});
 		}
+		// The lifted ValueDecls own these nodes from here on. Leaving the
+		// slice populated made every polymorphic instantiation deep-clone
+		// all method bodies into the permanent arena (clone_ast_array of
+		// StructType.methods) as dead weight, and exposed the lift's
+		// in-place proc-type mutations through the struct AST.
+		st->methods = {};
 	}
 
 	// Pass 1.25: rewrite bare-ident calls in each method body so a

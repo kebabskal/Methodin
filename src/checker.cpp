@@ -1583,6 +1583,7 @@ gb_internal void init_checker_info(CheckerInfo *i) {
 	map_init(&i->objc_method_implementations);
 
 	string_map_init(&i->load_file_cache);
+	string_map_init(&i->auto_union_dispatch_cache);
 	array_init(&i->all_procedures, a);
 	mpsc_init(&i->all_procedures_queue, a);
 
@@ -1606,6 +1607,7 @@ gb_internal void destroy_checker_info(CheckerInfo *i) {
 	array_free(&i->entities);
 	map_destroy(&i->global_untyped);
 	string_map_destroy(&i->foreigns);
+	string_map_destroy(&i->auto_union_dispatch_cache);
 
 	type_set_destroy(&i->min_dep_type_info_set);
 	map_destroy(&i->min_dep_type_info_index_map);
