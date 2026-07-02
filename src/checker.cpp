@@ -7571,7 +7571,14 @@ gb_internal WORKER_TASK_PROC(check_walk_all_dependencies_worker_proc) {
 
 gb_internal void check_walk_all_dependencies(DeclInfo *decl) {
 	if (decl != nullptr) {
-		thread_pool_add_task(check_walk_all_dependencies_worker_proc, decl);
+		if (build_context.no_threaded_checker) {
+			// Serial like every other checker phase: the walk mutates shared
+			// DeclInfo::deps sets, and the lifted-method decl graphs can reach
+			// the same node from several files. See init_build_context.
+			check_walk_all_dependencies_worker_proc(decl);
+		} else {
+			thread_pool_add_task(check_walk_all_dependencies_worker_proc, decl);
+		}
 	}
 }
 
@@ -7610,11 +7617,19 @@ gb_internal WORKER_TASK_PROC(check_scope_usage_pkg_worker) {
 gb_internal void check_all_scope_usages(Checker *c) {
 	for (auto const &entry : c->info.files) {
 		AstFile *f = entry.value;
-		thread_pool_add_task(check_scope_usage_file_worker, f);
+		if (build_context.no_threaded_checker) {
+			check_scope_usage_file_worker(f); // serial: see init_build_context
+		} else {
+			thread_pool_add_task(check_scope_usage_file_worker, f);
+		}
 	}
 	for (auto const &entry : c->info.packages) {
 		AstPackage *pkg = entry.value;
-		thread_pool_add_task(check_scope_usage_pkg_worker, pkg);
+		if (build_context.no_threaded_checker) {
+			check_scope_usage_pkg_worker(pkg);
+		} else {
+			thread_pool_add_task(check_scope_usage_pkg_worker, pkg);
+		}
 	}
 
 	thread_pool_wait();
