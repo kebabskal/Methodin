@@ -157,6 +157,25 @@ gb_internal void check_struct_fields(CheckerContext *ctx, Ast *node, Slice<Entit
 				type = nullptr;
 			}
 		}
+
+		// Methodin: constant default field values (`hp: int = 100`,
+		// `dir: Vec3 = {0, 1, 0}`, `name := "goblin"`). Applied wherever the
+		// compiler initializes the struct: declarations without an
+		// initializer, compound literals that omit the field, and globals.
+		// Runtime-allocated memory (new/make/mem.zero) stays zero.
+		ParameterValue field_default = {};
+		if (p->default_value != nullptr) {
+			Type *out_type = nullptr;
+			field_default = handle_parameter_value(ctx, type, &out_type, p->default_value, false);
+			if (type == nullptr && out_type != nullptr) {
+				type = out_type;
+			}
+			if (field_default.kind != ParameterValue_Constant && field_default.kind != ParameterValue_Nil) {
+				error(p->default_value, "Default struct field values must be constant");
+				field_default = {};
+			}
+		}
+
 		if (type == nullptr) {
 			error(params[i], "Invalid parameter type");
 			type = t_invalid;
@@ -193,6 +212,7 @@ gb_internal void check_struct_fields(CheckerContext *ctx, Ast *node, Slice<Entit
 			field->flags |= EntityFlag_Field;
 			if (is_using) field->flags |= EntityFlag_Using;
 			field->Variable.field_index = field_src_index;
+			field->Variable.param_value = field_default;
 
 			add_entity(ctx, ctx->scope, name, field);
 			field->Variable.field_group_index = field_group_index;
