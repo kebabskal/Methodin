@@ -5454,6 +5454,14 @@ gb_internal Ast *parse_stmt(AstFile *f) {
 	if (token.kind == Token_Ident && token.string == "impl" &&
 	    peek_token_n(f, 0).kind == Token_Ident &&
 	    peek_token_n(f, 1).kind == Token_OpenBrace) {
+		if (f->curr_proc != nullptr) {
+			// Only lift_struct_methods (file scope) ever processes these;
+			// inside a proc body the block would type-check as nothing and
+			// its methods would silently not exist.
+			syntax_error(token, "'impl' blocks are only allowed at file scope");
+			parse_impl_block(f); // keep the parser in sync
+			return ast_bad_stmt(f, token, f->curr_token);
+		}
 		return parse_impl_block(f);
 	}
 
@@ -6918,9 +6926,12 @@ gb_internal Ast *parse_impl_block(AstFile *f) {
 // checker to bind against.
 gb_internal String mangle_method_name(String struct_name, String method_name);
 
-gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Ast *polymorphic_params, Array<Ast *> *decls_out, bool no_using_self = false, bool self_polymorphic = false) {
-	if (method->kind != Ast_ValueDecl) return;
-	if (method->ValueDecl.values.count != 1) return;
+// Returns true when the method was actually lifted into `decls_out`; callers
+// must not register a method-index entry otherwise, or the assembled proc
+// group would reference a name that was never declared.
+gb_internal bool lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Ast *polymorphic_params, Array<Ast *> *decls_out, bool no_using_self = false, bool self_polymorphic = false) {
+	if (method->kind != Ast_ValueDecl) return false;
+	if (method->ValueDecl.values.count != 1) return false;
 
 	Ast *value = method->ValueDecl.values[0];
 
@@ -6952,11 +6963,18 @@ gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 		}
 		pg->args.data = new_args;
 		array_add(decls_out, method);
-		return;
+		return true;
 	}
 
 	Ast *proc_lit = value;
-	if (proc_lit->kind != Ast_ProcLit) return;
+	if (proc_lit->kind != Ast_ProcLit) {
+		// e.g. `Callback :: proc(int)` (a proc *type*) or any other constant:
+		// not a method. Silently eating it would delete the declaration from
+		// the program AND leave a dangling reference in the assembled proc
+		// group.
+		syntax_error(method, "a '::' declaration in a struct body must be a procedure literal or procedure group (a method); move other declarations to package scope");
+		return false;
+	}
 
 	Token caret_tok = {};
 	caret_tok.kind = Token_Pointer;
@@ -7058,6 +7076,7 @@ gb_internal void lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 	params->FieldList.list = slice_from_array(new_list);
 
 	array_add(decls_out, method);
+	return true;
 }
 
 struct PendingMethod {
@@ -7765,7 +7784,9 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			mangled_tok.string = mangle_method_name(pm.struct_name_token.string, method_name);
 			name_ident->Ident.token = mangled_tok;
 
-			lift_one_method(f, pm.method, pm.struct_name_token, pm.polymorphic_params, decls_out, pm.no_using_self, pm.self_polymorphic);
+			if (!lift_one_method(f, pm.method, pm.struct_name_token, pm.polymorphic_params, decls_out, pm.no_using_self, pm.self_polymorphic)) {
+				continue;
+			}
 
 			if (pkg != nullptr) {
 				MethodinMethodEntry entry = {};
