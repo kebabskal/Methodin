@@ -40,6 +40,7 @@ Entry :: struct {
 	host_implib: string, // Windows: host import library the reload build links against; "" elsewhere
 	is_file:     bool,
 	host_debug:  bool, // host was built with -debug; mirror it into reload dylibs so they stay debuggable
+	host_threaded_checker: bool, // host's effective checker threading; false mirrors -no-threaded-checker into rebuilds
 	host_sig:    u64, // rude-edit signature of the running program; a mismatch forces a restart
 	build_flags: []cstring, // host's -define flags; replayed so the reload build picks the same config
 	gen:         int,
@@ -74,6 +75,9 @@ _hot_reload_boot :: proc "contextless" () {
 	}
 	if dbg := cast(^int)_self_sym(self, "odin_hr_debug"); dbg != nil {
 		g.host_debug = dbg^ != 0
+	}
+	if tc := cast(^int)_self_sym(self, "odin_hr_threaded_checker"); tc != nil {
+		g.host_threaded_checker = tc^ != 0
 	}
 	// The host's -define flags, so the reload build selects the same configuration (e.g. shared vs
 	// static foreign libs). Emitted by the compiler as a parallel count + cstring array.
@@ -164,6 +168,10 @@ _reload :: proc() {
 	if g.host_debug {
 		// Match the host's debug info so breakpoints in reloaded procs keep binding.
 		append(&cmd, "-debug")
+	}
+	if !g.host_threaded_checker {
+		// Parallel is the default; mirror the host's opt-out.
+		append(&cmd, "-no-threaded-checker")
 	}
 	// Replay the host's -define flags so the reload DLL is built with the same configuration —
 	// crucially the same foreign-library selection (e.g. -define:RAYLIB_SHARED=true), so host and

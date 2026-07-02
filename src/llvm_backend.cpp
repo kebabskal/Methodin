@@ -351,6 +351,18 @@ gb_internal void lb_emit_hot_reload_manifest(lbModule *m) {
 	lb_hot_reload_mark_host_export(debug_g);
 	lb_append_to_compiler_used(m, debug_g);
 
+	// Mirror the effective checker threading into reload rebuilds: the
+	// per-edit rebuild is exactly where checker latency lands. Parallel is
+	// the default; a host built with -no-threaded-checker propagates the
+	// opt-out so its reloads stay serial too.
+	LLVMValueRef tc_g = LLVMAddGlobal(m->mod, lb_type(m, t_int), "odin_hr_threaded_checker");
+	LLVMSetInitializer(tc_g, LLVMConstInt(lb_type(m, t_int), build_context.no_threaded_checker ? 0 : 1, false));
+	LLVMSetLinkage(tc_g, LLVMExternalLinkage);
+	LLVMSetVisibility(tc_g, LLVMDefaultVisibility);
+	LLVMSetGlobalConstant(tc_g, true);
+	lb_hot_reload_mark_host_export(tc_g);
+	lb_append_to_compiler_used(m, tc_g);
+
 	// Forward the host's -define values to the reload build so it selects the same configuration.
 	// This matters for foreign libraries with global state: e.g. -define:RAYLIB_SHARED=true makes
 	// both the host and the reload DLL bind to a single shared raylib.dll, instead of each

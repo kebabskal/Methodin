@@ -1754,24 +1754,15 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 		bc->thread_count = gb_max(bc->affinity.thread_count, 1);
 	}
 
-	// Methodin: the parallel *checker* is not thread-safe with this fork — method
-	// proc-groups funnel every method call through polymorphic overload
-	// resolution, which binds a candidate's *shared* Generic type/scope in place
-	// (is_polymorphic_type_assignable / polymorphic_assign_index), and parallel
-	// entity collection/export race on shared package state. Resolving the same
-	// procedure from many proc bodies at once corrupts that shared state ->
-	// nondeterministic SIGSEGV / "double free" on build/run/watch. Until the
-	// binding is made thread-local, run all checker phases single-threaded.
-	// Codegen (the expensive phase) stays fully parallel, so the cost is small.
-	//
-	// `-threaded-checker` opts back in: the known shared-state mutation (the
-	// fast-path trial in find_or_generate_polymorphic_procedure checked the
-	// SHARED proc-type AST node, racing on scope association and cached
-	// types) is fixed by cloning the node per attempt, but the flag stays
-	// opt-in until the parallel pipeline has soaked longer under this fork.
-	if (!bc->threaded_checker) {
-		bc->no_threaded_checker = true;
-	}
+	// Methodin: the fork used to force the checker single-threaded because the
+	// parallel pipeline crashed on methodin projects. The root causes are
+	// fixed (exported-entity queue sized after the method lift, the poly
+	// fast-path trial cloning the shared signature AST, and all polymorphic
+	// trial-matching serialized under global_poly_match_mutex — it mutates
+	// shared generic state by design), so the checker is parallel by default
+	// again, matching upstream. `-no-threaded-checker` remains the opt-out
+	// if a race ever resurfaces; `-threaded-checker` is accepted as a no-op
+	// for compatibility.
 
 	bc->ODIN_VENDOR  = str_lit("odin");
 	bc->ODIN_VERSION = ODIN_VERSION;
