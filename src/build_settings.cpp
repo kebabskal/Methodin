@@ -600,6 +600,7 @@ struct BuildContext {
 	bool   enable_rvo;
 
 	bool   no_threaded_checker;
+	bool   threaded_checker; // Methodin: opt back in to the parallel checker (see init_build_context)
 
 	bool   show_debug_messages;
 
@@ -1762,7 +1763,15 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 	// nondeterministic SIGSEGV / "double free" on build/run/watch. Until the
 	// binding is made thread-local, run all checker phases single-threaded.
 	// Codegen (the expensive phase) stays fully parallel, so the cost is small.
-	bc->no_threaded_checker = true;
+	//
+	// `-threaded-checker` opts back in: the known shared-state mutation (the
+	// fast-path trial in find_or_generate_polymorphic_procedure checked the
+	// SHARED proc-type AST node, racing on scope association and cached
+	// types) is fixed by cloning the node per attempt, but the flag stays
+	// opt-in until the parallel pipeline has soaked longer under this fork.
+	if (!bc->threaded_checker) {
+		bc->no_threaded_checker = true;
+	}
 
 	bc->ODIN_VENDOR  = str_lit("odin");
 	bc->ODIN_VERSION = ODIN_VERSION;

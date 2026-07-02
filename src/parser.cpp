@@ -8096,7 +8096,18 @@ gb_internal bool parse_file(Parser *p, AstFile *f) {
 			}
 		}
 
+		// The lift appends synthesized top-level decls (lifted methods, union
+		// dispatchers). They must be counted like every parsed decl above:
+		// `pkg->exported_entity_queue` is sized from total_file_decl_count,
+		// and an undersized queue grows during the parallel collect phase —
+		// MPMCQueue's grow reallocs the buffer under a mutex the lock-free
+		// enqueue/dequeue paths never take, corrupting in-flight items
+		// (dequeued {nullptr, nullptr} entries, SEGV in export).
+		isize decl_count_before_lift = decls.count;
 		lift_struct_methods(f, &decls);
+		for (isize i = decl_count_before_lift; i < decls.count; i++) {
+			f->total_file_decl_count += calc_decl_count(decls[i]);
+		}
 
 		f->decls = slice_from_array(decls);
 
