@@ -2497,6 +2497,15 @@ gb_internal void lb_create_startup_runtime_generate_body(lbModule *m, lbProcedur
 	CheckerInfo *info = m->gen->info;
 
 	for (Entity *e : info->init_procedures) {
+		// Hot reload: the init package's @(init) procs already ran in the host
+		// process, and its globals are shared imports here — the linker's -init
+		// runs this proc on every dlopen, so re-running them would mutate live
+		// program state from the watch thread on each reload. Dependency
+		// packages keep their init: their globals are this dylib's private
+		// copies and must be initialized.
+		if (build_context.hot_reload_mode == HotReload_Reload && e->pkg == info->init_package) {
+			continue;
+		}
 		lbValue value = lb_find_procedure_value_from_entity(m, e);
 		lb_emit_call(p, value, {}, ProcInlining_none, ProcTailing_none);
 	}
@@ -2549,6 +2558,12 @@ gb_internal lbProcedure *lb_create_cleanup_runtime(lbModule *main_module) { // C
 	CheckerInfo *info = main_module->gen->info;
 
 	for (Entity *e : info->fini_procedures) {
+		// See init_procedures in lb_create_startup_runtime: the init package's
+		// @(fini) procs belong to the host; each reload dylib's -fini would
+		// re-run them (once per loaded generation) at process exit.
+		if (build_context.hot_reload_mode == HotReload_Reload && e->pkg == info->init_package) {
+			continue;
+		}
 		lbValue value = lb_find_procedure_value_from_entity(main_module, e);
 		lb_emit_call(p, value, {}, ProcInlining_none, ProcTailing_none);
 	}

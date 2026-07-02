@@ -82,6 +82,14 @@ gb_global Timings global_timings = {0};
 #include "bug_report.cpp"
 
 // NOTE(bill): 'name' is used in debugging and profiling modes
+// Keep in sync with HR_RESTART_EXIT_CODE in core/sys/hotreload/hotreload.odin:
+// a watched program exits with this code when its reload agent hits a rude edit
+// and needs the host rebuilt.
+#define ODIN_HR_RESTART_EXIT_CODE 211
+
+gb_global int          global_main_argc = 0;
+gb_global char const **global_main_argv = nullptr;
+
 gb_internal i32 system_exec_command_line_app_internal(bool exit_on_err, char const *name, char const *fmt, va_list va) {
 	isize const cmd_cap = 64<<20; // 64 MiB should be more than enough
 	char *cmd_line = gb_alloc_array(gb_heap_allocator(), char, cmd_cap);
@@ -157,6 +165,11 @@ gb_internal i32 system_exec_command_line_app_internal(bool exit_on_err, char con
 		struct rlimit limit = { 0, 0, };
 		setrlimit(RLIMIT_CORE, &limit);
 		raise(WTERMSIG(exit_code));
+	}
+	if (!exit_on_err && WIFSIGNALED(exit_code)) {
+		// Shell convention, so callers can inspect the code instead of the raw
+		// wait status (and distinguish it from a normal exit code).
+		exit_code = 128 + WTERMSIG(exit_code);
 	}
 	if (WIFEXITED(exit_code)) {
 		exit_code = WEXITSTATUS(exit_code);
@@ -3615,6 +3628,10 @@ int main(int arg_count, char const **arg_ptr) {
 		usage(make_string_c(arg_ptr[0]));
 		return 1;
 	}
+	// Stashed for `odin watch`, which re-execs this exact invocation when the
+	// watched program requests a restart (rude edit).
+	global_main_argc = arg_count;
+	global_main_argv = arg_ptr;
 	virtual_memory_init();
 
 	timings_init(&global_timings, str_lit("Total Time"), 2048);
@@ -4320,6 +4337,45 @@ end_of_code_gen:;
 	if (run_output) {
 		String exe_name = path_to_string(heap_allocator(), build_context.build_paths[BuildPath_Output]);
 		defer (gb_free(heap_allocator(), exe_name.text));
+
+		if (build_context.command_kind == Command_watch) {
+			// The watched program exits with the magic code when its reload
+			// agent hits a rude edit (changed globals/types/main). Re-exec this
+			// exact `odin watch` invocation: the image is replaced in place, so
+			// the process tree stays flat — the old flow (the app exec'ing a new
+			// `odin watch` inside itself) parked one compiler per restart, each
+			// re-raising the app's crash signal in a coredump cascade. A crash
+			// of the watched program is reported here, not re-raised.
+			i32 code = system_exec_command_line_app("odin watch", "\"%.*s\" %.*s", LIT(exe_name), LIT(run_args_string));
+			if (code == ODIN_HR_RESTART_EXIT_CODE) {
+#if defined(GB_SYSTEM_WINDOWS)
+				STARTUPINFOW rs_start_info = {gb_size_of(STARTUPINFOW)};
+				PROCESS_INFORMATION rs_pi = {0};
+				rs_start_info.dwFlags = STARTF_USESTDHANDLES;
+				rs_start_info.hStdInput   = GetStdHandle(STD_INPUT_HANDLE);
+				rs_start_info.hStdOutput  = GetStdHandle(STD_OUTPUT_HANDLE);
+				rs_start_info.hStdError   = GetStdHandle(STD_ERROR_HANDLE);
+				if (CreateProcessW(nullptr, GetCommandLineW(),
+				                   nullptr, nullptr, true, 0, nullptr, nullptr,
+				                   &rs_start_info, &rs_pi)) {
+					CloseHandle(rs_pi.hProcess);
+					CloseHandle(rs_pi.hThread);
+					return 0;
+				}
+				gb_printf_err("odin watch: restart failed; please re-run `odin watch` manually\n");
+				return 1;
+#else
+				execvp(global_main_argv[0], cast(char *const *)global_main_argv);
+				// execvp only returns on failure.
+				gb_printf_err("odin watch: restart failed; please re-run `odin watch` manually\n");
+				return 1;
+#endif
+			}
+			if (code >= 129 && code <= 192) {
+				gb_printf_err("odin watch: the watched program terminated with signal %d\n", code - 128);
+			}
+			return code;
+		}
 
 		system_must_exec_command_line_app("odin run", "\"%.*s\" %.*s", LIT(exe_name), LIT(run_args_string));
 

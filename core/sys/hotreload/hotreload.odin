@@ -233,6 +233,23 @@ _reload :: proc() {
 	}
 }
 
+// Exit code the watch parent (`odin watch`) recognizes as "rude edit: rebuild
+// the host and run it again". Keep in sync with ODIN_HR_RESTART_EXIT_CODE in
+// src/main.cpp.
+@(private)
+HR_RESTART_EXIT_CODE :: 211
+
+// A rude edit (changed globals/types/main) cannot be patched in place: exit
+// with the magic code and let the parent `odin watch` rebuild and respawn us.
+// The old implementation replaced this process with a fresh `odin watch`; on
+// unix that parked the previous compiler in the process tree — one more per
+// restart — and each parked parent re-raised the app's crash signal, filling
+// coredumpctl with misleading paired SIGSEGVs.
+@(private)
+_restart :: proc() {
+	os.exit(HR_RESTART_EXIT_CODE)
+}
+
 // True if a mangled proc symbol's final segment is the reserved hook name `hot_reloaded`.
 @(private)
 _is_hook :: proc(sym: string) -> bool {
