@@ -142,11 +142,37 @@ See [`examples/methods`](examples/methods) and
   scope. UFCS dispatches via overload resolution on the receiver type.
 - **Union method dispatch** — calling a method on a tagged union expands to
   a `switch v in s` over the known variants at compile time. No vtable, no
-  indirection.
+  indirection. Variadic methods forward correctly, and calling a method on a
+  nil union value panics with the union and method name instead of silently
+  doing nothing.
+- **`auto_union(T)`** — a tagged union of every struct in the program that
+  `using`-embeds `T` at offset 0 (directly or transitively). Bind it to a
+  named alias (`AnyEntity :: auto_union(Entity)`) and method calls on it
+  virtually dispatch to each variant's override; base fields are promoted
+  through the offset-0 layout. Cross-package variants work. See
+  [`examples/auto_union_test`](examples/auto_union_test).
+- **Virtual sibling dispatch** — a method that calls a sibling method gets a
+  polymorphic `^$Self` receiver, so each concrete receiver re-resolves the
+  call against its own overrides (virtual dispatch, still no vtable). See
+  [`examples/self_dispatch`](examples/self_dispatch).
+- **Type-scoped constants** — any non-proc `Name :: <expr>` inside a struct
+  body or `impl` block is a constant (or nested type alias) accessed as
+  `Vec3.UP`, `World.MAX_ENTITIES`, `World.Id` — usable in constant contexts
+  like array sizes. `impl` works on non-struct named types too (a method
+  whose first parameter names the target keeps its explicit receiver), so
+  `impl Vec3 { UP :: Vec3{0, 1, 0} }` works on a `distinct [3]f32`.
+- **Default struct field values** — `hp: int = 100` in a struct body, for
+  any constant-expressible value (numbers, strings, compound literals,
+  nested structs, fixed arrays). Applied wherever the compiler initializes
+  the type: declarations without an initializer, compound literals that omit
+  the field, globals, and arrays. Heap memory keeps zero semantics
+  (`new`/`make` never run defaults — a default is a constant, never code);
+  `ptr^ = {}` applies them explicitly. See
+  [`examples/type_members`](examples/type_members).
 
-Nothing here is dynamic dispatch — every call resolves statically to a
-known procedure (or one variant of a procedure group), and the inliner
-sees through it.
+Nothing here is dynamic dispatch through function pointers — every call
+resolves statically to a known procedure (or one variant of a procedure
+group / one case of a compile-time switch), and the inliner sees through it.
 
 ## `odin watch` — transparent hot reload
 
@@ -178,17 +204,34 @@ successful reload — handy for re-deriving cached state. Omit it and reloads
 happen silently.
 
 Some edits can't be patched into a running native process. The agent detects
-these via a compiler-emitted signature and **automatically restarts** (losing
-in-memory state) instead of corrupting it:
+these via a compiler-emitted structural signature and **automatically
+restarts** (losing in-memory state) instead of corrupting it:
 
 - editing `main`'s body (the running loop can't be re-entered);
-- adding, removing, or changing the type of a package global (the layout would
-  no longer match the host's storage).
+- adding, removing, or changing the type of a package global;
+- editing the **layout of any type** declared in the package (fields,
+  offsets, sizes — live globals and heap objects hold the old layout).
 
 Everything else — editing any other procedure's body — hot-reloads in place.
-Both directory and single-file (`-file`) packages work. Currently targets
-macOS/Linux and reloads the initial package only. See
-[`examples/hot_reload`](examples/hot_reload) for a runnable demo.
+The restart is handled by the parent `odin watch` process re-exec'ing
+itself, so the process tree stays flat no matter how many restarts happen.
+
+Odds and ends:
+
+- `ODIN_HOT_RELOAD` is a built-in `bool` constant — `when ODIN_HOT_RELOAD`
+  gates code to hot-reload builds (true in the host and in reload libraries).
+- Reload rebuilds inherit the host's `-define:` flags, `-debug`, and checker
+  threading, so each per-edit rebuild matches the original build.
+- Both directory and single-file (`-file`) packages work, on Linux, macOS,
+  and Windows; only the initial package is watched/reloaded. See
+  [`examples/hot_reload`](examples/hot_reload) for a runnable demo.
+
+## Compiler notes
+
+The checker runs multithreaded by default (matching upstream); pass
+`-no-threaded-checker` to serialize it if you ever suspect a
+checker race. Methodin's polymorphic method machinery serializes its own
+shared-state binding internally — everything else checks in parallel.
 
 ---
 
