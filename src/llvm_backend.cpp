@@ -3865,7 +3865,14 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			}
 			var.is_initialized = true;
 		} else if (LLVMGetInitializer(g.value) == nullptr) {
-			LLVMSetInitializer(g.value, LLVMConstNull(lb_type(m, e->type)));
+			if (lb_type_has_field_defaults(e->type)) {
+				// Methodin: globals without an initializer take the type's
+				// default field values. (A runtime init expression overwrites
+				// this at startup, which is correct either way.)
+				LLVMSetInitializer(g.value, lb_const_default_value_internal(m, e->type));
+			} else {
+				LLVMSetInitializer(g.value, LLVMConstNull(lb_type(m, e->type)));
+			}
 		}
 		if (export_to_host) {
 			// Must be a visible dynamic symbol (like a normal exported proc) so a reload

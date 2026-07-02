@@ -264,6 +264,70 @@ gb_internal LLVMValueRef llvm_const_slice(lbModule *m, lbValue data, lbValue len
 
 
 
+// Methodin: default struct field values. True when `t` (or anything it
+// contains by value) declares a constant field default, meaning zero-init
+// sites must materialize lb_const_default_value instead of zeroing.
+gb_internal bool lb_type_has_field_defaults(Type *t) {
+	if (t == nullptr) return false;
+	t = base_type(t);
+	if (t == nullptr) return false;
+	switch (t->kind) {
+	case Type_Struct:
+		if (t->Struct.is_raw_union) return false;
+		for (Entity *f : t->Struct.fields) {
+			if (f == nullptr || f->kind != Entity_Variable) continue;
+			if (f->Variable.param_value.kind == ParameterValue_Constant) return true;
+			if (lb_type_has_field_defaults(f->type)) return true;
+		}
+		return false;
+	case Type_Array:
+		return lb_type_has_field_defaults(t->Array.elem);
+	case Type_EnumeratedArray:
+		return lb_type_has_field_defaults(t->EnumeratedArray.elem);
+	}
+	return false;
+}
+
+gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, Type *value_type, lbConstContext cc);
+
+// The "default value" of a type: zero except where a struct field declares a
+// constant default (recursively, including through arrays and nested structs).
+gb_internal LLVMValueRef lb_const_default_value_internal(lbModule *m, Type *type) {
+	Type *bt = base_type(type);
+	if (bt->kind == Type_Struct && !bt->Struct.is_raw_union && lb_type_has_field_defaults(bt)) {
+		TEMPORARY_ALLOCATOR_GUARD();
+		isize n = bt->Struct.fields.count;
+		LLVMValueRef *values = gb_alloc_array(temporary_allocator(), LLVMValueRef, n);
+		for_array(i, bt->Struct.fields) {
+			Entity *f = bt->Struct.fields[i];
+			if (f != nullptr && f->kind == Entity_Variable &&
+			    f->Variable.param_value.kind == ParameterValue_Constant) {
+				values[i] = lb_const_value(m, f->type, f->Variable.param_value.value, f->type, LB_CONST_CONTEXT_DEFAULT).value;
+			} else if (f != nullptr && lb_type_has_field_defaults(f->type)) {
+				values[i] = lb_const_default_value_internal(m, f->type);
+			} else {
+				values[i] = LLVMConstNull(lb_type(m, f->type));
+			}
+		}
+		return llvm_const_named_struct(m, type, values, n);
+	}
+	if (bt->kind == Type_Array && lb_type_has_field_defaults(bt->Array.elem)) {
+		TEMPORARY_ALLOCATOR_GUARD();
+		LLVMValueRef elem = lb_const_default_value_internal(m, bt->Array.elem);
+		LLVMValueRef *elems = gb_alloc_array(temporary_allocator(), LLVMValueRef, bt->Array.count);
+		for (i64 i = 0; i < bt->Array.count; i++) elems[i] = elem;
+		return llvm_const_array(m, lb_type(m, bt->Array.elem), elems, bt->Array.count);
+	}
+	return LLVMConstNull(lb_type(m, type));
+}
+
+gb_internal lbValue lb_const_default_value(lbModule *m, Type *type) {
+	lbValue res = {};
+	res.type = type;
+	res.value = lb_const_default_value_internal(m, type);
+	return res;
+}
+
 gb_internal lbValue lb_const_nil(lbModule *m, Type *type) {
 	LLVMValueRef v = LLVMConstNull(lb_type(m, type));
 	return lbValue{v, type};
@@ -896,6 +960,10 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, Ty
 	if (value.kind == ExactValue_Compound) {
 		ast_node(cl, CompoundLit, value.value_compound);
 		if (cl->elems.count == 0) {
+			// Methodin: an empty literal takes the type's default field values.
+			if (lb_type_has_field_defaults(type)) {
+				return {lb_const_default_value_internal(m, original_type), original_type};
+			}
 			return lb_const_nil(m, original_type);
 		}
 	}
@@ -1809,6 +1877,9 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, Ty
 			ast_node(cl, CompoundLit, value.value_compound);
 
 			if (cl->elems.count == 0) {
+				if (lb_type_has_field_defaults(type)) {
+					return {lb_const_default_value_internal(m, original_type), original_type};
+				}
 				return lb_const_nil(m, original_type);
 			}
 
@@ -1986,6 +2057,20 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, Ty
 				}
 			}
 
+			// Fields the literal omitted get their declared defaults.
+			for_array(field_index, type->Struct.fields) {
+				Entity *f = type->Struct.fields[field_index];
+				if (f == nullptr || f->kind != Entity_Variable) continue;
+				i32 index = field_remapping[f->Variable.field_index];
+				if (visited[index]) continue;
+				if (f->Variable.param_value.kind == ParameterValue_Constant) {
+					values[index]  = lb_const_value(m, f->type, f->Variable.param_value.value, f->type, cc).value;
+					visited[index] = true;
+				} else if (lb_type_has_field_defaults(f->type)) {
+					values[index]  = lb_const_default_value_internal(m, f->type);
+					visited[index] = true;
+				}
+			}
 			for (isize i = 0; i < value_count; i++) {
 				if (!visited[i]) {
 					GB_ASSERT(values[i] == nullptr);

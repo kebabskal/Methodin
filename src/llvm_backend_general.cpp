@@ -3618,7 +3618,13 @@ gb_internal lbAddr lb_add_local(lbProcedure *p, Type *type, Entity *e, bool zero
 	}
 
 	if (zero_init) {
-		lb_mem_zero_ptr(p, ptr, type, alignment);
+		if (lb_type_has_field_defaults(type)) {
+			// Methodin: declarations without an initializer take the type's
+			// default field values, not plain zero.
+			LLVMBuildStore(p->builder, lb_const_default_value_internal(p->module, type), ptr);
+		} else {
+			lb_mem_zero_ptr(p, ptr, type, alignment);
+		}
 	}
 
 	return lb_addr(val);
@@ -3641,7 +3647,13 @@ gb_internal lbAddr lb_add_local_generated(lbProcedure *p, Type *type, bool zero_
 	if (zero_init) {
 		// Emit the zero-init store at the current position (not entry block)
 		// so it respects control flow. But the alloca itself is in entry.
-		lb_mem_zero_ptr(p, ptr, type, alignment);
+		if (lb_type_has_field_defaults(type)) {
+			// Methodin: generated temporaries back compound literals; an
+			// empty/partial literal starts from the type's default values.
+			LLVMBuildStore(p->builder, lb_const_default_value_internal(p->module, type), ptr);
+		} else {
+			lb_mem_zero_ptr(p, ptr, type, alignment);
+		}
 	}
 
 	lbValue val = {};

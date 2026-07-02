@@ -458,6 +458,11 @@ static lbConstContext const LB_CONST_CONTEXT_DEFAULT = {true, false, {}};
 static lbConstContext const LB_CONST_CONTEXT_DEFAULT_ALLOW_LOCAL = {true, false, {}};
 static lbConstContext const LB_CONST_CONTEXT_DEFAULT_NO_LOCAL = {false, false, {}};
 
+// Methodin: default struct field values (see llvm_backend_const.cpp).
+gb_internal bool lb_type_has_field_defaults(Type *t);
+gb_internal LLVMValueRef lb_const_default_value_internal(lbModule *m, Type *type);
+gb_internal lbValue lb_const_default_value(lbModule *m, Type *type);
+
 gb_internal lbValue lb_const_nil(lbModule *m, Type *type);
 gb_internal lbValue lb_const_undef(lbModule *m, Type *type);
 gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, Type *value_type=nullptr, lbConstContext cc = LB_CONST_CONTEXT_DEFAULT);

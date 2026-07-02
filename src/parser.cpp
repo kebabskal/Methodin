@@ -4415,7 +4415,9 @@ gb_internal Ast *parse_struct_field_list(AstFile *f, isize *name_count_, Array<A
 
 	isize total_name_count = 0;
 
-	Ast *params = parse_field_list(f, &total_name_count, FieldFlag_Struct, Token_CloseBrace, false, false, methods_out);
+	// Methodin: struct fields may carry constant default values
+	// (`hp: int = 100`), applied wherever the compiler initializes the type.
+	Ast *params = parse_field_list(f, &total_name_count, FieldFlag_Struct, Token_CloseBrace, true, false, methods_out);
 	if (name_count_) *name_count_ = total_name_count;
 	return params;
 }
@@ -4582,10 +4584,8 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 		syntax_error(f->curr_token, "Default parameters can only be applied to single values");
 	}
 
-	if (allowed_flags == FieldFlag_Struct && default_value != nullptr) {
-		syntax_error(default_value, "Default parameters are not allowed for structs");
-		default_value = nullptr;
-	}
+	// Methodin: struct fields may carry constant default values; the checker
+	// validates constness (check_struct_fields).
 
 	if (type != nullptr && type->kind == Ast_Ellipsis) {
 		if (seen_ellipsis) syntax_error(type, "Extra variadic parameter after ellipsis");
