@@ -302,7 +302,7 @@ gb_internal LLVMValueRef lb_const_default_value_internal(lbModule *m, Type *type
 			Entity *f = bt->Struct.fields[i];
 			if (f != nullptr && f->kind == Entity_Variable &&
 			    f->Variable.param_value.kind == ParameterValue_Constant) {
-				values[i] = lb_const_value(m, f->type, f->Variable.param_value.value, f->type, LB_CONST_CONTEXT_DEFAULT).value;
+				values[i] = lb_const_value(m, f->type, f->Variable.param_value.value, f->type, LB_CONST_CONTEXT_DEFAULT_NO_LOCAL).value;
 			} else if (f != nullptr && lb_type_has_field_defaults(f->type)) {
 				values[i] = lb_const_default_value_internal(m, f->type);
 			} else {
