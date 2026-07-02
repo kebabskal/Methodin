@@ -4483,8 +4483,7 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 		if (methods_out != nullptr &&
 		    f->curr_token.kind == Token_Ident &&
 		    peek_token_n(f, 0).kind == Token_Colon &&
-		    peek_token_n(f, 1).kind == Token_Colon &&
-		    peek_token_n(f, 2).kind == Token_proc) {
+		    peek_token_n(f, 1).kind == Token_Colon) {
 			CommentGroup *method_docs = f->lead_comment;
 			Token name_token = expect_token(f, Token_Ident);
 			expect_token(f, Token_Colon);
@@ -4628,8 +4627,7 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 		if (methods_out != nullptr &&
 		    f->curr_token.kind == Token_Ident &&
 		    peek_token_n(f, 0).kind == Token_Colon &&
-		    peek_token_n(f, 1).kind == Token_Colon &&
-		    peek_token_n(f, 2).kind == Token_proc) {
+		    peek_token_n(f, 1).kind == Token_Colon) {
 			Token name_token = expect_token(f, Token_Ident);
 			expect_token(f, Token_Colon);
 			expect_token(f, Token_Colon);
@@ -6869,9 +6867,8 @@ gb_internal Ast *parse_impl_block(AstFile *f) {
 	       f->curr_token.kind != Token_EOF) {
 		if (f->curr_token.kind != Token_Ident ||
 		    peek_token_n(f, 0).kind != Token_Colon ||
-		    peek_token_n(f, 1).kind != Token_Colon ||
-		    peek_token_n(f, 2).kind != Token_proc) {
-			syntax_error(f->curr_token, "Expected a method declaration `name :: proc(...) {...}` inside the impl block");
+		    peek_token_n(f, 1).kind != Token_Colon) {
+			syntax_error(f->curr_token, "Expected a `name :: ...` method or constant declaration inside the impl block");
 			advance_token(f);
 			continue;
 		}
@@ -6931,7 +6928,7 @@ gb_internal String mangle_method_name(String struct_name, String method_name);
 // Returns true when the method was actually lifted into `decls_out`; callers
 // must not register a method-index entry otherwise, or the assembled proc
 // group would reference a name that was never declared.
-gb_internal bool lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Ast *polymorphic_params, Array<Ast *> *decls_out, bool no_using_self = false, bool self_polymorphic = false) {
+gb_internal bool lift_one_method(AstFile *f, Ast *method, Token struct_name_token, Ast *polymorphic_params, Array<Ast *> *decls_out, bool no_using_self = false, bool self_polymorphic = false, bool keep_signature = false) {
 	if (method->kind != Ast_ValueDecl) return false;
 	if (method->ValueDecl.values.count != 1) return false;
 
@@ -6970,12 +6967,20 @@ gb_internal bool lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 
 	Ast *proc_lit = value;
 	if (proc_lit->kind != Ast_ProcLit) {
-		// e.g. `Callback :: proc(int)` (a proc *type*) or any other constant:
-		// not a method. Silently eating it would delete the declaration from
-		// the program AND leave a dangling reference in the assembled proc
-		// group.
-		syntax_error(method, "a '::' declaration in a struct body must be a procedure literal or procedure group (a method); move other declarations to package scope");
+		// Non-proc members are lifted as type-scoped constants by
+		// lift_member_constant before reaching the method machinery; anything
+		// non-proc arriving here is a shape it rejected (multi-name, mutable).
+		syntax_error(method, "a '::' declaration in a struct body must declare a single constant or method");
 		return false;
+	}
+
+	if (keep_signature) {
+		// impl method with an explicit receiver (`scaled :: proc(v: Vec3, ...)`
+		// inside `impl Vec3`): lift verbatim — the receiver is already spelled
+		// out, and non-struct targets can't take `using self` at all. UFCS
+		// first-arg matching handles `v.scaled(...)`.
+		array_add(decls_out, method);
+		return true;
 	}
 
 	Token caret_tok = {};
@@ -7086,6 +7091,7 @@ struct PendingMethod {
 	Token struct_name_token; // owning struct's name token
 	Ast *polymorphic_params; // owning struct's polymorphic_params FieldList, or nullptr
 	bool no_using_self;      // true for union dispatchers: prepend `self: ^Union` without `using`
+	bool keep_signature;     // impl method with an explicit receiver param: lift verbatim, no self injection
 	bool self_polymorphic;   // Methodin: method body calls a sibling method (`self.m()`), so lift with a
 	                         // polymorphic `^$Self` receiver — each concrete receiver monomorphises the
 	                         // body, re-resolving those sibling calls against the *actual* type (virtual
@@ -7584,6 +7590,48 @@ gb_internal void collect_effective_method_names(Array<Ast *> *decls_out,
 	}
 }
 
+// Methodin: a non-proc `Name :: <expr>` member of a struct body or impl block
+// is a type-scoped constant (or nested type alias): `Vec3 :: struct { UP ::
+// Vec3{0, 1, 0} }` or `impl Vec3 { UP :: ... }`. Lift it verbatim to package
+// scope under the mangled `<Type>__<name>`; check_selector maps `Vec3.UP`
+// back. Returns false when the member is a method (proc/proc-group), which
+// the caller routes through the normal method machinery instead.
+gb_internal bool lift_member_constant(AstFile *f, Ast *member, Token struct_name_token, Array<Ast *> *decls_out) {
+	if (member->kind != Ast_ValueDecl) return false;
+	if (member->ValueDecl.is_mutable) return false;
+	if (member->ValueDecl.names.count != 1 || member->ValueDecl.values.count != 1) return false;
+	Ast *value = member->ValueDecl.values[0];
+	if (value->kind == Ast_ProcLit || value->kind == Ast_ProcGroup) return false;
+	Ast *name_ident = member->ValueDecl.names[0];
+	if (name_ident->kind != Ast_Ident) return false;
+
+	Token mangled = name_ident->Ident.token;
+	mangled.string = mangle_method_name(struct_name_token.string, mangled.string);
+	// Fresh ident, not an in-place token mutation: Ident caches hash/interned
+	// strings derived from the original spelling at parse time.
+	member->ValueDecl.names[0] = ast_ident(f, mangled);
+	array_add(decls_out, member);
+	return true;
+}
+
+// True when an impl-block method already takes the target type as its first
+// parameter (`scaled :: proc(v: Vec3, ...)` inside `impl Vec3`): the method
+// keeps its explicit receiver and no `using self` is injected. This is what
+// makes `impl` usable on NON-struct named types (distinct arrays, enums...) —
+// `using self: ^Vec3` is only legal for struct receivers.
+gb_internal bool impl_method_has_explicit_receiver(Ast *method, String target_name) {
+	if (method->kind != Ast_ValueDecl || method->ValueDecl.values.count != 1) return false;
+	Ast *v = method->ValueDecl.values[0];
+	if (v->kind != Ast_ProcLit || v->ProcLit.type == nullptr || v->ProcLit.type->kind != Ast_ProcType) return false;
+	Ast *params = v->ProcLit.type->ProcType.params;
+	if (params == nullptr || params->kind != Ast_FieldList || params->FieldList.list.count == 0) return false;
+	Ast *f0 = params->FieldList.list[0];
+	if (f0->kind != Ast_Field || f0->Field.type == nullptr) return false;
+	Ast *t = f0->Field.type;
+	if (t->kind == Ast_PointerType) t = t->PointerType.type;
+	return t != nullptr && t->kind == Ast_Ident && t->Ident.token.string == target_name;
+}
+
 gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 	// Pass 1: collect every in-struct / impl-block method along with the
 	// token of the struct it belongs to. We do this before any lifting
@@ -7616,7 +7664,11 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 				poly = target_struct->StructType.polymorphic_params;
 			}
 			for (Ast *method : decl->ImplBlock.methods) {
-				array_add(&pending, PendingMethod{method, struct_name_token, poly});
+				if (lift_member_constant(f, method, struct_name_token, decls_out)) continue;
+				bool explicit_recv = impl_method_has_explicit_receiver(method, struct_name_token.string);
+				PendingMethod pm = {method, struct_name_token, poly};
+				pm.keep_signature = explicit_recv;
+				array_add(&pending, pm);
 			}
 			continue;
 		}
@@ -7637,6 +7689,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 
 		Token struct_name_token = name_ident->Ident.token;
 		for (Ast *method : st->methods) {
+			if (lift_member_constant(f, method, struct_name_token, decls_out)) continue;
 			array_add(&pending, PendingMethod{method, struct_name_token, st->polymorphic_params});
 		}
 		// The lifted ValueDecls own these nodes from here on. Leaving the
@@ -7833,7 +7886,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			mangled_tok.string = mangle_method_name(pm.struct_name_token.string, method_name);
 			name_ident->Ident.token = mangled_tok;
 
-			if (!lift_one_method(f, pm.method, pm.struct_name_token, pm.polymorphic_params, decls_out, pm.no_using_self, pm.self_polymorphic)) {
+			if (!lift_one_method(f, pm.method, pm.struct_name_token, pm.polymorphic_params, decls_out, pm.no_using_self, pm.self_polymorphic, pm.keep_signature)) {
 				continue;
 			}
 

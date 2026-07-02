@@ -6470,6 +6470,12 @@ gb_internal lbAddr lb_build_addr_internal(lbProcedure *p, Ast *expr) {
 					GB_ASSERT(e->kind == Entity_Procedure);
 					return lb_addr(lb_find_value_from_entity(p->module, e));
 				}
+				// Methodin: type-scoped members (`Vec3.scaled`, `Vec3.UP`)
+				// resolve to the lifted package-scope entity that check_selector
+				// recorded on the selector ident.
+				if (Entity *e = entity_of_node(sel_node)) {
+					return lb_build_addr_from_entity(p, e, expr);
+				}
 				GB_PANIC("Unreachable %s", selector.cstring());
 			}
 

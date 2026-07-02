@@ -6487,6 +6487,58 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 		}
 	}
 
+	// Methodin: type-scoped members. In-struct / impl constants (and nested
+	// type aliases, and methods) are lifted to package scope as
+	// `<Type>__<name>`; map `Vec3.UP` (selector on the TYPE) back to the
+	// lifted entity. Methods resolve too, giving `Vec3.dot(a, b)`-style
+	// explicit calls.
+	if (entity == nullptr && operand->mode == Addressing_Type &&
+	    operand->type != nullptr && operand->type->kind == Type_Named &&
+	    operand->type->Named.type_name != nullptr &&
+	    selector->kind == Ast_Ident) {
+		Entity *tn = operand->type->Named.type_name;
+		if (tn->scope != nullptr) {
+			String mangled = mangle_method_name(tn->token.string, selector->Ident.token.string);
+			Entity *e2 = scope_lookup(tn->scope, string_interner_insert(mangled), 0);
+			if (e2 != nullptr) {
+				switch (e2->kind) {
+				case Entity_Constant:
+				case Entity_TypeName:
+				case Entity_Procedure:
+				case Entity_ProcGroup:
+					check_entity_decl(c, e2, nullptr, nullptr);
+					add_entity_use(c, selector, e2);
+					operand->expr = node;
+					switch (e2->kind) {
+					case Entity_Constant:
+						operand->mode  = Addressing_Constant;
+						operand->type  = e2->type;
+						operand->value = e2->Constant.value;
+						break;
+					case Entity_TypeName:
+						operand->mode = Addressing_Type;
+						operand->type = e2->type;
+						break;
+					case Entity_Procedure:
+						operand->mode = Addressing_Value;
+						operand->type = e2->type;
+						break;
+					case Entity_ProcGroup:
+						operand->mode = Addressing_ProcGroup;
+						operand->type = e2->type != nullptr ? e2->type : t_invalid;
+						operand->proc_group = e2;
+						break;
+					default: break;
+					}
+					add_type_and_value(c, node, operand->mode, operand->type, operand->value);
+					return e2;
+				default:
+					break;
+				}
+			}
+		}
+	}
+
 	if (entity == nullptr) {
 		gbString op_str   = expr_to_string(op_expr);
 		gbString type_str = type_to_string_shorthand(operand->type);
