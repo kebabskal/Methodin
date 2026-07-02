@@ -58,7 +58,7 @@ World :: struct {
 g_world: World // globals get defaults too
 
 main :: proc() {
-	fmt.println("Vec3.UP =", Vec3.UP, " scaled:", Vec3.scaled(Vec3.UP, 2))
+	fmt.println("Vec3.UP =", Vec3.UP, " scaled:", Vec3.UP.scaled(2)) // rvalue receiver: method on a constant
 
 	v := Vec3{3, 0, 0}
 	fmt.println("v.scaled(2) =", v.scaled(2)) // UFCS on the impl method
