@@ -370,6 +370,7 @@ enum BuildFlagKind {
 	BuildFlag_UseSeparateModules,
 	BuildFlag_UseSingleModule,
 	BuildFlag_NoThreadedChecker,
+	BuildFlag_ThreadedChecker,
 	BuildFlag_ShowDebugMessages,
 	BuildFlag_DidYouMeanLimit,
 
@@ -611,6 +612,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_UseSeparateModules,      str_lit("use-separate-modules"),      BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSingleModule,         str_lit("use-single-module"),         BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_NoThreadedChecker,       str_lit("no-threaded-checker"),       BuildFlagParam_None,    Command__does_check);
+	add_flag(&build_flags, BuildFlag_ThreadedChecker,         str_lit("threaded-checker"),          BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_ShowDebugMessages,       str_lit("show-debug-messages"),       BuildFlagParam_None,    Command_all);
 	add_flag(&build_flags, BuildFlag_DidYouMeanLimit,         str_lit("did-you-mean-limit"),        BuildFlagParam_Integer, Command__does_check);
 
@@ -1358,6 +1360,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 								bad_flags = true;
 							}
 							build_context.use_single_module = true;
+							break;
+						case BuildFlag_ThreadedChecker:
+							build_context.threaded_checker = true;
 							break;
 						case BuildFlag_NoThreadedChecker:
 							build_context.no_threaded_checker = true;

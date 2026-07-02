@@ -169,9 +169,12 @@ struct MutexGuard {
 
 	operator bool() const noexcept { return true; }
 
-	BlockingMutex *bm;
-	RecursiveMutex *rm;
-	RwMutex *rwm;
+	// Must be null-initialized: each constructor sets exactly one of these,
+	// and the destructor probes them in order — an uninitialized `bm` made a
+	// RecursiveMutex guard unlock stack garbage.
+	BlockingMutex *bm = nullptr;
+	RecursiveMutex *rm = nullptr;
+	RwMutex *rwm = nullptr;
 };
 
 #define MUTEX_GUARD_BLOCK(m) if (MutexGuard GB_DEFER_3(_mutex_guard_){m})

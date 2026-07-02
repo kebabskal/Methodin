@@ -372,6 +372,18 @@ gb_internal void check_scope_decls(CheckerContext *c, Slice<Ast *> const &nodes,
 	}
 }
 
+// Methodin: polymorphic trial-matching MUTATES shared state — 
+// polymorphic_assign_index rewrites the generic scope's entity in place
+// (TypeName -> Constant) and the Type_Generic branch of
+// is_polymorphic_type_assignable memmoves over the shared poly Type. With the
+// threaded checker, two proc bodies scoring the same polymorphic candidate
+// (every methodin method group member) race on that state. Serialize all
+// polymorphic matching under one recursive mutex; ordinary (non-poly)
+// checking stays fully parallel. Lock ordering: this mutex is OUTER to the
+// per-entity gen_procs_mutex (find_or_generate_polymorphic_procedure takes
+// this first), so the two can never deadlock against each other.
+gb_global RecursiveMutex global_poly_match_mutex;
+
 gb_internal bool find_or_generate_polymorphic_procedure(CheckerContext *old_c, Entity *base_entity, Type *type,
                                                         Array<Operand> const *param_operands, Ast *poly_def_node, PolyProcData *poly_proc_data) {
 	///////////////////////////////////////////////////////////////////////////////
@@ -385,6 +397,11 @@ gb_internal bool find_or_generate_polymorphic_procedure(CheckerContext *old_c, E
 	if (base_entity == nullptr) {
 		return false;
 	}
+
+	// Lock ordering: global_poly_match_mutex (outer, recursive) before the
+	// per-entity gen_procs_mutex taken below — see the comment at
+	// global_poly_match_mutex.
+	MutexGuard poly_guard(&global_poly_match_mutex);
 
 	if (!is_type_proc(base_entity->type)) {
 		return false;
@@ -466,8 +483,14 @@ gb_internal bool find_or_generate_polymorphic_procedure(CheckerContext *old_c, E
 
 	// NOTE(bill): This is slightly memory leaking if the type already exists
 	// Maybe it's better to check with the previous types first?
+	//
+	// Clone the proc-type node for this trial: check_procedure_type mutates
+	// the node (scope association, cached types), and `pt->node` is the base
+	// entity's SHARED signature AST — concurrent instantiation attempts of
+	// the same polymorphic proc raced on it (the slow path below already
+	// clones for exactly this reason).
 	Type *final_proc_type = alloc_type_proc(scope, nullptr, 0, nullptr, 0, false, pt->calling_convention);
-	bool success = check_procedure_type(&nctx, final_proc_type, pt->node, &operands);
+	bool success = check_procedure_type(&nctx, final_proc_type, clone_ast(pt->node), &operands);
 
 	if (!success) {
 		return false;
@@ -1416,6 +1439,11 @@ gb_internal bool polymorphic_assign_index(Type **gt_, i64 *dst_count, i64 source
 }
 
 gb_internal bool is_polymorphic_type_assignable(CheckerContext *c, Type *poly, Type *source, bool compound, bool modify_type) {
+	// See global_poly_match_mutex above. Recursive: this proc self-recurses
+	// and re-enters through check_type_specialization_to /
+	// find_or_generate_polymorphic_procedure.
+	MutexGuard guard(&global_poly_match_mutex);
+
 	Operand o = {Addressing_Value};
 	o.type = source;
 	switch (poly->kind) {
