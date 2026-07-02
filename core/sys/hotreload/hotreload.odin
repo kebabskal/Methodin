@@ -18,6 +18,7 @@
 // — live in `hotreload_unix.odin` / `hotreload_windows.odin`.
 package hot_reload
 
+import "base:intrinsics"
 import "base:runtime"
 import "core:dynlib"
 import "core:fmt"
@@ -212,7 +213,11 @@ _reload :: proc() {
 	hook: rawptr
 	for e in g.entries {
 		if addr, found := dynlib.symbol_address(lib, string(e.name)); found && addr != nil {
-			e.slot^ = addr
+			// Release store paired with the monotonic slot loads the compiler
+			// emits at call sites: the main thread must not observe the new
+			// pointer before the dylib's code is fully mapped, and the store
+			// itself must not tear on weakly-ordered targets.
+			intrinsics.atomic_store_explicit(e.slot, addr, .Release)
 			swapped += 1
 			if _is_hook(string(e.name)) {
 				hook = addr
