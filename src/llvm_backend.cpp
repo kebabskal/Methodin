@@ -434,6 +434,75 @@ gb_internal u64 lb_hot_reload_signature(CheckerInfo *info) {
 	u64 h = FNV_OFFSET;
 	h = fold(h, cast(u8 const *)&globals_acc, gb_size_of(globals_acc));
 
+	// Named types declared at file scope in the initial package: any edit to them is a
+	// rude edit. Live state — the shared globals AND every heap object the old code
+	// allocated — keeps the old layout, so swapped-in code compiled against a new layout
+	// reads garbage at shifted offsets. The name-based canonical hash above cannot see
+	// this (`World` hashes as "World" whatever its fields are); this exact gap produced
+	// first-frame crashes after editing a struct's fields. Two folds per type:
+	//   - the declaration's source tokens, which catch field edits, enum renumbering,
+	//     and polymorphic template edits, and
+	//   - the computed size/align/field offsets, which catch layout shifts caused by
+	//     types from OTHER packages the declaration merely embeds.
+	// XOR-accumulated per entity for order independence; the set (file-scope type decls
+	// of one package) is stable across builds, and the file path is folded in so two
+	// identical `@(private="file")` decls in different files can't cancel.
+	u64 types_acc = 0;
+	for (Entity *e : info->entities) {
+		if (e == nullptr || e->kind != Entity_TypeName || e->pkg != info->init_package) {
+			continue;
+		}
+		if (e->scope == nullptr || (e->scope->flags & ScopeFlag_File) == 0) {
+			continue;
+		}
+		if (e->type == nullptr) {
+			continue;
+		}
+
+		u64 th = FNV_OFFSET;
+		th = fold(th, e->token.string.text, e->token.string.len);
+		if (e->file != nullptr) {
+			th = fold(th, e->file->fullpath.text, e->file->fullpath.len);
+		}
+
+		DeclInfo *d = decl_info_of_entity(e);
+		if (d != nullptr && d->decl_node != nullptr && e->file != nullptr) {
+			i32 lo = ast_token(d->decl_node).pos.offset;
+			i32 hi = ast_end_token(d->decl_node).pos.offset;
+			for (Token const &t : e->file->tokens) {
+				if (t.pos.offset >= lo && t.pos.offset <= hi) {
+					th = fold(th, t.string.text, t.string.len);
+					th = fold(th, cast(u8 const *)" ", 1);
+				}
+			}
+		}
+
+		if (!is_type_polymorphic(e->type)) {
+			i64 sz = type_size_of(e->type);
+			i64 al = type_align_of(e->type);
+			th = fold(th, cast(u8 const *)&sz, gb_size_of(sz));
+			th = fold(th, cast(u8 const *)&al, gb_size_of(al));
+
+			Type *bt = base_type(e->type);
+			if (bt != nullptr && bt->kind == Type_Struct && type_set_offsets(bt) && bt->Struct.offsets != nullptr) {
+				for_array(i, bt->Struct.fields) {
+					Entity *field = bt->Struct.fields[i];
+					if (field == nullptr) {
+						continue;
+					}
+					th = fold(th, field->token.string.text, field->token.string.len);
+					u64 fth = type_hash_canonical_type(field->type);
+					th = fold(th, cast(u8 const *)&fth, gb_size_of(fth));
+					i64 off = bt->Struct.offsets[i];
+					th = fold(th, cast(u8 const *)&off, gb_size_of(off));
+				}
+			}
+		}
+
+		types_acc ^= th;
+	}
+	h = fold(h, cast(u8 const *)&types_acc, gb_size_of(types_acc));
+
 	// `main`'s body: looked up by name (entry_point is null in reload builds), so both builds
 	// hash the same thing. Editing the loop changes the body tokens -> signature changes.
 	if (info->init_package != nullptr && info->init_package->scope != nullptr) {
