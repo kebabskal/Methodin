@@ -2906,6 +2906,14 @@ gb_internal ExactValue exact_bit_set_all_set_mask(Type *type) {
 gb_internal void check_unary_expr(CheckerContext *c, Operand *o, Token op, Ast *node) {
 	switch (op.kind) {
 	case Token_And: { // Pointer address
+		if ((node->state_flags & StateFlag_AddrOfTemporary) != 0 && o->mode != Addressing_Invalid) {
+			// Methodin: synthesized UFCS receiver over a temporary. Codegen
+			// materializes a hidden local; only created for methods proven
+			// not to mutate their receiver, so the copy is unobservable.
+			o->mode = Addressing_Value;
+			o->type = alloc_type_pointer(o->type);
+			return;
+		}
 		if (check_is_not_addressable(c, o)) {
 			if (ast_node_expect(node, Ast_UnaryExpr)) {
 				ast_node(ue, UnaryExpr, node);
@@ -5836,6 +5844,340 @@ gb_internal AstPackage *ufcs_owning_package(CheckerContext *c, Type *t) {
 	return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Methodin: rvalue receivers — syntactic "does this method mutate its
+// receiver" analysis. A method call on a temporary (function result, constant,
+// literal, immutable parameter) materializes a hidden local for the `^self`
+// receiver; that is only sound when the method never writes through it, so
+// mutation must be decided before allowing the call. The analysis is purely
+// syntactic (the callee's body may not be checked yet): a write is any
+// assignment whose root is the receiver param or a bare receiver-field name
+// (`using self` makes field writes look like locals; local shadowing is
+// ignored, erring toward "mutates"), any address-taken receiver/field (the
+// alias can escape), any slice of a field, the receiver passed as a call
+// argument (it is a pointer), and any construct the walker does not
+// understand. Sibling calls (`self.m()`, the parse-time rewrite) recurse into
+// `Struct__m` through the receiver type's `using` chain; unresolvable calls
+// count as mutating.
+// ---------------------------------------------------------------------------
+
+struct ReceiverMutationCtx {
+	CheckerInfo *info;
+	String       receiver_name;   // first param ("self" for lifted methods)
+	StringSet    field_names;     // transitive field names of the call-site receiver type
+	Type *       receiver_type;   // named struct type, for sibling-call lookup
+	bool         mutates;
+	Token        evidence;
+	String       evidence_desc;
+};
+
+gb_internal bool proc_lit_mutates_receiver(CheckerInfo *info, Ast *proc_lit, Type *receiver_type, Token *evidence_, String *evidence_desc_);
+
+gb_internal Ast *rm_root_ident(Ast *expr) {
+	for (;;) {
+		if (expr == nullptr) return nullptr;
+		switch (expr->kind) {
+		case Ast_Ident:        return expr;
+		case Ast_ParenExpr:    expr = expr->ParenExpr.expr;    break;
+		case Ast_SelectorExpr: expr = expr->SelectorExpr.expr; break;
+		case Ast_IndexExpr:    expr = expr->IndexExpr.expr;    break;
+		case Ast_DerefExpr:    expr = expr->DerefExpr.expr;    break;
+		case Ast_TypeAssertion: expr = expr->TypeAssertion.expr; break;
+		default:               return nullptr;
+		}
+	}
+}
+
+gb_internal bool rm_is_receiver_rooted(ReceiverMutationCtx *ctx, Ast *expr) {
+	Ast *root = rm_root_ident(expr);
+	if (root == nullptr) return false;
+	String name = root->Ident.token.string;
+	if (name == ctx->receiver_name) return true;
+	return string_set_exists(&ctx->field_names, name);
+}
+
+gb_internal void rm_mark(ReceiverMutationCtx *ctx, Ast *node, char const *what_fmt, String what) {
+	if (ctx->mutates) return;
+	ctx->mutates = true;
+	ctx->evidence = ast_token(node);
+	gbString d = gb_string_make(permanent_allocator(), "");
+	d = gb_string_append_fmt(d, what_fmt, LIT(what));
+	ctx->evidence_desc = make_string_c(d);
+}
+
+gb_internal void rm_walk(ReceiverMutationCtx *ctx, Ast *node);
+
+gb_internal void rm_walk_array(ReceiverMutationCtx *ctx, Slice<Ast *> const &nodes) {
+	for (Ast *n : nodes) {
+		if (ctx->mutates) return;
+		rm_walk(ctx, n);
+	}
+}
+
+// Resolve a sibling call `self.m(...)` to the lifted `Struct__m` proc-lit,
+// walking the receiver type's offset-0 `using` chain like the dispatchers do.
+gb_internal Ast *rm_find_sibling_method_proc_lit(ReceiverMutationCtx *ctx, String method_name) {
+	Type *t = ctx->receiver_type;
+	for (isize depth = 0; depth < 16; depth++) {
+		if (t == nullptr || t->kind != Type_Named || t->Named.type_name == nullptr) return nullptr;
+		Entity *tn = t->Named.type_name;
+		String mangled = mangle_method_name(tn->token.string, method_name);
+		Entity *e = scope_lookup(tn->scope, string_interner_insert(mangled), 0);
+		if (e != nullptr && e->kind == Entity_Procedure) {
+			DeclInfo *d = decl_info_of_entity(e);
+			if (d != nullptr && d->proc_lit != nullptr && d->proc_lit->kind == Ast_ProcLit) {
+				return d->proc_lit;
+			}
+			return nullptr;
+		}
+		Type *bt = base_type(t);
+		if (bt == nullptr || bt->kind != Type_Struct || bt->Struct.fields.count == 0) return nullptr;
+		Entity *f0 = bt->Struct.fields[0];
+		if (f0 == nullptr || (f0->flags & EntityFlag_Using) == 0) return nullptr;
+		t = f0->type;
+	}
+	return nullptr;
+}
+
+gb_internal void rm_walk_call(ReceiverMutationCtx *ctx, Ast *node) {
+	Ast *callee = node->CallExpr.proc;
+
+	// `self.m(...)` — the parse-time sibling rewrite. Recurse into m.
+	bool handled_callee = false;
+	if (callee != nullptr && callee->kind == Ast_SelectorExpr) {
+		Ast *base = callee->SelectorExpr.expr;
+		Ast *sel  = callee->SelectorExpr.selector;
+		if (base != nullptr && base->kind == Ast_Ident &&
+		    base->Ident.token.string == ctx->receiver_name &&
+		    sel != nullptr && sel->kind == Ast_Ident) {
+			handled_callee = true;
+			String mname = sel->Ident.token.string;
+			Ast *sib = rm_find_sibling_method_proc_lit(ctx, mname);
+			if (sib == nullptr) {
+				rm_mark(ctx, node, "calls '%.*s', which could not be analyzed", mname);
+			} else {
+				Token ev = {}; String ed = {};
+				if (proc_lit_mutates_receiver(ctx->info, sib, ctx->receiver_type, &ev, &ed)) {
+					rm_mark(ctx, node, "calls mutating method '%.*s'", mname);
+				}
+			}
+		}
+	}
+	if (!handled_callee) {
+		rm_walk(ctx, callee);
+	}
+
+	for (Ast *arg : node->CallExpr.args) {
+		if (ctx->mutates) return;
+		Ast *a = arg;
+		if (a != nullptr && a->kind == Ast_FieldValue) a = a->FieldValue.value;
+		if (a == nullptr) continue;
+		Ast *root = rm_root_ident(a);
+		if (root != nullptr && root->Ident.token.string == ctx->receiver_name && a->kind == Ast_Ident) {
+			// Passing `self` itself: it IS a pointer, the callee can write.
+			rm_mark(ctx, node, "passes '%.*s' (a pointer) to another procedure", ctx->receiver_name);
+			return;
+		}
+		if (a->kind == Ast_SliceExpr && rm_is_receiver_rooted(ctx, a->SliceExpr.expr)) {
+			rm_mark(ctx, node, "passes a slice of the receiver's data%.*s", str_lit(""));
+			return;
+		}
+		rm_walk(ctx, a);
+	}
+}
+
+gb_internal void rm_walk(ReceiverMutationCtx *ctx, Ast *node) {
+	if (node == nullptr || ctx->mutates) return;
+
+	switch (node->kind) {
+	case Ast_Ident: case Ast_BasicLit: case Ast_BasicDirective:
+	case Ast_Implicit: case Ast_Uninit: case Ast_EmptyStmt: case Ast_BadExpr: case Ast_BadStmt:
+	case Ast_ImplicitSelectorExpr:
+		return;
+
+	case Ast_AssignStmt:
+		for (Ast *lhs : node->AssignStmt.lhs) {
+			if (rm_is_receiver_rooted(ctx, lhs)) {
+				Ast *root = rm_root_ident(lhs);
+				rm_mark(ctx, lhs, "'%.*s' is written", root->Ident.token.string);
+				return;
+			}
+		}
+		rm_walk_array(ctx, node->AssignStmt.lhs); // index exprs etc. may contain calls
+		rm_walk_array(ctx, node->AssignStmt.rhs);
+		return;
+
+	case Ast_UnaryExpr:
+		if (node->UnaryExpr.op.kind == Token_And && rm_is_receiver_rooted(ctx, node->UnaryExpr.expr)) {
+			Ast *root = rm_root_ident(node->UnaryExpr.expr);
+			rm_mark(ctx, node, "the address of '%.*s' is taken", root->Ident.token.string);
+			return;
+		}
+		rm_walk(ctx, node->UnaryExpr.expr);
+		return;
+
+	case Ast_CallExpr:
+		rm_walk_call(ctx, node);
+		return;
+
+	case Ast_BlockStmt:      rm_walk_array(ctx, node->BlockStmt.stmts); return;
+	case Ast_ExprStmt:       rm_walk(ctx, node->ExprStmt.expr); return;
+	case Ast_ReturnStmt:     rm_walk_array(ctx, node->ReturnStmt.results); return;
+	case Ast_DeferStmt:      rm_walk(ctx, node->DeferStmt.stmt); return;
+	case Ast_IfStmt:
+		rm_walk(ctx, node->IfStmt.init); rm_walk(ctx, node->IfStmt.cond);
+		rm_walk(ctx, node->IfStmt.body); rm_walk(ctx, node->IfStmt.else_stmt);
+		return;
+	case Ast_ForStmt:
+		rm_walk(ctx, node->ForStmt.init); rm_walk(ctx, node->ForStmt.cond);
+		rm_walk(ctx, node->ForStmt.post); rm_walk(ctx, node->ForStmt.body);
+		return;
+	case Ast_RangeStmt:
+		// `for &e in field` hands out mutable element references.
+		for (Ast *val : node->RangeStmt.vals) {
+			if (val != nullptr && val->kind == Ast_UnaryExpr && val->UnaryExpr.op.kind == Token_And) {
+				if (rm_is_receiver_rooted(ctx, node->RangeStmt.expr)) {
+					rm_mark(ctx, node, "iterates the receiver's data by reference%.*s", str_lit(""));
+					return;
+				}
+			}
+		}
+		rm_walk(ctx, node->RangeStmt.expr); rm_walk(ctx, node->RangeStmt.body);
+		return;
+	case Ast_UnrollRangeStmt:
+		rm_walk(ctx, node->UnrollRangeStmt.expr); rm_walk(ctx, node->UnrollRangeStmt.body);
+		return;
+	case Ast_SwitchStmt:
+		rm_walk(ctx, node->SwitchStmt.init); rm_walk(ctx, node->SwitchStmt.tag);
+		rm_walk(ctx, node->SwitchStmt.body);
+		return;
+	case Ast_TypeSwitchStmt:
+		rm_walk(ctx, node->TypeSwitchStmt.tag); rm_walk(ctx, node->TypeSwitchStmt.body);
+		return;
+	case Ast_CaseClause:
+		rm_walk_array(ctx, node->CaseClause.list); rm_walk_array(ctx, node->CaseClause.stmts);
+		return;
+	case Ast_WhenStmt:
+		rm_walk(ctx, node->WhenStmt.cond); rm_walk(ctx, node->WhenStmt.body);
+		rm_walk(ctx, node->WhenStmt.else_stmt);
+		return;
+	case Ast_ValueDecl:      rm_walk_array(ctx, node->ValueDecl.values); return;
+	case Ast_UsingStmt:      rm_walk_array(ctx, node->UsingStmt.list); return;
+	case Ast_BinaryExpr:
+		rm_walk(ctx, node->BinaryExpr.left); rm_walk(ctx, node->BinaryExpr.right);
+		return;
+	case Ast_ParenExpr:      rm_walk(ctx, node->ParenExpr.expr); return;
+	case Ast_SelectorExpr:   rm_walk(ctx, node->SelectorExpr.expr); return;
+	case Ast_SelectorCallExpr:
+		rm_walk(ctx, node->SelectorCallExpr.expr); rm_walk(ctx, node->SelectorCallExpr.call);
+		return;
+	case Ast_IndexExpr:
+		rm_walk(ctx, node->IndexExpr.expr); rm_walk(ctx, node->IndexExpr.index);
+		return;
+	case Ast_MatrixIndexExpr:
+		rm_walk(ctx, node->MatrixIndexExpr.expr);
+		rm_walk(ctx, node->MatrixIndexExpr.row_index); rm_walk(ctx, node->MatrixIndexExpr.column_index);
+		return;
+	case Ast_DerefExpr:      rm_walk(ctx, node->DerefExpr.expr); return;
+	case Ast_SliceExpr:
+		rm_walk(ctx, node->SliceExpr.expr); rm_walk(ctx, node->SliceExpr.low); rm_walk(ctx, node->SliceExpr.high);
+		return;
+	case Ast_CompoundLit:    rm_walk_array(ctx, node->CompoundLit.elems); return;
+	case Ast_FieldValue:     rm_walk(ctx, node->FieldValue.value); return;
+	case Ast_TernaryIfExpr:
+		rm_walk(ctx, node->TernaryIfExpr.x); rm_walk(ctx, node->TernaryIfExpr.cond); rm_walk(ctx, node->TernaryIfExpr.y);
+		return;
+	case Ast_TernaryWhenExpr:
+		rm_walk(ctx, node->TernaryWhenExpr.x); rm_walk(ctx, node->TernaryWhenExpr.cond); rm_walk(ctx, node->TernaryWhenExpr.y);
+		return;
+	case Ast_TypeAssertion:  rm_walk(ctx, node->TypeAssertion.expr); return;
+	case Ast_TypeCast:       rm_walk(ctx, node->TypeCast.expr); return;
+	case Ast_AutoCast:       rm_walk(ctx, node->AutoCast.expr); return;
+	case Ast_OrElseExpr:
+		rm_walk(ctx, node->OrElseExpr.x); rm_walk(ctx, node->OrElseExpr.y);
+		return;
+	case Ast_OrReturnExpr:   rm_walk(ctx, node->OrReturnExpr.expr); return;
+	case Ast_OrBranchExpr:   rm_walk(ctx, node->OrBranchExpr.expr); return;
+	case Ast_BranchStmt:     return;
+	case Ast_ProcLit:        return; // nested proc owns its own receiver rules
+	}
+
+	// Anything the walker doesn't understand counts as mutating — this
+	// analysis gates soundness, so unknown constructs must not slip through.
+	rm_mark(ctx, node, "contains a construct the analysis cannot prove read-only%.*s", str_lit(""));
+}
+
+gb_internal bool proc_lit_mutates_receiver(CheckerInfo *info, Ast *proc_lit, Type *receiver_type, Token *evidence_, String *evidence_desc_) {
+	if (proc_lit == nullptr || proc_lit->kind != Ast_ProcLit) return true;
+
+	mutex_lock(&info->receiver_mutation_mutex);
+	ReceiverMutation *cached = map_get(&info->receiver_mutation_cache, proc_lit);
+	if (cached != nullptr) {
+		ReceiverMutation rm = *cached;
+		mutex_unlock(&info->receiver_mutation_mutex);
+		if (rm.in_progress) {
+			// Recursion cycle: the cycle itself proves nothing; the caller's
+			// remaining statements still get scanned.
+			return false;
+		}
+		if (evidence_)      *evidence_      = rm.evidence;
+		if (evidence_desc_) *evidence_desc_ = rm.evidence_desc;
+		return rm.mutates;
+	}
+	ReceiverMutation sentinel = {};
+	sentinel.in_progress = true;
+	map_set(&info->receiver_mutation_cache, proc_lit, sentinel);
+	mutex_unlock(&info->receiver_mutation_mutex);
+
+	ReceiverMutationCtx ctx = {};
+	ctx.info = info;
+	ctx.receiver_type = receiver_type;
+	string_set_init(&ctx.field_names);
+	defer (string_set_destroy(&ctx.field_names));
+	// Receiver param name: first param's first name.
+	ctx.receiver_name = str_lit("self");
+	Ast *pt = proc_lit->ProcLit.type;
+	if (pt != nullptr && pt->kind == Ast_ProcType &&
+	    pt->ProcType.params != nullptr && pt->ProcType.params->kind == Ast_FieldList &&
+	    pt->ProcType.params->FieldList.list.count > 0) {
+		Ast *f0 = pt->ProcType.params->FieldList.list[0];
+		if (f0->kind == Ast_Field && f0->Field.names.count > 0 && f0->Field.names[0]->kind == Ast_Ident) {
+			ctx.receiver_name = f0->Field.names[0]->Ident.token.string;
+		}
+	}
+
+	// Transitive field names of the receiver type (bare `using self` writes).
+	{
+		Type *t = receiver_type;
+		for (isize depth = 0; depth < 64; depth++) {
+			Type *bt = base_type(t);
+			if (bt == nullptr || bt->kind != Type_Struct) break;
+			for (Entity *f : bt->Struct.fields) {
+				if (f == nullptr) continue;
+				string_set_add(&ctx.field_names, f->token.string);
+			}
+			if (bt->Struct.fields.count == 0) break;
+			Entity *f0 = bt->Struct.fields[0];
+			if (f0 == nullptr || (f0->flags & EntityFlag_Using) == 0) break;
+			t = f0->type;
+		}
+	}
+
+	rm_walk(&ctx, proc_lit->ProcLit.body);
+
+	ReceiverMutation rm = {};
+	rm.mutates       = ctx.mutates;
+	rm.evidence      = ctx.evidence;
+	rm.evidence_desc = ctx.evidence_desc;
+	mutex_lock(&info->receiver_mutation_mutex);
+	map_set(&info->receiver_mutation_cache, proc_lit, rm);
+	mutex_unlock(&info->receiver_mutation_mutex);
+
+	if (evidence_)      *evidence_      = rm.evidence;
+	if (evidence_desc_) *evidence_desc_ = rm.evidence_desc;
+	return rm.mutates;
+}
+
 // try_ufcs_resolve_at performs a single-package UFCS lookup. On success it
 // writes the resolved procedure entity to *out_entity and the (possibly
 // auto-&'d / auto-*'d) receiver expression to *out_first_arg and returns
@@ -5921,12 +6263,78 @@ gb_internal bool try_ufcs_resolve_at(CheckerContext *c, AstPackage *pkg,
 		}
 	}
 
+	// Methodin: rvalue receivers. When the receiver is a temporary (function
+	// result, constant, literal, immutable parameter) and only a pointer
+	// first-parameter matches, the call is still allowed IF the method never
+	// mutates its receiver: the checker synthesizes `&recv` flagged
+	// StateFlag_AddrOfTemporary and codegen materializes a hidden local.
+	// A mutating method is recorded so check_selector can explain exactly why
+	// the call is refused instead of saying "no field or method".
+	bool ok_addrof_temp = false;
+	if (!ok_asis && !ok_addrof && !ok_deref && !can_addrof &&
+	    (recv_mode == Addressing_Value || recv_mode == Addressing_Constant)) {
+		bool t_asis = false, t_deref = false, t_addrof = false;
+		if (e->kind == Entity_Procedure) {
+			Type *pt = base_type(e->type);
+			if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.param_count > 0) {
+				try_match(pt->Proc.params->Tuple.variables[0]->type,
+				          y, z, false, w, /*can_addrof*/true,
+				          &t_asis, &t_deref, &t_addrof);
+			}
+		} else {
+			for (Entity *m : e->ProcGroup.entities) {
+				if (m == nullptr || m->type == nullptr) continue;
+				Type *pt = base_type(m->type);
+				if (pt == nullptr || pt->kind != Type_Proc || pt->Proc.param_count == 0) continue;
+				try_match(pt->Proc.params->Tuple.variables[0]->type,
+				          y, z, false, w, /*can_addrof*/true,
+				          &t_asis, &t_deref, &t_addrof);
+			}
+		}
+		if (t_addrof) {
+			// Every pointer-receiver candidate must be provably non-mutating.
+			Type *recv_deref = type_deref(recv_type);
+			bool mutates = false;
+			Token evidence = {};
+			String evidence_desc = {};
+			auto candidate_mutates = [&](Entity *cand) -> bool {
+				if (cand == nullptr || cand->kind != Entity_Procedure) return true;
+				Type *pt = base_type(cand->type);
+				if (pt == nullptr || pt->kind != Type_Proc || pt->Proc.param_count == 0) return true;
+				if (!is_type_pointer(pt->Proc.params->Tuple.variables[0]->type)) return false;
+				DeclInfo *d = decl_info_of_entity(cand);
+				Ast *pl = (d != nullptr) ? d->proc_lit : nullptr;
+				return proc_lit_mutates_receiver(c->info, pl, recv_deref, &evidence, &evidence_desc);
+			};
+			if (e->kind == Entity_Procedure) {
+				mutates = candidate_mutates(e);
+			} else {
+				for (Entity *m : e->ProcGroup.entities) {
+					if (candidate_mutates(m)) { mutates = true; break; }
+				}
+			}
+			if (mutates) {
+				if (c->ufcs_temp_mutating_entity == nullptr) {
+					c->ufcs_temp_mutating_entity   = e;
+					c->ufcs_temp_mutating_evidence = evidence;
+					c->ufcs_temp_mutating_desc     = evidence_desc;
+				}
+				return false;
+			}
+			ok_addrof_temp = true;
+		}
+	}
+
 	Ast *first_arg = recv_expr;
 	if (ok_asis) {
 		// Pass receiver as-is.
 	} else if (ok_addrof) {
 		Token op = {Token_And};
 		first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
+	} else if (ok_addrof_temp) {
+		Token op = {Token_And};
+		first_arg = ast_unary_expr(first_arg->file(), op, first_arg);
+		first_arg->state_flags |= StateFlag_AddrOfTemporary;
 	} else if (ok_deref) {
 		Token op = {Token_Pointer};
 		first_arg = ast_deref_expr(first_arg->file(), first_arg, op);
@@ -5940,7 +6348,7 @@ gb_internal bool try_ufcs_resolve_at(CheckerContext *c, AstPackage *pkg,
 	// and keep matching by name so the real call checker can report a precise
 	// argument-type error.
 	if (out_type_matched != nullptr) {
-		*out_type_matched = ok_asis || ok_addrof || ok_deref;
+		*out_type_matched = ok_asis || ok_addrof || ok_deref || ok_addrof_temp;
 	}
 
 	*out_entity = e;
@@ -6466,6 +6874,23 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 			}
 		}
 
+		if (resolved == nullptr && fallback_resolved == nullptr &&
+		    c->ufcs_temp_mutating_entity != nullptr && c->ufcs_call_node == node) {
+			ERROR_BLOCK();
+			gbString op_str  = expr_to_string(op_expr);
+			gbString sel_str = expr_to_string(selector);
+			error(op_expr, "Cannot call '%s' on '%s', which is a temporary value: the method mutates its receiver and the mutation would be lost", sel_str, op_str);
+			if (c->ufcs_temp_mutating_desc.len > 0 && c->ufcs_temp_mutating_evidence.pos.line > 0) {
+				error_line("\t%.*s at %s\n", LIT(c->ufcs_temp_mutating_desc), token_pos_to_string(c->ufcs_temp_mutating_evidence.pos));
+			}
+			error_line("\tSuggestion: store the value in a variable first, then call the method on it\n");
+			gb_string_free(sel_str);
+			gb_string_free(op_str);
+			operand->mode = Addressing_Invalid;
+			expr_entity = nullptr;
+			return nullptr;
+		}
+
 		if (resolved == nullptr && fallback_resolved != nullptr) {
 			// No tier produced a type-correct candidate; bind the by-name hit
 			// so the call checker reports a precise argument-type error
@@ -6583,7 +7008,12 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 		return nullptr;
 	}
 
-	if (expr_entity != nullptr && expr_entity->kind == Entity_Constant && entity->kind != Entity_Constant) {
+	// Methodin: a UFCS method resolved on a constant receiver (rvalue
+	// receiver, e.g. `Vec3.UP.scaled(2)`) is not a constant field access.
+	bool ufcs_resolved_here = (c->ufcs_call_node == node && entity == c->ufcs_entity && entity != nullptr);
+
+	if (!ufcs_resolved_here &&
+	    expr_entity != nullptr && expr_entity->kind == Entity_Constant && entity->kind != Entity_Constant) {
 		bool success = false;
 		ExactValue field_value = get_constant_field(c, operand, sel, &success);
 		if (success) {
@@ -6608,7 +7038,7 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 		return nullptr;
 	}
 
-	if (operand->mode == Addressing_Constant && entity->kind != Entity_Constant) {
+	if (!ufcs_resolved_here && operand->mode == Addressing_Constant && entity->kind != Entity_Constant) {
 		bool success = false;
 		ExactValue field_value = get_constant_field(c, operand, sel, &success);
 		if (success) {
@@ -9411,6 +9841,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 	} else {
 		if (proc != nullptr) {
 			Ast *  prev_ufcs_call_node    = c->ufcs_call_node;
+			Entity *prev_ufcs_temp_mut    = c->ufcs_temp_mutating_entity;
 			Ast *  prev_ufcs_first_arg    = c->ufcs_first_arg;
 			Entity *prev_ufcs_entity      = c->ufcs_entity;
 			Ast *  prev_ufcs_au_recv      = c->ufcs_auto_union_recv;
@@ -9418,6 +9849,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 			bool try_ufcs = proc->kind == Ast_SelectorExpr && proc->SelectorExpr.token.kind == Token_Period;
 			if (try_ufcs) {
 				c->ufcs_call_node    = proc;
+				c->ufcs_temp_mutating_entity = nullptr;
 				c->ufcs_first_arg    = nullptr;
 				c->ufcs_entity       = nullptr;
 				c->ufcs_auto_union_recv = nullptr;
@@ -9509,6 +9941,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 							operand->value = {};
 
 							c->ufcs_call_node    = prev_ufcs_call_node;
+							c->ufcs_temp_mutating_entity = prev_ufcs_temp_mut;
 							c->ufcs_first_arg    = prev_ufcs_first_arg;
 							c->ufcs_entity       = prev_ufcs_entity;
 							c->ufcs_auto_union_recv = prev_ufcs_au_recv;
@@ -9560,6 +9993,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 				}
 			}
 			c->ufcs_call_node    = prev_ufcs_call_node;
+			c->ufcs_temp_mutating_entity = prev_ufcs_temp_mut;
 			c->ufcs_first_arg    = prev_ufcs_first_arg;
 			c->ufcs_entity       = prev_ufcs_entity;
 			c->ufcs_auto_union_recv = prev_ufcs_au_recv;

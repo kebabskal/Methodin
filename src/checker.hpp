@@ -628,6 +628,14 @@ struct UntypedExprInfo {
 
 typedef PtrMap<Ast *, ExprInfo *> UntypedExprInfoMap; 
 
+// Methodin: result of the syntactic receiver-mutation analysis.
+struct ReceiverMutation {
+	bool   in_progress;   // cycle sentinel: this proc-lit is being analyzed higher in the stack
+	bool   mutates;
+	Token  evidence;      // where the mutation happens
+	String evidence_desc; // what is mutated ("hp", "self", "call to 'heal'")
+};
+
 enum ObjcMsgKind : u32 {
 	ObjcMsg_normal,
 	ObjcMsg_fpret,
@@ -783,6 +791,11 @@ struct CheckerInfo {
 	BlockingMutex    auto_union_dispatch_mutex;
 	StringMap<Ast *> auto_union_dispatch_cache;
 
+	// Methodin: memoized "does this method mutate its receiver" analysis
+	// (rvalue receivers). Key: the ProcLit node.
+	BlockingMutex               receiver_mutation_mutex;
+	PtrMap<Ast *, ReceiverMutation> receiver_mutation_cache;
+
 	MPSCQueue<ProcInfo *> all_procedures_queue;
 	Array<ProcInfo *> all_procedures;
 
@@ -866,6 +879,13 @@ struct CheckerContext {
 	// from selector resolution to the call assembly.
 	Ast *      ufcs_auto_union_recv;
 	Type *     ufcs_auto_union_type;
+	// Methodin: rvalue receivers. When the only way to bind `x.m()` was
+	// taking the address of a temporary but `m` mutates its receiver, the
+	// resolution records the rejected candidate here; check_selector emits a
+	// rich "would mutate a temporary" error if no other tier resolves.
+	Entity *   ufcs_temp_mutating_entity;
+	Token      ufcs_temp_mutating_evidence;
+	String     ufcs_temp_mutating_desc;
 };
 
 gb_internal u64 check_vet_flags(CheckerContext *c);

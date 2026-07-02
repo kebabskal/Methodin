@@ -4105,6 +4105,17 @@ gb_internal lbValue lb_build_unary_and(lbProcedure *p, Ast *expr) {
 	ast_node(ue, UnaryExpr, expr);
 	auto tv = type_and_value_of_expr(expr);
 
+	if (expr->state_flags & StateFlag_AddrOfTemporary) {
+		// Methodin: synthesized UFCS receiver over a temporary (rvalue
+		// receiver). Materialize the value into a hidden local and pass its
+		// address; the checker only creates this for methods proven not to
+		// mutate their receiver, so the copy is unobservable.
+		lbValue value = lb_build_expr(p, ue->expr);
+		lbValue ptr = lb_address_from_load_or_generate_local(p, value);
+		ptr.type = tv.type;
+		return ptr;
+	}
+
 	Ast *ue_expr = unparen_expr(ue->expr);
 	if (ue_expr->kind == Ast_IndexExpr && tv.mode == Addressing_OptionalOkPtr && is_type_tuple(tv.type)) {
 		Type *tuple = tv.type;

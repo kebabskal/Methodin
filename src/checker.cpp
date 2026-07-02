@@ -1584,6 +1584,7 @@ gb_internal void init_checker_info(CheckerInfo *i) {
 
 	string_map_init(&i->load_file_cache);
 	string_map_init(&i->auto_union_dispatch_cache);
+	map_init(&i->receiver_mutation_cache);
 	array_init(&i->all_procedures, a);
 	mpsc_init(&i->all_procedures_queue, a);
 
@@ -1608,6 +1609,7 @@ gb_internal void destroy_checker_info(CheckerInfo *i) {
 	map_destroy(&i->global_untyped);
 	string_map_destroy(&i->foreigns);
 	string_map_destroy(&i->auto_union_dispatch_cache);
+	map_destroy(&i->receiver_mutation_cache);
 
 	type_set_destroy(&i->min_dep_type_info_set);
 	map_destroy(&i->min_dep_type_info_index_map);

@@ -355,7 +355,14 @@ enum StateFlag : u8 {
 	// (e.g. auto_union dispatcher variants from other packages, which are not
 	// in scope at the call site); check_ident uses the binding instead of a
 	// name lookup, and clone_ast preserves it.
-	StateFlag_PreResolvedIdent = 1<<4,
+	StateFlag_PreResolvedIdent = 1<<4, // meaning on Ast_Ident
+	// Methodin: this synthesized `&expr` is a UFCS receiver whose operand is
+	// a temporary (rvalue receiver): addressability checking allows it and
+	// codegen materializes a hidden local. Only ever set by the checker on
+	// nodes it creates, and only for methods proven not to mutate their
+	// receiver. Shares the bit with StateFlag_PreResolvedIdent — the two are
+	// read on disjoint node kinds (Ident vs UnaryExpr).
+	StateFlag_AddrOfTemporary = 1<<4, // meaning on Ast_UnaryExpr
 
 	StateFlag_SelectorCallExpr = 1<<5,
 	StateFlag_DirectiveWasFalse = 1<<6,
