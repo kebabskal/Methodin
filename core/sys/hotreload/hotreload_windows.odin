@@ -129,27 +129,3 @@ _quote_arg :: proc(sb: ^strings.Builder, arg: string) {
 	strings.write_byte(sb, '"')
 }
 
-// Restart by spawning a fresh `odin watch` of the same target that inherits this console, then
-// exiting. (Windows has no execv-style in-place image replacement.) This rebuilds the host with
-// the new code (new globals/main) and runs it — program state is lost, which is unavoidable for
-// a layout/loop change.
-_restart :: proc() {
-	sb := strings.builder_make(context.temp_allocator)
-	fmt.sbprintf(&sb, "\"%s\" watch \"%s\"", g.odin_path, g.src_path)
-	if g.is_file {
-		strings.write_string(&sb, " -file")
-	}
-	cmdline := win.utf8_to_wstring(strings.to_string(sb))
-
-	si: win.STARTUPINFOW
-	si.cb = size_of(win.STARTUPINFOW)
-	pi: win.PROCESS_INFORMATION
-	ok := win.CreateProcessW(nil, cmdline, nil, nil, win.TRUE, 0, nil, nil, &si, &pi)
-	if !ok {
-		fmt.eprintln("[hot-reload] restart failed; please re-run `odin watch` manually")
-		return
-	}
-	win.CloseHandle(pi.hThread)
-	win.CloseHandle(pi.hProcess)
-	os.exit(0)
-}

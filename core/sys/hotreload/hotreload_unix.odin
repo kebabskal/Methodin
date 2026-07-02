@@ -4,7 +4,6 @@ package hot_reload
 
 import "core:fmt"
 import "core:os"
-import "core:strings"
 import "core:sys/posix"
 
 // Run the reload build and report whether it succeeded. Output is captured; on failure the
@@ -37,19 +36,3 @@ _temp_lib_path :: proc(gen: int) -> string {
 	return fmt.tprintf("/tmp/.odin_hot_reload_%d_%d.dylib", int(posix.getpid()), gen)
 }
 
-// Replace the running process with a fresh `odin watch` of the same target. This rebuilds the
-// host with the new code (new globals/main) and runs it — program state is lost, which is
-// unavoidable for a layout/loop change.
-_restart :: proc() {
-	argv := make([dynamic]cstring, 0, 6, context.temp_allocator)
-	append(&argv, strings.clone_to_cstring(g.odin_path, context.temp_allocator))
-	append(&argv, "watch")
-	append(&argv, strings.clone_to_cstring(g.src_path, context.temp_allocator))
-	if g.is_file {
-		append(&argv, "-file")
-	}
-	append(&argv, nil) // execv requires a null-terminated argument vector
-	posix.execv(argv[0], raw_data(argv))
-	// execv only returns on failure.
-	fmt.eprintln("[hot-reload] restart failed; please re-run `odin watch` manually")
-}
