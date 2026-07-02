@@ -1384,9 +1384,8 @@ parse_impl_block :: proc(p: ^Parser) -> ^ast.Stmt {
 	for p.curr_tok.kind != .Close_Brace && p.curr_tok.kind != .EOF {
 		if p.curr_tok.kind != .Ident ||
 		   !peek_token_kind(p, .Colon, 0) ||
-		   !peek_token_kind(p, .Colon, 1) ||
-		   !peek_token_kind(p, .Proc,  2) {
-			error(p, p.curr_tok.pos, "expected a method declaration `name :: proc(...) {...}` inside impl block")
+		   !peek_token_kind(p, .Colon, 1) {
+			error(p, p.curr_tok.pos, "expected a `name :: ...` method or constant declaration inside impl block")
 			advance_token(p)
 			continue
 		}
@@ -2023,7 +2022,6 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 		if p.curr_tok.kind != .Ident do return false
 		if !peek_token_kind(p, .Colon, 0) do return false
 		if !peek_token_kind(p, .Colon, 1) do return false
-		if !peek_token_kind(p, .Proc,  2) do return false
 
 		docs := p.lead_comment
 		name_tok := expect_token(p, .Ident)
@@ -2104,7 +2102,8 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 
 		if allow_token(p, .Eq) {
 			default_value = parse_expr(p, false)
-			if .Default_Parameters not_in allowed_flags {
+			// Methodin: struct fields may carry constant default values.
+			if .Default_Parameters not_in allowed_flags && allowed_flags != ast.Field_Flags_Struct {
 				error(p, p.curr_tok.pos, "default parameters are only allowed for procedures")
 				default_value = nil
 			}
@@ -2112,11 +2111,6 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 
 		if default_value != nil && len(names) > 1 {
 			error(p, p.curr_tok.pos, "default parameters can only be applied to single values")
-		}
-
-		if allowed_flags == ast.Field_Flags_Struct && default_value != nil {
-			error(p, default_value.pos, "default parameters are not allowed for structs")
-			default_value = nil
 		}
 
 		if is_type_ellipsis(type) {
