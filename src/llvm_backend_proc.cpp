@@ -4864,6 +4864,13 @@ gb_internal lbValue lb_build_call_expr_internal(lbProcedure *p, Ast *expr, lbVal
 		}
 		if (hr_slot != nullptr) {
 			value = lb_emit_load(p, *hr_slot);
+			// The reload agent rewrites the slot from its watch thread while
+			// this code runs. A monotonic atomic load prevents a torn read on
+			// weakly-ordered targets and stops LLVM from hoisting the load out
+			// of a loop — a hoisted load would pin the loop to the generation
+			// that was current when it started, never observing a reload.
+			LLVMSetOrdering(value.value, LLVMAtomicOrderingMonotonic);
+			LLVMSetAlignment(value.value, cast(unsigned)build_context.ptr_size);
 		} else {
 			value = lb_build_expr(p, proc_expr);
 		}
