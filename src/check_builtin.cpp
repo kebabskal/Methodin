@@ -2816,6 +2816,67 @@ gb_internal bool type_embeds_at_offset0(Type *s, Type *target) {
 	return false;
 }
 
+// Non-forcing lookup of the entity a type expression names: a bare ident in
+// `from`'s scope chain, or `pkg.Name` through an import. Returns nullptr for
+// anything else (pointers, generics, ...), which callers treat as "not an
+// offset-0 embed".
+gb_internal Entity *auto_union_lookup_type_expr_entity(Entity *from, Ast *type_expr) {
+	type_expr = unparen_expr(type_expr);
+	if (type_expr == nullptr || from == nullptr || from->scope == nullptr) {
+		return nullptr;
+	}
+	if (type_expr->kind == Ast_Ident) {
+		return scope_lookup(from->scope, string_interner_insert(type_expr->Ident.token.string), 0);
+	}
+	if (type_expr->kind == Ast_SelectorExpr) {
+		Ast *lhs = unparen_expr(type_expr->SelectorExpr.expr);
+		Ast *sel = type_expr->SelectorExpr.selector;
+		if (lhs == nullptr || lhs->kind != Ast_Ident || sel == nullptr || sel->kind != Ast_Ident) {
+			return nullptr;
+		}
+		Entity *pkg_e = scope_lookup(from->scope, string_interner_insert(lhs->Ident.token.string), 0);
+		if (pkg_e == nullptr || pkg_e->kind != Entity_ImportName || pkg_e->ImportName.scope == nullptr) {
+			return nullptr;
+		}
+		return scope_lookup_current(pkg_e->ImportName.scope, string_interner_insert(sel->Ident.token.string));
+	}
+	return nullptr;
+}
+
+// AST-level mirror of type_embeds_at_offset0 for candidates that are
+// EntityState_InProgress and cannot be type-inspected: follow the first
+// `using` field's type *name* through further named structs. Conservative —
+// anything it cannot positively identify counts as "does not embed".
+gb_internal bool auto_union_embeds_target_by_ast(Entity *e, Type *target, isize depth) {
+	if (depth > 64) {
+		return false;
+	}
+	Entity *target_entity = nullptr;
+	if (target != nullptr && target->kind == Type_Named) {
+		target_entity = target->Named.type_name;
+	}
+	if (target_entity == nullptr) {
+		return false;
+	}
+	if (!auto_union_candidate_first_field_using(e)) {
+		return false;
+	}
+	Ast *init = unparen_expr(e->decl_info->init_expr);
+	Ast *f0 = init->StructType.fields[0];
+	Entity *fe = auto_union_lookup_type_expr_entity(e, f0->Field.type);
+	if (fe == nullptr || fe->kind != Entity_TypeName) {
+		return false;
+	}
+	if (fe == target_entity) {
+		return true;
+	}
+	// A resolved alias of the target also matches (`E :: Entity`).
+	if (fe->type != nullptr && are_types_identical(fe->type, target)) {
+		return true;
+	}
+	return auto_union_embeds_target_by_ast(fe, target, depth + 1);
+}
+
 gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, Ast *call, i32 id, Type *type_hint) {
 	ast_node(ce, CallExpr, call);
 	if (ce->inlining != ProcInlining_none) {
@@ -3410,9 +3471,19 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 				continue;
 			}
 			if (e->state == EntityState_InProgress) {
-				// Skips the auto_union being defined and anything mid-resolution
-				// (a real embedder never depends on the auto_union, so is never
-				// in-progress here).
+				// Mid-resolution — typically because resolving THIS auto_union
+				// was forced from inside the candidate's own declaration, e.g.
+				// `Enemy :: struct { using base: Entity, target: ^AnyEntity }`
+				// resolved before the alias. Its type can't be inspected yet,
+				// so decide embedding from the AST; silently dropping it made
+				// union membership depend on checker visit order. (The alias
+				// entity being defined is also in-progress, but its init is a
+				// call expression, not a struct, so the AST check rejects it.)
+				if (e->type != nullptr &&
+				    auto_union_candidate_first_field_using(e) &&
+				    auto_union_embeds_target_by_ast(e, target, 0)) {
+					array_add(&variants, e->type);
+				}
 				continue;
 			}
 			if (!auto_union_candidate_first_field_using(e)) {
@@ -3432,6 +3503,15 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 			if (type_embeds_at_offset0(e->type, target)) {
 				array_add(&variants, e->type);
 			}
+		}
+		if (variants.count == 0) {
+			// A variant-less auto_union is almost always a mistake (nothing
+			// embeds T yet), and method dispatch on it would fall back to
+			// transmuting a payload-less union — warn here where the cause
+			// is visible.
+			gbString ts = type_to_string(target);
+			warning(call, "'auto_union(%s)' has no variants: no struct in the program `using`-embeds '%s' as its first field", ts, ts);
+			gb_string_free(ts);
 		}
 		ut->Union.variants = slice_from_array(variants);
 
