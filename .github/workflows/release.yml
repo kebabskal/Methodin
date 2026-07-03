@@ -25,14 +25,18 @@ jobs:
       - uses: actions/checkout@v4
 
       # Linux/macOS builds link libLLVM dynamically — consumers of these
-      # artifacts need the matching LLVM runtime (libllvm18 / brew llvm@18).
+      # artifacts need the matching LLVM runtime (libllvm20 / brew llvm@20).
       - name: Install LLVM (Linux)
         if: runner.os == 'Linux'
-        run: wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+        run: wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
 
       - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
-        run: brew install llvm@18
+        # Pin LLVM_CONFIG explicitly — build_odin.sh otherwise grabs the
+        # highest brew llvm on the runner and the runtime dep drifts.
+        run: |
+          brew list llvm@20 &>/dev/null || brew install llvm@20
+          echo "LLVM_CONFIG=$(brew --prefix llvm@20)/bin/llvm-config" >> "$GITHUB_ENV"
 
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
@@ -51,11 +55,14 @@ jobs:
         shell: bash
         run: |
           mkdir staging
-          cp -r base core vendor LICENSE staging/
           if [ "${{ runner.os }}" = "Windows" ]; then
+            # -L: vendor ships .so symlinks that bash cp on Windows can't
+            # recreate — copy the link targets instead.
+            cp -rL base core vendor LICENSE staging/
             # odin.exe loads LLVM-C.dll from its own directory at runtime
             cp odin.exe LLVM-C.dll staging/
           else
+            cp -r base core vendor LICENSE staging/
             cp odin staging/
           fi
           git rev-parse HEAD > staging/COMMIT
