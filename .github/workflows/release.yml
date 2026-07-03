@@ -1,0 +1,74 @@
+name: Publish compiler builds
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04 # older glibc = compiler runs on more distros
+            slug: linux-amd64
+          - os: windows-latest
+            slug: windows-amd64
+          - os: macos-latest
+            slug: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux/macOS builds link libLLVM dynamically — consumers of these
+      # artifacts need the matching LLVM runtime (libllvm18 / brew llvm@18).
+      - name: Install LLVM (Linux)
+        if: runner.os == 'Linux'
+        run: wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+
+      - name: Install LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install llvm@18
+
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: ./build_odin.sh release
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call build.bat release
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir staging
+          cp -r base core vendor LICENSE staging/
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # odin.exe loads LLVM-C.dll from its own directory at runtime
+            cp odin.exe LLVM-C.dll staging/
+          else
+            cp odin staging/
+          fi
+          git rev-parse HEAD > staging/COMMIT
+          tar -czf "methodin-${{ matrix.slug }}.tar.gz" -C staging .
+
+      - name: Upload to rolling "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        # The three platform jobs race to create the release; losers fall
+        # through to the upload, which overwrites the previous build.
+        run: |
+          gh release create latest --prerelease --title "Latest master build" \
+            --notes "Rolling compiler build of master; assets are overwritten on every push. See COMMIT inside each archive for the exact revision." \
+            || true
+          gh release upload latest "methodin-${{ matrix.slug }}.tar.gz" --clobber
