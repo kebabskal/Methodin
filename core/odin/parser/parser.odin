@@ -2035,10 +2035,18 @@ parse_ident_list :: proc(p: ^Parser, allow_poly_names: bool) -> []^ast.Expr {
 // appended to it and excluded from the regular field list.
 parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags: ast.Field_Flags, methods_out: ^[dynamic]^ast.Stmt = nil) -> (field_list: ^ast.Field_List, total_name_count: int) {
 	try_parse_in_struct_method :: proc(p: ^Parser, methods_out: ^[dynamic]^ast.Stmt) -> bool {
-		if methods_out == nil do return false
-		if p.curr_tok.kind != .Ident do return false
-		if !peek_token_kind(p, .Colon, 0) do return false
-		if !peek_token_kind(p, .Colon, 1) do return false
+		if methods_out == nil {
+			return false
+		}
+		if p.curr_tok.kind != .Ident {
+			return false
+		}
+		if !peek_token_kind(p, .Colon, 0) {
+			return false
+		}
+		if !peek_token_kind(p, .Colon, 1) {
+			return false
+		}
 
 		docs := p.lead_comment
 		name_tok := expect_token(p, .Ident)
