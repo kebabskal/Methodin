@@ -20,6 +20,10 @@ jobs:
             slug: windows-amd64
           - os: macos-latest
             slug: macos-arm64
+          - os: macos-15-intel
+            slug: macos-amd64
+          - os: ubuntu-22.04-arm
+            slug: linux-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
