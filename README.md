@@ -1,6 +1,6 @@
 # Methodin — Odin with Methods
 
-This is an experimental fork of the Odin Programming language that adds Methods and somewhat smart dispatch. It doesn't use vtables; instead it implements dispatch as compile time switch statements. Definitely not in line with Odin design principles and not intended to ever be merged or even used by anyone but me.
+This is an experimental fork of the Odin Programming language that adds Methods and somewhat smart dispatch. It doesn't use vtables; instead it implements dispatch as switch statements. Definitely not in line with Odin design principles and not intended to ever be merged or even used by anyone but me.
 
 That said, pretty cute!
 
