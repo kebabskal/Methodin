@@ -10,8 +10,10 @@ import "core:fmt"
 import "core:strings"
 import "core:unicode/utf8"
 
-TAB_W :: 4
 OVERSCROLL_LINES :: 4
+
+// Tab display width; a setting, adjustable from the command palette.
+tab_w: int = 4
 
 App :: struct {
 	buf:     Buffer,
@@ -22,9 +24,27 @@ App :: struct {
 
 	scroll_x, scroll_y: f32, // pixels
 
+	sidebar:    Sidebar,
+	palette:    Palette,
+	lsp:        Lsp,
+	completion: Completion,
+	sighelp:    Sig_Help,
+	retitle: bool, // buffer path changed; main should refresh the window title
+	want_follow: bool, // something moved the cursor; main should scroll to it
+
+	// Hover tooltip (LSP), driven by mouse dwell.
+	hover_state:    Hover_State,
+	hover_pos:      Pos,
+	hover_text:     string, // owned
+	hover_req_id:   int,
+	hover_armed:    bool, // mouse has moved since the last request/hide
+	mouse_x, mouse_y: f32, // last mouse position (framebuffer pixels)
+	mouse_moved_ms: u64,
+
 	// View geometry, updated every draw (pixels).
-	view_w, view_h: f32, // text viewport (excludes gutter and status bar)
-	gutter_px:      f32,
+	view_w, view_h: f32, // text viewport (excludes sidebar, gutter and status bar)
+	sidebar_px:     f32,
+	gutter_px:      f32, // left edge of the text area (includes sidebar_px)
 	status_h:       f32,
 
 	now_ms:      u64,
@@ -34,6 +54,15 @@ App :: struct {
 	selecting:   bool,
 	select_word: bool,
 	select_origin: Range, // word the drag started on (word mode)
+
+	// Column (alt+drag) selection state.
+	col_select:      bool,
+	col_origin_line: int,
+	col_origin_vis:  int,
+	col_base:        [dynamic]Cursor, // cursors present when the gesture started
+
+	// Selection history for ctrl+u (cursor undo).
+	cursor_undo: [dynamic][]Cursor,
 
 	status_msg:      string,
 	status_msg_time: u64,
@@ -65,12 +94,24 @@ app_init :: proc(app: ^App, path: string) {
 	}
 	app.hl.lang = lang_from_path(path)
 	append(&app.cursors, cursor_at(Pos{0, 0}))
+	sidebar_init(&app.sidebar)
 }
 
 app_destroy :: proc(app: ^App) {
 	buffer_destroy(&app.buf)
 	highlight_destroy(&app.hl)
+	sidebar_destroy(&app.sidebar)
+	palette_destroy(&app.palette)
+	lsp_stop(&app.lsp)
+	completion_destroy(&app.completion)
+	delete(app.sighelp.label)
+	delete(app.hover_text)
 	delete(app.cursors)
+	delete(app.col_base)
+	for s in app.cursor_undo {
+		delete(s)
+	}
+	delete(app.cursor_undo)
 	delete(app.status_msg)
 }
 
@@ -115,7 +156,7 @@ visual_col :: proc(b: ^Buffer, line: int, col: int) -> int {
 	vis := 0
 	for i := 0; i < min(col, len(s)); {
 		if s[i] == '\t' {
-			vis = (vis/TAB_W + 1) * TAB_W
+			vis = (vis/tab_w + 1) * tab_w
 			i += 1
 		} else {
 			_, n := utf8.decode_rune(s[i:])
@@ -133,7 +174,7 @@ col_from_visual :: proc(b: ^Buffer, line: int, target_vis: int) -> int {
 	i := 0
 	for i < len(s) && vis < target_vis {
 		if s[i] == '\t' {
-			vis = (vis/TAB_W + 1) * TAB_W
+			vis = (vis/tab_w + 1) * tab_w
 			i += 1
 		} else {
 			_, n := utf8.decode_rune(s[i:])
@@ -227,20 +268,58 @@ impl App {
 		self.blink_reset()
 	}
 
+	// Snapshot the cursor set so ctrl+u can restore it.
+	push_cursor_undo :: proc() {
+		snap := make([]Cursor, len(cursors))
+		copy(snap, cursors[:])
+		append(&cursor_undo, snap)
+		if len(cursor_undo) > 64 {
+			delete(cursor_undo[0])
+			ordered_remove(&cursor_undo, 0)
+		}
+	}
+
+	clear_cursor_undo :: proc() {
+		for s in cursor_undo {
+			delete(s)
+		}
+		clear(&cursor_undo)
+	}
+
+	// ctrl+u: restore the cursor set from before the last selection change.
+	undo_selection :: proc() {
+		if len(cursor_undo) == 0 {
+			return
+		}
+		snap := pop(&cursor_undo)
+		clear(&cursors)
+		for c in snap {
+			append(&cursors, Cursor{head = buf.clamp_pos(c.head), anchor = buf.clamp_pos(c.anchor), goal_col = -1})
+		}
+		delete(snap)
+		primary = len(cursors) - 1
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+
 	select_all :: proc() {
+		self.push_cursor_undo()
 		clear(&cursors)
 		append(&cursors, Cursor{head = buf.end_pos(), anchor = Pos{0, 0}, goal_col = -1})
 		primary = 0
 	}
 
-	// Esc: first collapse to one cursor, then collapse the selection.
+	// Esc: multiple cursors collapse to a single caret at the most recently
+	// placed one; a lone selection collapses to its head.
 	escape :: proc() {
 		if len(cursors) > 1 {
-			c := self.primary_cursor()^
+			self.push_cursor_undo()
+			p := self.primary_cursor().head
 			clear(&cursors)
-			append(&cursors, c)
+			append(&cursors, cursor_at(p))
 			primary = 0
-		} else {
+		} else if cursor_has_selection(cursors[0]) {
+			self.push_cursor_undo()
 			c := &cursors[0]
 			c.anchor = c.head
 		}
@@ -264,6 +343,7 @@ impl App {
 		if target < 0 || target >= b.line_count() {
 			return
 		}
+		self.push_cursor_undo()
 		goal := c.goal_col >= 0 ? c.goal_col : visual_col(b, c.head.line, c.head.col)
 		p := Pos{target, col_from_visual(b, target, goal)}
 		append(&cursors, Cursor{head = p, anchor = p, goal_col = goal})
@@ -307,6 +387,7 @@ impl App {
 			if range_empty(r) {
 				return
 			}
+			self.push_cursor_undo()
 			pc.anchor = r.start
 			pc.head = r.end
 			self.blink_reset()
@@ -343,6 +424,7 @@ impl App {
 				return
 			}
 		}
+		self.push_cursor_undo()
 		append(&cursors, Cursor{head = e, anchor = s, goal_col = -1})
 		primary = len(cursors) - 1
 		self.normalize_cursors()
@@ -442,7 +524,7 @@ impl App {
 				if len(s) > 0 && s[0] == '\t' {
 					n = 1
 				} else {
-					for n < len(s) && n < TAB_W && s[n] == ' ' {
+					for n < len(s) && n < tab_w && s[n] == ' ' {
 						n += 1
 					}
 				}
@@ -606,20 +688,299 @@ impl App {
 	}
 }
 
+// Per-language line comment prefix ("" = no line comments; toggle is a no-op).
+@(private = "file")
+COMMENT_PREFIX := [Lang]string{
+	.Plain      = "",
+	.Odin       = "//",
+	.JSON       = "//", // jsonc
+	.GLSL       = "//",
+	.HLSL       = "//",
+	.WGSL       = "//",
+	.C          = "//",
+	.CPP        = "//",
+	.Python     = "#",
+	.JS         = "//",
+	.TS         = "//",
+	.Rust       = "//",
+	.Go         = "//",
+	.Java       = "//",
+	.CSharp     = "//",
+	.Lua        = "--",
+	.Shell      = "#",
+	.PowerShell = "#",
+	.Batch      = "::",
+	.YAML       = "#",
+	.TOML       = "#",
+	.INI        = ";",
+	.CSS        = "", // block comments only
+	.Markdown   = "",
+	.HTML       = "",
+}
+
+impl App {
+	// alt+up/down: move each cursor's block of lines by one, swapping with
+	// the neighbouring line. Selections ride along.
+	move_lines :: proc(down: bool) {
+		b := &buf
+
+		// Disjoint line spans (cursors are sorted); adjacent spans merge so
+		// they don't swap through each other.
+		spans := make([dynamic][2]int, context.temp_allocator)
+		for c in cursors {
+			r := cursor_range(c)
+			lo := r.start.line
+			hi := r.end.line
+			// A selection ending at column 0 doesn't claim that line.
+			if hi > lo && r.end.col == 0 {
+				hi -= 1
+			}
+			if len(spans) > 0 && lo <= spans[len(spans)-1][1]+1 {
+				spans[len(spans)-1][1] = max(spans[len(spans)-1][1], hi)
+			} else {
+				append(&spans, [2]int{lo, hi})
+			}
+		}
+
+		edits := make([dynamic]Edit, context.temp_allocator)
+		moved := make([dynamic][2]int, context.temp_allocator) // spans that actually move
+		for span in spans {
+			lo, hi := span[0], span[1]
+			if !down && lo == 0 {
+				continue
+			}
+			if down && hi >= b.line_count()-1 {
+				continue
+			}
+			sb := strings.builder_make(context.temp_allocator)
+			if down {
+				strings.write_string(&sb, b.line_str(hi + 1))
+				for line in lo ..= hi {
+					strings.write_byte(&sb, '\n')
+					strings.write_string(&sb, b.line_str(line))
+				}
+				append(&edits, Edit{range = {{lo, 0}, {hi + 1, b.line_len(hi + 1)}}, text = strings.to_string(sb)})
+			} else {
+				for line in lo ..= hi {
+					strings.write_string(&sb, b.line_str(line))
+					strings.write_byte(&sb, '\n')
+				}
+				strings.write_string(&sb, b.line_str(lo - 1))
+				append(&edits, Edit{range = {{lo - 1, 0}, {hi, b.line_len(hi)}}, text = strings.to_string(sb)})
+			}
+			append(&moved, span)
+		}
+		if len(edits) == 0 {
+			return
+		}
+
+		saved := make([]Cursor, len(cursors), context.temp_allocator)
+		copy(saved, cursors[:])
+		b.commit(edits[:], cursors[:])
+
+		d := 1 if down else -1
+		clear(&cursors)
+		for c in saved {
+			nc := c
+			for span in moved {
+				if c.head.line >= span[0] && cursor_range(c).start.line <= span[1] {
+					nc.head.line += d
+					nc.anchor.line += d
+					break
+				}
+			}
+			nc.head = b.clamp_pos(nc.head)
+			nc.anchor = b.clamp_pos(nc.anchor)
+			nc.goal_col = -1
+			append(&cursors, nc)
+		}
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+
+	// ctrl+': comment the selected lines, or uncomment if they all are.
+	toggle_comment :: proc() {
+		prefix := COMMENT_PREFIX[hl.lang]
+		if prefix == "" {
+			return
+		}
+		b := &buf
+
+		leading_ws :: proc(s: string) -> int {
+			n := 0
+			for n < len(s) && (s[n] == ' ' || s[n] == '\t') {
+				n += 1
+			}
+			return n
+		}
+
+		// All non-blank target lines already commented?
+		all_commented := true
+		any_line := false
+		seen_last := -1
+		for c in cursors {
+			r := cursor_range(c)
+			for line in max(r.start.line, seen_last+1) ..= r.end.line {
+				s := b.line_str(line)
+				ws := leading_ws(s)
+				if ws == len(s) {
+					continue // blank
+				}
+				any_line = true
+				if !strings.has_prefix(s[ws:], prefix) {
+					all_commented = false
+				}
+			}
+			seen_last = max(seen_last, r.end.line)
+		}
+		if !any_line {
+			return
+		}
+
+		edits := make([dynamic]Edit, context.temp_allocator)
+		with_space := strings.concatenate({prefix, " "}, context.temp_allocator)
+		seen_last = -1
+		for c in cursors {
+			r := cursor_range(c)
+			for line in max(r.start.line, seen_last+1) ..= r.end.line {
+				s := b.line_str(line)
+				ws := leading_ws(s)
+				if ws == len(s) {
+					continue
+				}
+				if all_commented {
+					n := len(prefix)
+					if ws+n < len(s) && s[ws+n] == ' ' {
+						n += 1
+					}
+					append(&edits, Edit{range = {{line, ws}, {line, ws + n}}, text = ""})
+				} else if !strings.has_prefix(s[ws:], prefix) {
+					append(&edits, Edit{range = {{line, ws}, {line, ws}}, text = with_space})
+				}
+			}
+			seen_last = max(seen_last, r.end.line)
+		}
+		self.apply_keep_selections(edits[:])
+	}
+
+	// ctrl+shift+d: duplicate each selection after itself; a cursor without
+	// a selection duplicates its line below.
+	duplicate :: proc() {
+		edits := make([dynamic]Edit, context.temp_allocator)
+		for c in cursors {
+			r := cursor_range(c)
+			if range_empty(r) {
+				line := r.start.line
+				end := Pos{line, buf.line_len(line)}
+				text := strings.concatenate({"\n", buf.line_str(line)}, context.temp_allocator)
+				append(&edits, Edit{range = {end, end}, text = text})
+			} else {
+				text := buf.range_text(r, context.temp_allocator)
+				append(&edits, Edit{range = {r.end, r.end}, text = text})
+			}
+		}
+		self.apply_keep_selections(edits[:])
+	}
+
+	// Select every occurrence of the primary selection (or the word under
+	// the cursor) in the whole document.
+	select_all_matches :: proc() {
+		b := &buf
+		pc := self.primary_cursor()
+		if !cursor_has_selection(pc^) {
+			r := b.word_range_at(pc.head)
+			if range_empty(r) {
+				return
+			}
+			pc.anchor = r.start
+			pc.head = r.end
+		}
+		prim := cursor_range(pc^)
+		needle := b.range_text(prim, context.temp_allocator)
+		if len(needle) == 0 {
+			return
+		}
+		text := b.text(context.temp_allocator)
+
+		self.push_cursor_undo()
+		clear(&cursors)
+		off := 0
+		for len(cursors) < 1000 {
+			idx := strings.index(text[off:], needle)
+			if idx < 0 {
+				break
+			}
+			s := b.pos_from_offset(off + idx)
+			e := b.pos_from_offset(off + idx + len(needle))
+			append(&cursors, Cursor{head = e, anchor = s, goal_col = -1})
+			if pos_eq(s, prim.start) {
+				primary = len(cursors) - 1
+			}
+			off += idx + max(len(needle), 1)
+		}
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+
+	// Upper/lowercase every selection; selections survive.
+	transform_case :: proc(upper: bool) {
+		edits := make([dynamic]Edit, context.temp_allocator)
+		for c in cursors {
+			r := cursor_range(c)
+			if range_empty(r) {
+				continue
+			}
+			text := buf.range_text(r, context.temp_allocator)
+			out := strings.to_upper(text, context.temp_allocator) if upper else strings.to_lower(text, context.temp_allocator)
+			append(&edits, Edit{range = r, text = out})
+		}
+		self.apply_keep_selections(edits[:])
+	}
+
+	// Palette: force a language (overrides the path-based guess).
+	set_language :: proc(l: Lang) {
+		hl.lang = l
+		hl.version = buf.version - 1 // force a relex
+	}
+
+	// Save under a new path (from the system save dialog).
+	save_as :: proc(path: string) {
+		delete(buf.path)
+		buf.path = strings.clone(path)
+		self.set_language(lang_from_path(path))
+		retitle = true
+		self.save()
+	}
+}
+
 // --- Mouse -------------------------------------------------------------------
 
 impl App {
+	// Visual (cell) column under a pixel x, unclamped.
+	vis_at_pixel :: proc(px: f32, cell_w: f32) -> int {
+		return max(int((px - gutter_px + scroll_x) / cell_w + 0.5), 0)
+	}
+
 	// Convert a pixel position (already in framebuffer scale) to a buffer Pos.
 	pos_at_pixel :: proc(px, py: f32, cell_w, line_h: f32) -> Pos {
 		line := int((py + scroll_y) / line_h)
 		line = clamp(line, 0, buf.line_count()-1)
-		vis := int((px - gutter_px + scroll_x) / cell_w + 0.5)
-		vis = max(vis, 0)
+		vis := self.vis_at_pixel(px, cell_w)
 		return Pos{line, col_from_visual(&buf, line, vis)}
 	}
 
-	click :: proc(p: Pos, clicks: int, shift, alt: bool) {
+	click :: proc(p: Pos, vis: int, clicks: int, shift, alt: bool) {
 		if alt {
+			// Start of a possible column-selection drag: remember the cursors
+			// that were already there and the anchor cell.
+			self.push_cursor_undo()
+			clear(&col_base)
+			for c in cursors {
+				append(&col_base, c)
+			}
+			col_select = true
+			col_origin_line = p.line
+			col_origin_vis = vis
 			append(&cursors, cursor_at(p))
 			primary = len(cursors) - 1
 			self.normalize_cursors()
@@ -649,8 +1010,25 @@ impl App {
 		self.blink_reset()
 	}
 
-	drag :: proc(p: Pos) {
+	drag :: proc(p: Pos, vis: int) {
 		if !selecting {
+			return
+		}
+		if col_select {
+			// Rebuild: pre-gesture cursors + one per line in the dragged box.
+			clear(&cursors)
+			for c in col_base {
+				append(&cursors, c)
+			}
+			lo := min(col_origin_line, p.line)
+			hi := max(col_origin_line, p.line)
+			for line in lo ..= hi {
+				a := Pos{line, col_from_visual(&buf, line, col_origin_vis)}
+				h := Pos{line, col_from_visual(&buf, line, vis)}
+				append(&cursors, Cursor{head = h, anchor = a, goal_col = -1})
+			}
+			primary = len(cursors) - 1
+			self.blink_reset()
 			return
 		}
 		pc := self.primary_cursor()
@@ -673,8 +1051,28 @@ impl App {
 	mouse_up :: proc() {
 		if selecting {
 			selecting = false
+			col_select = false
 			self.normalize_cursors()
 		}
+	}
+
+	// Right-click: keep the selection if clicked inside it, else move the
+	// cursor there; then show the context menu.
+	right_click :: proc(p: Pos) {
+		inside := false
+		for c in cursors {
+			r := cursor_range(c)
+			if !pos_less(p, r.start) && !pos_less(r.end, p) {
+				inside = true
+				break
+			}
+		}
+		if !inside {
+			clear(&cursors)
+			append(&cursors, cursor_at(p))
+			primary = 0
+		}
+		self.open_context_editor()
 	}
 }
 
@@ -722,9 +1120,10 @@ impl App {
 		line_h := r.line_h
 		cell_w := r.cell_w
 		status_h = line_h + 8
+		sidebar_px = min(SIDEBAR_CELLS*cell_w, width*0.35) if sidebar.visible else 0
 		gutter_digits := count_digits(buf.line_count())
 		gutter_cells := f32(gutter_digits + 2)
-		gutter_px = gutter_cells * cell_w
+		gutter_px = sidebar_px + gutter_cells*cell_w
 		view_w = width - gutter_px
 		view_h = height - status_h
 
@@ -736,7 +1135,7 @@ impl App {
 		// Current-line highlight (single cursor, no selection).
 		if len(cursors) == 1 && !cursor_has_selection(cursors[0]) {
 			y := f32(cursors[0].head.line)*line_h - scroll_y
-			push_rect(r, 0, y, width, line_h, theme.current_line)
+			push_rect(r, sidebar_px, y, width-sidebar_px, line_h, theme.current_line)
 		}
 
 		// Selections.
@@ -786,7 +1185,7 @@ impl App {
 			for i := 0; i < len(s); {
 				ch, n := utf8.decode_rune(s[i:])
 				if ch == '\t' {
-					vis = (vis/TAB_W + 1) * TAB_W
+					vis = (vis/tab_w + 1) * tab_w
 					i += n
 					continue
 				}
@@ -823,7 +1222,12 @@ impl App {
 			}
 		}
 
+		self.sidebar_draw(r, height)
 		self.draw_status(r, width, height)
+		self.hover_draw(r, width, height)
+		self.sighelp_draw(r, width, height)
+		self.completion_draw(r, width, height)
+		self.palette_draw(r, width, height)
 	}
 
 	draw_status :: proc(r: ^Renderer, width, height: f32) {
@@ -855,19 +1259,11 @@ impl App {
 
 		// Right: language, cursor count, position.
 		pc := self.primary_cursor()
-		lang_names := [Lang]string {
-			.Plain = "text",
-			.Odin  = "methodin",
-			.JSON  = "json",
-			.GLSL  = "glsl",
-			.HLSL  = "hlsl",
-			.WGSL  = "wgsl",
-		}
 		right: string
 		if len(cursors) > 1 {
-			right = fmt.tprintf("%d cursors  %s  %d:%d", len(cursors), lang_names[hl.lang], pc.head.line+1, visual_col(&buf, pc.head.line, pc.head.col)+1)
+			right = fmt.tprintf("%d cursors  %s  %d:%d", len(cursors), LANG_NAMES[hl.lang], pc.head.line+1, visual_col(&buf, pc.head.line, pc.head.col)+1)
 		} else {
-			right = fmt.tprintf("%s  %d:%d", lang_names[hl.lang], pc.head.line+1, visual_col(&buf, pc.head.line, pc.head.col)+1)
+			right = fmt.tprintf("%s  %d:%d", LANG_NAMES[hl.lang], pc.head.line+1, visual_col(&buf, pc.head.line, pc.head.col)+1)
 		}
 		draw_str(r, width-f32(len(right)+1)*cell_w, baseline, right, theme.status_dim)
 		_ = line_h

@@ -206,10 +206,45 @@ char_class :: proc(r: rune) -> int {
 	return 2 // punctuation
 }
 
+// Subword helpers for smart word movement.
+@(private = "file")
+is_upper_r :: proc(r: rune) -> bool {
+	return 'A' <= r && r <= 'Z'
+}
+
+@(private = "file")
+is_lower_alpha :: proc(r: rune) -> bool {
+	return 'a' <= r && r <= 'z'
+}
+
+// Continues a lowercase subword: lowercase, digits, and non-ASCII word runes.
+@(private = "file")
+is_sub_low :: proc(r: rune) -> bool {
+	return ('a' <= r && r <= 'z') || ('0' <= r && r <= '9') || r >= 0x80
+}
+
+@(private = "file")
+at_bof :: proc(p: Pos) -> bool {
+	return p.line == 0 && p.col == 0
+}
+
+// Word movement mode; a setting, toggled from the command palette.
+// Smart stops at subword boundaries (camelCase humps, underscores);
+// whole-word hops entire identifiers like most editors.
+smart_word := true
+
 impl Buffer {
-	// Word-wise movement: skip any run of same-class runes, plus leading
-	// whitespace in the direction of travel.
 	word_right :: proc(p: Pos) -> Pos {
+		return self.subword_right(p) if smart_word else self.full_word_right(p)
+	}
+
+	word_left :: proc(p: Pos) -> Pos {
+		return self.subword_left(p) if smart_word else self.full_word_left(p)
+	}
+
+	// Whole-word movement: skip any run of same-class runes, plus leading
+	// whitespace in the direction of travel.
+	full_word_right :: proc(p: Pos) -> Pos {
 		p := p
 		if pos_eq(p, self.end_pos()) {
 			return p
@@ -233,29 +268,138 @@ impl Buffer {
 		}
 	}
 
-	word_left :: proc(p: Pos) -> Pos {
+	full_word_left :: proc(p: Pos) -> Pos {
 		p := p
-		if p.line == 0 && p.col == 0 {
+		if at_bof(p) {
 			return p
 		}
 		p = self.prev_pos(p)
 		class := char_class(self.rune_at(p))
-		for class == 0 && !(p.line == 0 && p.col == 0) {
+		for class == 0 && !at_bof(p) {
 			np := self.prev_pos(p)
 			c := char_class(self.rune_at(np))
+			p = np
 			if c != 0 {
 				class = c
-				p = np
 				break
 			}
-			p = np
 		}
-		for !(p.line == 0 && p.col == 0) {
+		for !at_bof(p) {
 			np := self.prev_pos(p)
 			if char_class(self.rune_at(np)) != class {
 				return p
 			}
 			p = np
+		}
+		return p
+	}
+
+	// Smart word movement: stops at subword boundaries — camelCase humps,
+	// underscores, punctuation runs — not just whitespace-separated words.
+	// "fooBarHTTPBaz" hops foo|Bar|HTTP|Baz; "foo_bar" hops foo|_bar.
+	subword_right :: proc(p: Pos) -> Pos {
+		p := p
+		end := self.end_pos()
+		if pos_eq(p, end) {
+			return p
+		}
+		// Whitespace (and newlines) first.
+		for char_class(self.rune_at(p)) == 0 {
+			p = self.next_pos(p)
+			if pos_eq(p, end) {
+				return p
+			}
+		}
+		c := self.rune_at(p)
+		if char_class(c) == 2 {
+			for !pos_eq(p, end) && char_class(self.rune_at(p)) == 2 {
+				p = self.next_pos(p)
+			}
+			return p
+		}
+		// Inside an identifier: consume exactly one subword.
+		if c == '_' {
+			for !pos_eq(p, end) && self.rune_at(p) == '_' {
+				p = self.next_pos(p)
+			}
+			if pos_eq(p, end) {
+				return p
+			}
+			c = self.rune_at(p)
+			if !(is_upper_r(c) || is_sub_low(c)) {
+				return p
+			}
+		}
+		if is_upper_r(c) {
+			p = self.next_pos(p)
+			if pos_eq(p, end) {
+				return p
+			}
+			if is_upper_r(self.rune_at(p)) {
+				// Acronym run (HTTP): stop before an upper that begins the
+				// next camel word (the P in HTMLParser).
+				for {
+					if pos_eq(p, end) || !is_upper_r(self.rune_at(p)) {
+						return p
+					}
+					np := self.next_pos(p)
+					if !pos_eq(np, end) && is_lower_alpha(self.rune_at(np)) {
+						return p
+					}
+					p = np
+				}
+			}
+			// Single upper starting a camel word: fall through to its tail.
+		}
+		for !pos_eq(p, end) && is_sub_low(self.rune_at(p)) {
+			p = self.next_pos(p)
+		}
+		return p
+	}
+
+	subword_left :: proc(p: Pos) -> Pos {
+		p := p
+		if at_bof(p) {
+			return p
+		}
+		for !at_bof(p) && char_class(self.rune_at(self.prev_pos(p))) == 0 {
+			p = self.prev_pos(p)
+		}
+		if at_bof(p) {
+			return p
+		}
+		c := self.rune_at(self.prev_pos(p))
+		if char_class(c) == 2 {
+			for !at_bof(p) && char_class(self.rune_at(self.prev_pos(p))) == 2 {
+				p = self.prev_pos(p)
+			}
+			return p
+		}
+		if c == '_' {
+			for !at_bof(p) && self.rune_at(self.prev_pos(p)) == '_' {
+				p = self.prev_pos(p)
+			}
+			if at_bof(p) {
+				return p
+			}
+			c = self.rune_at(self.prev_pos(p))
+			if !(is_upper_r(c) || is_sub_low(c)) {
+				return p
+			}
+		}
+		if is_sub_low(c) {
+			for !at_bof(p) && is_sub_low(self.rune_at(self.prev_pos(p))) {
+				p = self.prev_pos(p)
+			}
+			// One leading upper completes a camel word (the B of Bar).
+			if !at_bof(p) && is_upper_r(self.rune_at(self.prev_pos(p))) {
+				p = self.prev_pos(p)
+			}
+			return p
+		}
+		// Acronym run backward.
+		for !at_bof(p) && is_upper_r(self.rune_at(self.prev_pos(p))) {
+			p = self.prev_pos(p)
 		}
 		return p
 	}

@@ -1,5 +1,7 @@
 package medit
 
+import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import "core:testing"
 
@@ -153,14 +155,63 @@ test_word_motion :: proc(t: ^testing.T) {
 	b := buffer_from("foo_bar baz(qux)")
 	defer buffer_destroy(&b)
 	p := b.word_right(Pos{0, 0})
-	testing.expect_value(t, p, Pos{0, 7}) // end of foo_bar
+	testing.expect_value(t, p, Pos{0, 3}) // end of foo (subword)
+	p = b.word_right(p)
+	testing.expect_value(t, p, Pos{0, 7}) // end of _bar
 	p = b.word_right(p)
 	testing.expect_value(t, p, Pos{0, 11}) // end of baz
 	p = b.word_left(Pos{0, 11})
 	testing.expect_value(t, p, Pos{0, 8}) // start of baz
+	p = b.word_left(p)
+	testing.expect_value(t, p, Pos{0, 4}) // start of bar (after underscore)
+	p = b.word_left(p)
+	testing.expect_value(t, p, Pos{0, 0})
 
+	// Double-click still selects the whole identifier.
 	w := b.word_range_at(Pos{0, 1})
 	testing.expect_value(t, w, Range{{0, 0}, {0, 7}})
+}
+
+@test
+test_word_motion_full :: proc(t: ^testing.T) {
+	// The whole-word variant (smart_word = false) hops entire identifiers.
+	b := buffer_from("foo_bar baz(qux)")
+	defer buffer_destroy(&b)
+	p := b.full_word_right(Pos{0, 0})
+	testing.expect_value(t, p, Pos{0, 7}) // end of foo_bar
+	p = b.full_word_right(p)
+	testing.expect_value(t, p, Pos{0, 11}) // end of baz
+	p = b.full_word_left(Pos{0, 11})
+	testing.expect_value(t, p, Pos{0, 8}) // start of baz
+	p = b.full_word_left(p)
+	testing.expect_value(t, p, Pos{0, 0})
+}
+
+@test
+test_word_movement_camel :: proc(t: ^testing.T) {
+	b := buffer_from("fooBarHTTPBaz then")
+	defer buffer_destroy(&b)
+	p := b.word_right(Pos{0, 0})
+	testing.expect_value(t, p, Pos{0, 3}) // foo|
+	p = b.word_right(p)
+	testing.expect_value(t, p, Pos{0, 6}) // Bar|
+	p = b.word_right(p)
+	testing.expect_value(t, p, Pos{0, 10}) // HTTP| (stops before Baz)
+	p = b.word_right(p)
+	testing.expect_value(t, p, Pos{0, 13}) // Baz|
+	p = b.word_right(p)
+	testing.expect_value(t, p, Pos{0, 18}) // then|
+
+	p = b.word_left(Pos{0, 18})
+	testing.expect_value(t, p, Pos{0, 14}) // |then
+	p = b.word_left(p)
+	testing.expect_value(t, p, Pos{0, 10}) // |Baz
+	p = b.word_left(p)
+	testing.expect_value(t, p, Pos{0, 6}) // |HTTP
+	p = b.word_left(p)
+	testing.expect_value(t, p, Pos{0, 3}) // |Bar
+	p = b.word_left(p)
+	testing.expect_value(t, p, Pos{0, 0}) // |foo
 }
 
 @test
@@ -190,7 +241,9 @@ test_cursors_normalize_merges_overlap :: proc(t: ^testing.T) {
 
 @test
 test_load_save_roundtrip :: proc(t: ^testing.T) {
-	path := "/tmp/medit_test_roundtrip.txt"
+	tmp, terr := os.temp_directory(context.temp_allocator)
+	testing.expect(t, terr == nil)
+	path, _ := filepath.join({tmp, "medit_test_roundtrip.txt"}, context.temp_allocator)
 	content := "line1\nline2\n\nline4\n"
 	b := buffer_from(content)
 	delete(b.path)

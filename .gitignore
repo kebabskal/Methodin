@@ -311,6 +311,13 @@ cmake-build*/
 CMakeLists.txt
 sandbox/
 
-# medit editor binaries
+# medit editor binaries (editor.exe/.exp/.lib come from `odin watch .`
+# in editor/, which names the output after the package directory)
 editor/medit
 editor/medit.exe
+editor/editor.exp
+editor/editor.lib
+editor/SDL3.dll
+# ...and at the root when building `odin build editor` from there
+/editor.exp
+/editor.lib
