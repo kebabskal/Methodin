@@ -1,0 +1,875 @@
+// medit — editor state and actions.
+//
+// Every editing action builds a batch of edits (one per cursor) and pushes
+// it through Buffer.commit. The app layer knows pixels only through the
+// metrics the renderer exposes; SDL specifics (events, clipboard) stay in
+// main.odin.
+package medit
+
+import "core:fmt"
+import "core:strings"
+import "core:unicode/utf8"
+
+TAB_W :: 4
+OVERSCROLL_LINES :: 4
+
+App :: struct {
+	buf:     Buffer,
+	hl:      Highlight,
+	theme:   Theme,
+	cursors: [dynamic]Cursor,
+	primary: int, // index of the most recently active cursor
+
+	scroll_x, scroll_y: f32, // pixels
+
+	// View geometry, updated every draw (pixels).
+	view_w, view_h: f32, // text viewport (excludes gutter and status bar)
+	gutter_px:      f32,
+	status_h:       f32,
+
+	now_ms:      u64,
+	blink_start: u64,
+
+	// Mouse drag state.
+	selecting:   bool,
+	select_word: bool,
+	select_origin: Range, // word the drag started on (word mode)
+
+	status_msg:      string,
+	status_msg_time: u64,
+}
+
+Move :: enum {
+	Left,
+	Right,
+	Up,
+	Down,
+	Word_Left,
+	Word_Right,
+	Line_Start, // smart home
+	Line_End,
+	Doc_Start,
+	Doc_End,
+}
+
+app_init :: proc(app: ^App, path: string) {
+	app.theme = theme_default()
+	if path != "" {
+		if b, ok := buffer_load(path); ok {
+			app.buf = b
+		} else {
+			app.buf = buffer_make(path) // new file at that path
+		}
+	} else {
+		app.buf = buffer_make()
+	}
+	app.hl.lang = lang_from_path(path)
+	append(&app.cursors, cursor_at(Pos{0, 0}))
+}
+
+app_destroy :: proc(app: ^App) {
+	buffer_destroy(&app.buf)
+	highlight_destroy(&app.hl)
+	delete(app.cursors)
+	delete(app.status_msg)
+}
+
+impl App {
+	blink_reset :: proc() {
+		blink_start = now_ms
+	}
+
+	set_status :: proc(msg: string) {
+		delete(status_msg)
+		status_msg = strings.clone(msg)
+		status_msg_time = now_ms
+	}
+
+	primary_cursor :: proc() -> ^Cursor {
+		if primary >= len(cursors) {
+			primary = len(cursors) - 1
+		}
+		return &cursors[primary]
+	}
+
+	normalize_cursors :: proc() {
+		head := self.primary_cursor().head
+		cursors_normalize(&cursors)
+		// Keep primary pointing at the cursor that owns the old head.
+		primary = len(cursors) - 1
+		for c, i in cursors {
+			r := cursor_range(c)
+			if !pos_less(head, r.start) && !pos_less(r.end, head) {
+				primary = i
+				break
+			}
+		}
+	}
+}
+
+// --- Visual columns (tabs) ---------------------------------------------------
+
+// Visual column of a byte offset within a line.
+visual_col :: proc(b: ^Buffer, line: int, col: int) -> int {
+	s := b.line_str(line)
+	vis := 0
+	for i := 0; i < min(col, len(s)); {
+		if s[i] == '\t' {
+			vis = (vis/TAB_W + 1) * TAB_W
+			i += 1
+		} else {
+			_, n := utf8.decode_rune(s[i:])
+			i += n
+			vis += 1
+		}
+	}
+	return vis
+}
+
+// Byte offset within a line for a target visual column (clamped to line end).
+col_from_visual :: proc(b: ^Buffer, line: int, target_vis: int) -> int {
+	s := b.line_str(line)
+	vis := 0
+	i := 0
+	for i < len(s) && vis < target_vis {
+		if s[i] == '\t' {
+			vis = (vis/TAB_W + 1) * TAB_W
+			i += 1
+		} else {
+			_, n := utf8.decode_rune(s[i:])
+			i += n
+			vis += 1
+		}
+	}
+	return i
+}
+
+// --- Movement ----------------------------------------------------------------
+
+impl App {
+	move_cursors :: proc(m: Move, extend: bool) {
+		b := &buf
+		for &c in cursors {
+			p := c.head
+			keep_goal := false
+			switch m {
+			case .Left:
+				if !extend && cursor_has_selection(c) {
+					p = cursor_range(c).start
+				} else {
+					p = b.prev_pos(p)
+				}
+			case .Right:
+				if !extend && cursor_has_selection(c) {
+					p = cursor_range(c).end
+				} else {
+					p = b.next_pos(p)
+				}
+			case .Word_Left:
+				p = b.word_left(p)
+			case .Word_Right:
+				p = b.word_right(p)
+			case .Up, .Down:
+				keep_goal = true
+				if c.goal_col < 0 {
+					c.goal_col = visual_col(b, p.line, p.col)
+				}
+				target := p.line - 1 if m == .Up else p.line + 1
+				if target < 0 {
+					p = Pos{0, 0}
+				} else if target >= b.line_count() {
+					p = b.end_pos()
+				} else {
+					p = Pos{target, col_from_visual(b, target, c.goal_col)}
+				}
+			case .Line_Start:
+				// Smart home: first non-whitespace, or column 0 if already there.
+				s := b.line_str(p.line)
+				first := 0
+				for first < len(s) && (s[first] == ' ' || s[first] == '\t') {
+					first += 1
+				}
+				p.col = 0 if p.col == first else first
+			case .Line_End:
+				p.col = b.line_len(p.line)
+			case .Doc_Start:
+				p = Pos{0, 0}
+			case .Doc_End:
+				p = b.end_pos()
+			}
+			c.head = b.clamp_pos(p)
+			if !extend {
+				c.anchor = c.head
+			}
+			if !keep_goal {
+				c.goal_col = -1
+			}
+		}
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+
+	// Page movement needs the page size in lines, so it gets its own proc.
+	move_page :: proc(up: bool, extend: bool, lines_per_page: int) {
+		b := &buf
+		for &c in cursors {
+			if c.goal_col < 0 {
+				c.goal_col = visual_col(b, c.head.line, c.head.col)
+			}
+			target := c.head.line - lines_per_page if up else c.head.line + lines_per_page
+			target = clamp(target, 0, b.line_count()-1)
+			c.head = b.clamp_pos(Pos{target, col_from_visual(b, target, c.goal_col)})
+			if !extend {
+				c.anchor = c.head
+			}
+		}
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+
+	select_all :: proc() {
+		clear(&cursors)
+		append(&cursors, Cursor{head = buf.end_pos(), anchor = Pos{0, 0}, goal_col = -1})
+		primary = 0
+	}
+
+	// Esc: first collapse to one cursor, then collapse the selection.
+	escape :: proc() {
+		if len(cursors) > 1 {
+			c := self.primary_cursor()^
+			clear(&cursors)
+			append(&cursors, c)
+			primary = 0
+		} else {
+			c := &cursors[0]
+			c.anchor = c.head
+		}
+		self.blink_reset()
+	}
+
+	add_cursor_line :: proc(below: bool) {
+		b := &buf
+		// Clone from the topmost (above) or bottommost (below) cursor.
+		src := 0
+		for c, i in cursors {
+			if below && pos_less(cursors[src].head, c.head) {
+				src = i
+			}
+			if !below && pos_less(c.head, cursors[src].head) {
+				src = i
+			}
+		}
+		c := cursors[src]
+		target := c.head.line + 1 if below else c.head.line - 1
+		if target < 0 || target >= b.line_count() {
+			return
+		}
+		goal := c.goal_col >= 0 ? c.goal_col : visual_col(b, c.head.line, c.head.col)
+		p := Pos{target, col_from_visual(b, target, goal)}
+		append(&cursors, Cursor{head = p, anchor = p, goal_col = goal})
+		primary = len(cursors) - 1
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+}
+
+// --- Offset mapping (for search / ctrl+d) ------------------------------------
+
+impl Buffer {
+	offset_from_pos :: proc(p: Pos) -> int {
+		off := 0
+		for i in 0 ..< p.line {
+			off += len(lines[i]) + 1
+		}
+		return off + p.col
+	}
+
+	pos_from_offset :: proc(off: int) -> Pos {
+		remaining := off
+		for line, i in lines {
+			if remaining <= len(line) {
+				return Pos{i, remaining}
+			}
+			remaining -= len(line) + 1
+		}
+		return self.end_pos()
+	}
+}
+
+impl App {
+	// ctrl+d: select the word under the cursor, or add a cursor at the next
+	// occurrence of the primary selection.
+	select_next_match :: proc() {
+		b := &buf
+		pc := self.primary_cursor()
+		if !cursor_has_selection(pc^) {
+			r := b.word_range_at(pc.head)
+			if range_empty(r) {
+				return
+			}
+			pc.anchor = r.start
+			pc.head = r.end
+			self.blink_reset()
+			return
+		}
+
+		needle := b.range_text(cursor_range(pc^), context.temp_allocator)
+		if len(needle) == 0 {
+			return
+		}
+		text := b.text(context.temp_allocator)
+
+		// Search after the last cursor, wrapping around once.
+		start := 0
+		for c in cursors {
+			start = max(start, b.offset_from_pos(cursor_range(c).end))
+		}
+		idx := strings.index(text[start:], needle)
+		found := -1
+		if idx >= 0 {
+			found = start + idx
+		} else if idx = strings.index(text, needle); idx >= 0 {
+			found = idx
+		}
+		if found < 0 {
+			return
+		}
+		s := b.pos_from_offset(found)
+		e := b.pos_from_offset(found + len(needle))
+		// Already selected by some cursor? Then we're done (all occurrences taken).
+		for c in cursors {
+			r := cursor_range(c)
+			if pos_eq(r.start, s) && pos_eq(r.end, e) {
+				return
+			}
+		}
+		append(&cursors, Cursor{head = e, anchor = s, goal_col = -1})
+		primary = len(cursors) - 1
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+}
+
+// --- Editing -----------------------------------------------------------------
+
+impl App {
+	// Replace every cursor's selection with text; carets end up after it.
+	insert_text :: proc(text: string) {
+		edits := make([]Edit, len(cursors), context.temp_allocator)
+		for c, i in cursors {
+			edits[i] = Edit{range = cursor_range(c), text = text}
+		}
+		self.apply_and_place(edits, false)
+	}
+
+	// Enter: newline + copy the current line's leading whitespace.
+	insert_newline :: proc() {
+		edits := make([]Edit, len(cursors), context.temp_allocator)
+		for c, i in cursors {
+			r := cursor_range(c)
+			s := buf.line_str(r.start.line)
+			ws_end := 0
+			for ws_end < len(s) && ws_end < r.start.col && (s[ws_end] == ' ' || s[ws_end] == '\t') {
+				ws_end += 1
+			}
+			text := strings.concatenate({"\n", s[:ws_end]}, context.temp_allocator)
+			edits[i] = Edit{range = r, text = text}
+		}
+		self.apply_and_place(edits, false)
+	}
+
+	delete_backward :: proc() {
+		b := &buf
+		edits := make([]Edit, len(cursors), context.temp_allocator)
+		for c, i in cursors {
+			r := cursor_range(c)
+			if range_empty(r) {
+				r.start = b.prev_pos(r.start)
+			}
+			edits[i] = Edit{range = r, text = ""}
+		}
+		self.apply_and_place(edits, false)
+	}
+
+	delete_forward :: proc() {
+		b := &buf
+		edits := make([]Edit, len(cursors), context.temp_allocator)
+		for c, i in cursors {
+			r := cursor_range(c)
+			if range_empty(r) {
+				r.end = b.next_pos(r.end)
+			}
+			edits[i] = Edit{range = r, text = ""}
+		}
+		self.apply_and_place(edits, false)
+	}
+
+	// Tab: indent selected lines, or insert a tab character.
+	indent :: proc() {
+		multiline := false
+		for c in cursors {
+			r := cursor_range(c)
+			if r.start.line != r.end.line {
+				multiline = true
+			}
+		}
+		if !multiline {
+			self.insert_text("\t")
+			return
+		}
+		edits := make([dynamic]Edit, context.temp_allocator)
+		seen_last := -1
+		for c in cursors {
+			r := cursor_range(c)
+			for line in max(r.start.line, seen_last+1) ..= r.end.line {
+				if buf.line_len(line) > 0 {
+					append(&edits, Edit{range = {{line, 0}, {line, 0}}, text = "\t"})
+				}
+			}
+			seen_last = max(seen_last, r.end.line)
+		}
+		self.apply_keep_selections(edits[:])
+	}
+
+	dedent :: proc() {
+		edits := make([dynamic]Edit, context.temp_allocator)
+		seen_last := -1
+		for c in cursors {
+			r := cursor_range(c)
+			for line in max(r.start.line, seen_last+1) ..= r.end.line {
+				s := buf.line_str(line)
+				n := 0
+				if len(s) > 0 && s[0] == '\t' {
+					n = 1
+				} else {
+					for n < len(s) && n < TAB_W && s[n] == ' ' {
+						n += 1
+					}
+				}
+				if n > 0 {
+					append(&edits, Edit{range = {{line, 0}, {line, n}}, text = ""})
+				}
+			}
+			seen_last = max(seen_last, r.end.line)
+		}
+		self.apply_keep_selections(edits[:])
+	}
+
+	// Apply one edit per cursor; place carets at each replacement's end
+	// (select_inserted keeps the inserted text selected — used by paste-all).
+	apply_and_place :: proc(edits: []Edit, select_inserted: bool) {
+		if len(edits) == 0 {
+			return
+		}
+		new_ranges := buf.commit(edits, cursors[:])
+		clear(&cursors)
+		for r in new_ranges {
+			c := cursor_at(r.end)
+			if select_inserted {
+				c.anchor = r.start
+			}
+			append(&cursors, c)
+		}
+		primary = len(cursors) - 1
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+
+	// Apply edits that don't correspond 1:1 to cursors (indent/dedent);
+	// cursors are re-clamped afterwards but selections survive roughly.
+	apply_keep_selections :: proc(edits: []Edit) {
+		if len(edits) == 0 {
+			return
+		}
+		saved := make([]Cursor, len(cursors), context.temp_allocator)
+		copy(saved, cursors[:])
+		buf.commit(edits, cursors[:])
+		clear(&cursors)
+		for c in saved {
+			nc := c
+			nc.head = buf.clamp_pos(nc.head)
+			nc.anchor = buf.clamp_pos(nc.anchor)
+			append(&cursors, nc)
+		}
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+
+	undo :: proc() {
+		restored, ok := buf.undo(cursors[:])
+		if !ok {
+			return
+		}
+		if len(restored) > 0 {
+			clear(&cursors)
+			for c in restored {
+				append(&cursors, Cursor{head = buf.clamp_pos(c.head), anchor = buf.clamp_pos(c.anchor), goal_col = -1})
+			}
+			primary = len(cursors) - 1
+		} else {
+			for &c in cursors {
+				c.head = buf.clamp_pos(c.head)
+				c.anchor = buf.clamp_pos(c.anchor)
+			}
+		}
+		delete(restored)
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+
+	redo :: proc() {
+		restored, ok := buf.redo(cursors[:])
+		if !ok {
+			return
+		}
+		if len(restored) > 0 {
+			clear(&cursors)
+			for c in restored {
+				append(&cursors, Cursor{head = buf.clamp_pos(c.head), anchor = buf.clamp_pos(c.anchor), goal_col = -1})
+			}
+			primary = len(cursors) - 1
+		} else {
+			for &c in cursors {
+				c.head = buf.clamp_pos(c.head)
+				c.anchor = buf.clamp_pos(c.anchor)
+			}
+		}
+		delete(restored)
+		self.normalize_cursors()
+		self.blink_reset()
+	}
+
+	save :: proc() {
+		if buf.path == "" {
+			self.set_status("no file path — start medit with a filename")
+			return
+		}
+		if buffer_save(&buf) {
+			self.set_status("saved")
+		} else {
+			self.set_status("SAVE FAILED")
+		}
+	}
+
+	// Copy: selections joined with '\n'; a cursor without a selection
+	// contributes its whole line. Caller hands the result to the clipboard.
+	copy_text :: proc() -> string {
+		sb := strings.builder_make(context.temp_allocator)
+		for c, i in cursors {
+			if i > 0 {
+				strings.write_byte(&sb, '\n')
+			}
+			r := cursor_range(c)
+			if range_empty(r) {
+				strings.write_string(&sb, buf.line_str(r.start.line))
+			} else {
+				t := buf.range_text(r, context.temp_allocator)
+				strings.write_string(&sb, t)
+			}
+		}
+		return strings.to_string(sb)
+	}
+
+	cut_text :: proc() -> string {
+		text := self.copy_text()
+		edits := make([]Edit, len(cursors), context.temp_allocator)
+		for c, i in cursors {
+			r := cursor_range(c)
+			if range_empty(r) {
+				// Cut the whole line including its newline.
+				r = Range{{r.start.line, 0}, {r.start.line + 1, 0}}
+				if r.end.line >= buf.line_count() {
+					r.end = buf.end_pos()
+				}
+			}
+			edits[i] = Edit{range = r, text = ""}
+		}
+		self.apply_and_place(edits, false)
+		return text
+	}
+
+	paste :: proc(text: string) {
+		if len(text) == 0 {
+			return
+		}
+		// Multi-cursor smart paste: N lines onto N cursors goes one line each.
+		lines := strings.split(text, "\n", context.temp_allocator)
+		if len(lines) == len(cursors) && len(cursors) > 1 {
+			edits := make([]Edit, len(cursors), context.temp_allocator)
+			for c, i in cursors {
+				edits[i] = Edit{range = cursor_range(c), text = lines[i]}
+			}
+			self.apply_and_place(edits, false)
+			return
+		}
+		self.insert_text(text)
+	}
+}
+
+// --- Mouse -------------------------------------------------------------------
+
+impl App {
+	// Convert a pixel position (already in framebuffer scale) to a buffer Pos.
+	pos_at_pixel :: proc(px, py: f32, cell_w, line_h: f32) -> Pos {
+		line := int((py + scroll_y) / line_h)
+		line = clamp(line, 0, buf.line_count()-1)
+		vis := int((px - gutter_px + scroll_x) / cell_w + 0.5)
+		vis = max(vis, 0)
+		return Pos{line, col_from_visual(&buf, line, vis)}
+	}
+
+	click :: proc(p: Pos, clicks: int, shift, alt: bool) {
+		if alt {
+			append(&cursors, cursor_at(p))
+			primary = len(cursors) - 1
+			self.normalize_cursors()
+			selecting = true
+			select_word = false
+		} else if shift {
+			pc := self.primary_cursor()
+			pc.head = p
+			pc.goal_col = -1
+			selecting = true
+			select_word = false
+		} else if clicks >= 2 {
+			r := buf.word_range_at(p)
+			clear(&cursors)
+			append(&cursors, Cursor{head = r.end, anchor = r.start, goal_col = -1})
+			primary = 0
+			selecting = true
+			select_word = true
+			select_origin = r
+		} else {
+			clear(&cursors)
+			append(&cursors, cursor_at(p))
+			primary = 0
+			selecting = true
+			select_word = false
+		}
+		self.blink_reset()
+	}
+
+	drag :: proc(p: Pos) {
+		if !selecting {
+			return
+		}
+		pc := self.primary_cursor()
+		if select_word {
+			r := buf.word_range_at(p)
+			if pos_less(r.start, select_origin.start) {
+				pc.anchor = select_origin.end
+				pc.head = r.start
+			} else {
+				pc.anchor = select_origin.start
+				pc.head = r.end
+			}
+		} else {
+			pc.head = p
+		}
+		pc.goal_col = -1
+		self.blink_reset()
+	}
+
+	mouse_up :: proc() {
+		if selecting {
+			selecting = false
+			self.normalize_cursors()
+		}
+	}
+}
+
+// --- Drawing -----------------------------------------------------------------
+
+@(private = "file")
+count_digits :: proc(n: int) -> int {
+	d := 1
+	x := n
+	for x >= 10 {
+		x /= 10
+		d += 1
+	}
+	return d
+}
+
+impl App {
+	ensure_cursor_visible :: proc(cell_w, line_h: f32) {
+		p := self.primary_cursor().head
+		y := f32(p.line) * line_h
+		if y < scroll_y {
+			scroll_y = y
+		}
+		if y+line_h > scroll_y+view_h {
+			scroll_y = y + line_h - view_h
+		}
+		x := f32(visual_col(&buf, p.line, p.col)) * cell_w
+		if x < scroll_x {
+			scroll_x = max(0, x-cell_w*4)
+		}
+		if x+cell_w > scroll_x+view_w {
+			scroll_x = x + cell_w*4 - view_w
+		}
+	}
+
+	clamp_scroll :: proc(line_h: f32) {
+		content_h := f32(buf.line_count()+OVERSCROLL_LINES) * line_h
+		scroll_y = clamp(scroll_y, 0, max(0, content_h-view_h))
+		scroll_x = max(scroll_x, 0)
+	}
+
+	draw :: proc(r: ^Renderer, width, height: f32) {
+		highlight_update(&hl, &buf)
+
+		line_h := r.line_h
+		cell_w := r.cell_w
+		status_h = line_h + 8
+		gutter_digits := count_digits(buf.line_count())
+		gutter_cells := f32(gutter_digits + 2)
+		gutter_px = gutter_cells * cell_w
+		view_w = width - gutter_px
+		view_h = height - status_h
+
+		self.clamp_scroll(line_h)
+
+		first_line := max(0, int(scroll_y/line_h))
+		last_line := min(buf.line_count()-1, int((scroll_y+view_h)/line_h)+1)
+
+		// Current-line highlight (single cursor, no selection).
+		if len(cursors) == 1 && !cursor_has_selection(cursors[0]) {
+			y := f32(cursors[0].head.line)*line_h - scroll_y
+			push_rect(r, 0, y, width, line_h, theme.current_line)
+		}
+
+		// Selections.
+		for c in cursors {
+			sel := cursor_range(c)
+			if range_empty(sel) {
+				continue
+			}
+			for line in max(sel.start.line, first_line) ..= min(sel.end.line, last_line) {
+				s_col := sel.start.col if line == sel.start.line else 0
+				e_col := sel.end.col if line == sel.end.line else buf.line_len(line)
+				x0 := gutter_px + f32(visual_col(&buf, line, s_col))*cell_w - scroll_x
+				x1 := gutter_px + f32(visual_col(&buf, line, e_col))*cell_w - scroll_x
+				if line != sel.end.line {
+					x1 += cell_w * 0.5 // show the selected newline
+				}
+				y := f32(line)*line_h - scroll_y
+				push_rect(r, x0, y, max(x1-x0, 2), line_h, theme.selection)
+			}
+		}
+
+		// Text + gutter.
+		cursor_lines := make(map[int]bool, 16, context.temp_allocator)
+		for c in cursors {
+			cursor_lines[c.head.line] = true
+		}
+		for line in first_line ..= last_line {
+			y := f32(line) * line_h - scroll_y
+			baseline := y + r.ascent + (line_h-r.line_h)*0.5
+
+			// Line number, right-aligned in the gutter.
+			num := fmt.tprintf("%d", line+1)
+			num_color := theme.gutter_cur if cursor_lines[line] else theme.gutter_fg
+			nx := gutter_px - cell_w*1.5 - f32(len(num))*cell_w
+			for ch, ci in num {
+				push_glyph(r, nx+f32(ci)*cell_w, baseline, ch, num_color)
+			}
+
+			// Line text with highlight spans.
+			s := buf.line_str(line)
+			spans: []Span
+			if line < len(hl.spans) {
+				spans = hl.spans[line][:]
+			}
+			span_i := 0
+			vis := 0
+			for i := 0; i < len(s); {
+				ch, n := utf8.decode_rune(s[i:])
+				if ch == '\t' {
+					vis = (vis/TAB_W + 1) * TAB_W
+					i += n
+					continue
+				}
+				for span_i < len(spans) && spans[span_i].end <= i {
+					span_i += 1
+				}
+				face := Face.Text
+				if span_i < len(spans) && spans[span_i].start <= i {
+					face = spans[span_i].face
+				}
+				x := gutter_px + f32(vis)*cell_w - scroll_x
+				if x > width {
+					break
+				}
+				if x+cell_w >= gutter_px {
+					push_glyph(r, x, baseline, ch, theme.faces[face])
+				}
+				vis += 1
+				i += n
+			}
+		}
+
+		// Carets (blinking, ~1Hz cycle).
+		if (now_ms-blink_start)/530%2 == 0 {
+			for c in cursors {
+				if c.head.line < first_line || c.head.line > last_line {
+					continue
+				}
+				x := gutter_px + f32(visual_col(&buf, c.head.line, c.head.col))*cell_w - scroll_x
+				y := f32(c.head.line)*line_h - scroll_y
+				if x >= gutter_px-1 {
+					push_rect(r, x-1, y+1, 2, line_h-2, theme.cursor)
+				}
+			}
+		}
+
+		self.draw_status(r, width, height)
+	}
+
+	draw_status :: proc(r: ^Renderer, width, height: f32) {
+		line_h := r.line_h
+		cell_w := r.cell_w
+		y := height - status_h
+		push_rect(r, 0, y, width, status_h, theme.status_bg)
+		baseline := y + 4 + r.ascent
+
+		draw_str :: proc(r: ^Renderer, x, baseline: f32, s: string, color: Color) -> f32 {
+			x := x
+			for ch in s {
+				push_glyph(r, x, baseline, ch, color)
+				x += r.cell_w
+			}
+			return x
+		}
+
+		// Left: dirty marker + path (+ transient message).
+		x := cell_w
+		name := buf.path if buf.path != "" else "[untitled]"
+		if buf.is_dirty() {
+			x = draw_str(r, x, baseline, "● ", theme.faces[.Number])
+		}
+		x = draw_str(r, x, baseline, name, theme.status_fg)
+		if len(status_msg) > 0 && now_ms-status_msg_time < 3000 {
+			x = draw_str(r, x+cell_w*2, baseline, status_msg, theme.faces[.String])
+		}
+
+		// Right: language, cursor count, position.
+		pc := self.primary_cursor()
+		lang_names := [Lang]string {
+			.Plain = "text",
+			.Odin  = "methodin",
+			.JSON  = "json",
+			.GLSL  = "glsl",
+			.HLSL  = "hlsl",
+			.WGSL  = "wgsl",
+		}
+		right: string
+		if len(cursors) > 1 {
+			right = fmt.tprintf("%d cursors  %s  %d:%d", len(cursors), lang_names[hl.lang], pc.head.line+1, visual_col(&buf, pc.head.line, pc.head.col)+1)
+		} else {
+			right = fmt.tprintf("%s  %d:%d", lang_names[hl.lang], pc.head.line+1, visual_col(&buf, pc.head.line, pc.head.col)+1)
+		}
+		draw_str(r, width-f32(len(right)+1)*cell_w, baseline, right, theme.status_dim)
+		_ = line_h
+	}
+}

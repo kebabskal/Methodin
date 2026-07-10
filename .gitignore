@@ -310,3 +310,7 @@ build/
 cmake-build*/
 CMakeLists.txt
 sandbox/
+
+# medit editor binaries
+editor/medit
+editor/medit.exe
