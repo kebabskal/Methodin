@@ -122,7 +122,7 @@ PALETTE_MODE_RENAME :: 6
 
 @(private = "file")
 PALETTE_MODES := []Palette_Mode{
-	{prefix = "", hint = "find a file  ·  > commands  / search  : line  ! outline  # symbols", refresh = files_refresh, accept = files_accept},
+	{prefix = "", hint = "find a file  ·  > commands  / search  : line  ! outline  # symbols  ? problems", refresh = files_refresh, accept = files_accept},
 	{prefix = ">", hint = "run a command", refresh = commands_refresh, accept = commands_accept},
 	{prefix = "/", hint = "search the document", refresh = search_refresh, accept = accept_nothing, preview = search_preview},
 	{prefix = ":", hint = "go to line[:column]", refresh = goto_refresh, accept = accept_nothing, preview = goto_preview},
@@ -131,6 +131,7 @@ PALETTE_MODES := []Palette_Mode{
 	{prefix = "", hint = "new name for the symbol", refresh = rename_refresh, accept = rename_accept},
 	{prefix = "!", hint = "document outline — type to filter", refresh = outline_refresh, accept = accept_nothing, preview = outline_preview},
 	{prefix = "#", hint = "workspace symbols — type to search", refresh = wsymbols_refresh, accept = wsymbols_accept, preview = wsymbols_preview},
+	{prefix = "?", hint = "problems — type to filter", refresh = problems_refresh, accept = problems_pal_accept, preview = problems_pal_preview},
 }
 
 @(private = "file")
@@ -139,9 +140,24 @@ PALETTE_COMMANDS := []Palette_Command{
 	{"File: New Untitled File", "ctrl+n", proc(app: ^App) { app.new_file() }},
 	{"File: Close Tab", "ctrl+w", proc(app: ^App) { app.tab_close(app.active) }},
 	{"File: Open Folder…", "", proc(app: ^App) { open_folder_dialog() }},
+	{"File: Toggle Format on Save", "", proc(app: ^App) {
+		app.format_on_save = !app.format_on_save
+		app.set_status("format on save: on" if app.format_on_save else "format on save: off")
+	}},
+	{"File: Quit (Exit)", "ctrl+q", proc(app: ^App) { request_quit() }},
+	{"File: Copy Path and Line", "", proc(app: ^App) {
+		if app.buf.path == "" {
+			app.set_status("no file path")
+			return
+		}
+		loc := fmt.tprintf("%s:%d", app.buf.path, app.primary_cursor().head.line+1)
+		clipboard_set(loc)
+		app.set_status(fmt.tprintf("copied %s", loc))
+	}},
 	{"View: Next Tab", "ctrl+tab", proc(app: ^App) { app.tab_cycle(1) }},
 	{"View: Previous Tab", "ctrl+shift+tab", proc(app: ^App) { app.tab_cycle(-1) }},
 	{"View: Toggle File Tree Sidebar", "ctrl+b", proc(app: ^App) { app.sidebar.visible = !app.sidebar.visible }},
+	{"View: Toggle Problems Panel", "ctrl+m", proc(app: ^App) { app.problems_open = !app.problems_open }},
 	{"View: Increase Font Size", "ctrl+=", proc(app: ^App) { app.zoom_req = .In }},
 	{"View: Decrease Font Size", "ctrl+-", proc(app: ^App) { app.zoom_req = .Out }},
 	{"View: Reset Font Size", "ctrl+0", proc(app: ^App) { app.zoom_req = .Reset }},
@@ -170,6 +186,10 @@ PALETTE_COMMANDS := []Palette_Command{
 	}},
 	{"Go to Symbol in Workspace…", "ctrl+t", proc(app: ^App) {
 		app.palette_open_with("#")
+		app.palette.keep_open = true
+	}},
+	{"Go to Problem…", "", proc(app: ^App) {
+		app.palette_open_with("?")
 		app.palette.keep_open = true
 	}},
 	{"Find Usages", "ctrl+h", proc(app: ^App) { app.lsp_find_references() }},
@@ -510,6 +530,15 @@ commands_refresh :: proc(app: ^App, q: string) {
 		}
 		push_item(p, cmd.name, cmd.key, ms[:], score = s, data = ci)
 	}
+	// Recent workspaces ride along as commands (data past the static list).
+	for dir, di in app.recent_dirs {
+		label := fmt.tprintf("Open Recent: %s", dir)
+		s, ok := fuzzy_match(q, label, 0, &ms)
+		if !ok {
+			continue
+		}
+		push_item(p, label, "", ms[:], score = s, data = len(PALETTE_COMMANDS)+di)
+	}
 	if len(q) > 0 {
 		slice.sort_by(p.items[:], proc(a, b: Palette_Item) -> bool { return a.score > b.score })
 	}
@@ -517,6 +546,13 @@ commands_refresh :: proc(app: ^App, q: string) {
 
 @(private = "file")
 commands_accept :: proc(app: ^App, it: ^Palette_Item) {
+	if it.data >= len(PALETTE_COMMANDS) {
+		// recent_dirs_add reshuffles the list this string lives in; the
+		// workspace switch needs its own copy.
+		dir := strings.clone(app.recent_dirs[it.data-len(PALETTE_COMMANDS)], context.temp_allocator)
+		app.open_workspace(dir)
+		return
+	}
 	PALETTE_COMMANDS[it.data].run(app)
 }
 
@@ -967,6 +1003,60 @@ wsymbols_accept :: proc(app: ^App, it: ^Palette_Item) {
 	app.lsp_jump(Lsp_Location{path = s.path, line = s.line, char = s.char, eline = s.eline, echar = s.echar})
 }
 
+// --- Mode: problems (?) --------------------------------------------------------------
+
+// "E: msg" labels make severity part of the searchable text ("?E:" filters
+// down to errors). The path matches too, so "?main" works.
+@(private = "file")
+problems_refresh :: proc(app: ^App, q: string) {
+	p := &app.palette
+	ms := make([dynamic]int, context.temp_allocator)
+	for d, i in app.problems {
+		if len(p.items) >= MAX_PALETTE_ITEMS {
+			break
+		}
+		label := fmt.tprintf("%s: %s", severity_letter(d.severity), d.msg)
+		loc := fmt.tprintf("%s:%d", d.path, d.line+1)
+		score, ok := fuzzy_match(q, label, 0, &ms)
+		if !ok {
+			// Match against the location too, without highlight offsets
+			// (they would index into the wrong string).
+			if score, ok = fuzzy_match(q, loc, 0, &ms); ok {
+				clear(&ms)
+			}
+		}
+		if !ok {
+			continue
+		}
+		push_item(p, label, loc, ms[:], score = score, data = i)
+	}
+	if len(q) > 0 {
+		slice.sort_by(p.items[:], proc(a, b: Palette_Item) -> bool { return a.score > b.score })
+	}
+}
+
+@(private = "file")
+problems_pal_accept :: proc(app: ^App, it: ^Palette_Item) {
+	if it.data < len(app.problems) {
+		app.problem_jump(it.data)
+	}
+}
+
+@(private = "file")
+problems_pal_preview :: proc(app: ^App, it: ^Palette_Item) {
+	if it.data >= len(app.problems) {
+		return
+	}
+	d := app.problems[it.data] // copy: open_preview switches documents
+	loc := Lsp_Location{path = d.path, line = d.line, char = d.char, eline = d.eline, echar = d.echar}
+	if loc.path != app.buf.path {
+		if !app.open_preview(loc.path) {
+			return
+		}
+	}
+	app.lsp_select_range(loc)
+}
+
 // --- Mode: rename symbol (F2) --------------------------------------------------------
 
 @(private = "file")
@@ -1358,7 +1448,7 @@ impl App {
 		}
 
 		// Caret.
-		if (now_ms-blink_start)/530%2 == 0 {
+		if self.caret_on(true) {
 			cx := qx + f32(strings.rune_count(q[:p.caret]))*cell_w
 			push_rect(r, cx-1, py+(input_h-line_h)*0.5, 2, line_h, theme.cursor)
 		}

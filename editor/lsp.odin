@@ -40,6 +40,7 @@ Lsp_Req :: enum {
 	Sig_Help,
 	Doc_Symbols,
 	Workspace_Symbols,
+	Format, // format-on-save; the pending write completes when this lands
 }
 
 Hover_State :: enum {
@@ -218,7 +219,7 @@ hexval :: proc(c: u8) -> int {
 	return -1
 }
 
-@(private = "file")
+// Package-visible: problems.odin resolves diagnostics URIs with it.
 path_from_uri :: proc(uri: string) -> string {
 	s := uri
 	if strings.has_prefix(s, "file://") {
@@ -266,7 +267,7 @@ utf16_col :: proc(b: ^Buffer, p: Pos) -> int {
 	return u
 }
 
-@(private = "file")
+// Package-visible: completion applies additionalTextEdits (auto-import).
 buf_pos_from_utf16 :: proc(b: ^Buffer, line, character: int) -> Pos {
 	l := clamp(line, 0, b.line_count()-1)
 	s := b.line_str(l)
@@ -556,7 +557,11 @@ lsp_handle :: proc(app: ^App, body: string) {
 		return
 	}
 
-	if _, has_method := obj["method"]; has_method {
+	if methodv, has_method := obj["method"]; has_method {
+		if jstr(methodv) == "textDocument/publishDiagnostics" {
+			lsp_on_diagnostics(app, obj["params"])
+			return
+		}
 		if idv, has_id := obj["id"]; has_id {
 			// Server→client request; a null result satisfies the ones
 			// ols sends (configuration, registerCapability, ...).
@@ -584,6 +589,9 @@ lsp_handle :: proc(app: ^App, body: string) {
 		#partial switch kind {
 		case .Definition, .References, .Rename, .Initialize:
 			app.set_status(fmt.tprintf("lsp: %s", jstr(jget(errv, "message"))))
+		case .Format:
+			// The formatter failing must never swallow the save.
+			lsp_on_format(app, nil, id)
 		}
 		return // hover/completion/signature errors are not worth a status line
 	}
@@ -608,7 +616,72 @@ lsp_handle :: proc(app: ^App, body: string) {
 		lsp_on_doc_symbols(app, result, id)
 	case .Workspace_Symbols:
 		lsp_on_workspace_symbols(app, result, id)
+	case .Format:
+		lsp_on_format(app, result, id)
 	}
+}
+
+// After a successful write: ols runs its checker on didSave, which feeds the
+// problems panel. The full text rides along (ols re-indexes from it).
+lsp_did_save :: proc(app: ^App) {
+	l := &app.lsp
+	if l.state != .Ready || l.open_uri == "" {
+		return
+	}
+	text := app.buf.text(context.temp_allocator)
+	lsp_notify(l, "textDocument/didSave", fmt.tprintf(
+		`{{"textDocument":{{"uri":"%s"}},"text":"%s"}}`, jesc(l.open_uri), jesc(text)))
+}
+
+// --- Format on save ----------------------------------------------------------------
+
+impl App {
+	// Ask the server to format the current document before saving; the save
+	// itself completes in lsp_on_format (or in format_save_tick on timeout).
+	// Returns false when the request could not be made — caller saves plain.
+	format_request :: proc() -> bool {
+		if !self.lsp_ready_quiet() {
+			return false
+		}
+		lsp_update(self) // push pending edits so the server formats what we see
+		if lsp.synced_version != buf.version || lsp.open_uri == "" {
+			return false
+		}
+		fmt_req = lsp_request(&lsp, .Format, "textDocument/formatting", fmt.tprintf(
+			`{{"textDocument":{{"uri":"%s"}},"options":{{"tabSize":%d,"insertSpaces":false}}}}`,
+			jesc(lsp.open_uri), tab_w))
+		delete(fmt_path)
+		fmt_path = strings.clone(buf.path)
+		fmt_deadline = now_ms + 1500
+		return true
+	}
+
+	// Runs every frame: a formatter that never answers must not hold the
+	// file hostage — save unformatted once the deadline passes.
+	format_save_tick :: proc() {
+		if fmt_req != 0 && now_ms > fmt_deadline {
+			fmt_req = 0
+			if buf.path == fmt_path {
+				self.save_now()
+				self.set_status("saved (formatter timed out)")
+			}
+		}
+	}
+}
+
+@(private = "file")
+lsp_on_format :: proc(app: ^App, result: json.Value, id: int) {
+	if id != app.fmt_req {
+		return // stale
+	}
+	app.fmt_req = 0
+	if app.buf.path != app.fmt_path {
+		return // tab switched mid-save; leave that buffer dirty rather than guess
+	}
+	if edits := jarr(result); len(edits) > 0 {
+		lsp_apply_file_edits(app, app.buf.path, edits)
+	}
+	app.save_now()
 }
 
 // --- Symbols (palette ! outline and # workspace search) ---------------------------

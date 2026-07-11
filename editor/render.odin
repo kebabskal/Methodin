@@ -7,6 +7,7 @@ package medit
 import "core:fmt"
 import "core:math"
 import "core:os"
+import "core:strings"
 import gl "vendor:OpenGL"
 import stbtt "vendor:stb/truetype"
 
@@ -86,14 +87,38 @@ when ODIN_OS == .Windows {
 		"/System/Library/Fonts/SFNSMono.ttf",
 	}
 } else {
+	// Fallbacks for when fc-match is unavailable: Debian/Ubuntu keep fonts
+	// under truetype/<family>/, Arch under TTF/ and <family>/, Fedora under
+	// <package-name>/.
 	@(private = "file")
 	FONT_CANDIDATES := []string{
 		"/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+		"/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
 		"/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
 		"/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+		"/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
 		"/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+		"/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+		"/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
 		"/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
 		"/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+		"/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf",
+	}
+
+	// Distros disagree on font paths, so ask fontconfig where the user's
+	// preferred monospace font lives; it prints its best match even when
+	// nothing is explicitly configured.
+	@(private = "file")
+	fontconfig_monospace :: proc() -> (path: string, ok: bool) {
+		state, stdout, _, err := os.process_exec(
+			{command = []string{"fc-match", "--format=%{file}", "monospace"}},
+			context.temp_allocator,
+		)
+		if err != nil || !state.exited || state.exit_code != 0 {
+			return "", false
+		}
+		p := strings.trim_space(string(stdout))
+		return p, p != ""
 	}
 }
 
@@ -104,6 +129,13 @@ load_font_file :: proc() -> (data: []byte, ok: bool) {
 			return d, true
 		}
 		fmt.eprintfln("medit: MEDIT_FONT=%s could not be read, falling back", env)
+	}
+	when ODIN_OS != .Windows && ODIN_OS != .Darwin {
+		if path, found := fontconfig_monospace(); found {
+			if d, err := os.read_entire_file(path, context.allocator); err == nil {
+				return d, true
+			}
+		}
 	}
 	for path in FONT_CANDIDATES {
 		if d, err := os.read_entire_file(path, context.allocator); err == nil {

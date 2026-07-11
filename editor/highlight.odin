@@ -23,6 +23,19 @@ Face :: enum u8 {
 	Constant, // true/false/nil/null
 	Directive, // #directives, @attributes, @group(...) in wgsl
 	Key, // JSON object keys
+	Bracket1, // rainbow brackets, cycling by nesting depth
+	Bracket2,
+	Bracket3,
+}
+
+bracket_face :: proc(depth: int) -> Face {
+	switch depth %% 3 {
+	case 0:
+		return .Bracket1
+	case 1:
+		return .Bracket2
+	}
+	return .Bracket3
 }
 
 Span :: struct {
@@ -251,6 +264,7 @@ highlight_odin :: proc(h: ^Highlight, b: ^Buffer) {
 		append(&tokens, token)
 	}
 
+	depth := 0
 	for token, i in tokens {
 		start := token.pos.offset
 		end := start + len(token.text)
@@ -265,6 +279,12 @@ highlight_odin :: proc(h: ^Highlight, b: ^Buffer) {
 			face = .Number
 		case token.kind == .Rune || token.kind == .String:
 			face = .String
+		case token.kind == .Open_Paren || token.kind == .Open_Bracket || token.kind == .Open_Brace:
+			face = bracket_face(depth)
+			depth += 1
+		case token.kind == .Close_Paren || token.kind == .Close_Bracket || token.kind == .Close_Brace:
+			depth = max(depth-1, 0)
+			face = bracket_face(depth)
 		case token.kind == .Ident:
 			face = odin_ident_face(tokens[:], i)
 		case token.kind == .Hash || token.kind == .At:
@@ -727,6 +747,7 @@ highlight_generic :: proc(h: ^Highlight, b: ^Buffer) {
 
 	n := len(text)
 	i := 0
+	depth := 0
 	for i < n {
 		c := text[i]
 		switch {
@@ -805,6 +826,16 @@ highlight_generic :: proc(h: ^Highlight, b: ^Buffer) {
 				i += 1
 			}
 			em.emit(start, i, .Directive)
+
+		case c == '(' || c == '[' || c == '{':
+			em.emit(i, i+1, bracket_face(depth))
+			depth += 1
+			i += 1
+
+		case c == ')' || c == ']' || c == '}':
+			depth = max(depth-1, 0)
+			em.emit(i, i+1, bracket_face(depth))
+			i += 1
 
 		case c == '@' && cfg.at_attributes:
 			start := i

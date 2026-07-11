@@ -239,6 +239,9 @@ impl App {
 		self.clear_cursor_undo()
 		retitle = true
 		cwd, _ := os.get_working_directory(context.temp_allocator)
+		if cwd != "" {
+			self.recent_dirs_add(cwd)
+		}
 		self.set_status(fmt.tprintf("workspace: %s", cwd))
 	}
 

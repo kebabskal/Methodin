@@ -52,6 +52,28 @@ open_folder_dialog :: proc() {
 	sdl.ShowOpenFolderDialog(dialog_done, rawptr(uintptr(DIALOG_OPEN_DIR)), main_window, nil, false)
 }
 
+// Keys whose held-down repeats may be dropped when frames fall behind:
+// movement and single-step deletion, where each step is visible feedback.
+// Typing (TEXT_INPUT) is never dropped.
+@(private = "file")
+coalesce_repeat :: proc(key: sdl.Keycode) -> bool {
+	switch key {
+	case sdl.K_LEFT, sdl.K_RIGHT, sdl.K_UP, sdl.K_DOWN,
+	     sdl.K_PAGEUP, sdl.K_PAGEDOWN, sdl.K_HOME, sdl.K_END,
+	     sdl.K_BACKSPACE, sdl.K_DELETE:
+		return true
+	}
+	return false
+}
+
+// Package-visible so the palette's "Quit" command can call it. Pushes a
+// regular .QUIT event, so the unsaved-changes guard still gets its say.
+request_quit :: proc() {
+	e: sdl.Event
+	e.type = .QUIT
+	_ = sdl.PushEvent(&e)
+}
+
 @(private = "file")
 dialog_done :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: c.int) {
 	if filelist == nil || filelist[0] == nil {
@@ -146,14 +168,20 @@ main :: proc() {
 		scale = 1
 	}
 
+	// The zoom level survives restarts (ctrl+0 still resets to FONT_PT).
+	if pt, zok := zoom_pt_load(); zok {
+		font_pt = clamp(pt, FONT_PT_MIN, FONT_PT_MAX)
+	}
+
 	rend: Renderer
-	if !renderer_init(&rend, FONT_PT*scale) {
+	if !renderer_init(&rend, font_pt*scale) {
 		os.exit(1)
 	}
 	defer renderer_destroy(&rend)
 
 	app: App
 	app_init(&app, path)
+	app.recent_dirs_load()
 	defer app_destroy(&app)
 
 	// While the user drags a window edge, the OS traps the event loop in a
@@ -185,8 +213,26 @@ main :: proc() {
 
 		ev: sdl.Event
 		if sdl.WaitEventTimeout(&ev, 120) {
+			// Key-repeat can outpace vsync'd frames; extra repeats would
+			// queue up and play out after release, sailing the cursor past
+			// where the user saw it. Cap repeats at one per key per frame
+			// for keys whose effect must track the screen.
+			seen: [8]sdl.Keycode
+			seen_n := 0
 			for {
-				if !handle_event(&app, &rend, window, &ev, density) {
+				skip := false
+				if ev.type == .KEY_DOWN && ev.key.repeat && coalesce_repeat(ev.key.key) {
+					for i in 0 ..< seen_n {
+						if seen[i] == ev.key.key {
+							skip = true
+						}
+					}
+					if !skip && seen_n < len(seen) {
+						seen[seen_n] = ev.key.key
+						seen_n += 1
+					}
+				}
+				if !skip && !handle_event(&app, &rend, window, &ev, density) {
 					running = false
 				}
 				if !sdl.PollEvent(&ev) {
@@ -202,6 +248,7 @@ main :: proc() {
 
 		lsp_update(&app)
 		lsp_poll(&app)
+		app.format_save_tick()
 		app.lsp_hover_tick(rend.cell_w, rend.line_h)
 
 		if app.want_follow {
@@ -260,6 +307,7 @@ zoom :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, req: Zoom_Req) {
 	}
 	app.sidebar.scroll_y *= ky
 	app.tab_follow = true
+	zoom_pt_save(font_pt)
 	app.set_status(fmt.tprintf("font size: %.0f pt", font_pt))
 }
 
@@ -401,6 +449,13 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		}
 		return false
 
+	case .WINDOW_FOCUS_GAINED:
+		app.focused = true
+		app.blink_reset() // start with a full visible phase
+
+	case .WINDOW_FOCUS_LOST:
+		app.focused = false
+
 	case .KEY_DOWN:
 		app.pending_quit = false
 		handle_key(app, rend, window, ev)
@@ -411,7 +466,7 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 			if app.palette.open {
 				app.palette_insert(text)
 			} else {
-				app.insert_text(text)
+				app.type_text(text)
 				app.completion_after_insert(text)
 				app.sighelp_after_insert(text)
 				app.ensure_cursor_visible(rend.cell_w, rend.line_h)
@@ -442,6 +497,9 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 				case:
 					app.tabbar_click(px, rend.cell_w, 0)
 				}
+			} else if app.problems_open && py >= app.problems_top && py < app.problems_top+app.problems_h {
+				// Before the sidebar: the panel spans the full width.
+				app.problems_click(px, py)
 			} else if px < app.sidebar_px {
 				app.sidebar_click(py, rend.line_h)
 			} else {
@@ -483,7 +541,8 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		}
 
 	case .MOUSE_MOTION:
-		over_ui := ev.motion.x*density < app.sidebar_px || ev.motion.y*density < app.tabbar_h
+		over_ui := ev.motion.x*density < app.sidebar_px || ev.motion.y*density < app.tabbar_h ||
+			(app.problems_open && ev.motion.y*density >= app.problems_top)
 		_ = sdl.SetCursor(cursor_arrow if over_ui else cursor_ibeam)
 		app.hover_motion(ev.motion.x*density, ev.motion.y*density, rend.cell_w, rend.line_h)
 		if app.selecting && !app.palette.open {
@@ -513,6 +572,10 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		} else if ev.wheel.mouse_y*density < app.tabbar_h {
 			// Over the tab bar: scroll the tabs (clamped next draw).
 			app.tab_scroll -= (dy + dx) * rend.cell_w * 6
+		} else if app.problems_open && ev.wheel.mouse_y*density >= app.problems_top &&
+		   ev.wheel.mouse_y*density < app.problems_top+app.problems_h {
+			// Over the problems panel: scroll its rows (clamped next draw).
+			app.problems_scroll -= dy
 		} else if ev.wheel.mouse_x*density < app.sidebar_px {
 			// Over the sidebar: scroll the tree (clamped next draw).
 			app.sidebar.scroll_y -= dy * rend.line_h * 3
@@ -670,6 +733,10 @@ handle_key :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.Eve
 		app.move_cursors(.Word_Left if ctrl else .Left, shift)
 	case key == sdl.K_RIGHT:
 		app.move_cursors(.Word_Right if ctrl else .Right, shift)
+	case ctrl && key == sdl.K_UP:
+		app.semantic_move(-1, shift)
+	case ctrl && key == sdl.K_DOWN:
+		app.semantic_move(1, shift)
 	case key == sdl.K_UP:
 		app.move_cursors(.Up, shift)
 	case key == sdl.K_DOWN:
@@ -728,6 +795,12 @@ handle_key :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.Eve
 		follow = false
 	case ctrl && key == sdl.K_B:
 		app.sidebar.visible = !app.sidebar.visible
+		follow = false
+	case ctrl && key == sdl.K_Q:
+		request_quit()
+		follow = false
+	case ctrl && key == sdl.K_M:
+		app.problems_open = !app.problems_open
 		follow = false
 	case ctrl && key == sdl.K_A:
 		app.select_all()

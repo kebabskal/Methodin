@@ -11,7 +11,6 @@
 package medit
 
 import "core:encoding/json"
-import "core:fmt"
 import "core:strings"
 import "core:unicode/utf8"
 
@@ -24,6 +23,14 @@ Comp_Item :: struct {
 	detail: string, // owned
 	kind:   int,    // LSP CompletionItemKind
 	score:  int,
+	extra:  []Extra_Edit, // owned; additionalTextEdits (auto-import)
+}
+
+// One LSP additionalTextEdit, kept in UTF-16 coords until it is applied.
+Extra_Edit :: struct {
+	line, char:   int,
+	eline, echar: int,
+	text:         string, // owned
 }
 
 Completion :: struct {
@@ -33,9 +40,10 @@ Completion :: struct {
 	sel:        int,
 	scroll:     int,
 	anchor:     Pos, // start of the word being completed (primary cursor)
-	req_id:     int,
-	requested:  bool, // a request is in flight
-	incomplete: bool, // server told us to re-ask as the word grows
+	req_id:      int,
+	requested:   bool, // a request is in flight
+	incomplete:  bool, // server told us to re-ask as the word grows
+	import_mode: bool, // items are import path segments (importcomp.odin)
 }
 
 Sig_Help :: struct {
@@ -69,6 +77,10 @@ completion_items_clear :: proc(c: ^Completion) {
 		delete(it.label)
 		delete(it.insert)
 		delete(it.detail)
+		for e in it.extra {
+			delete(e.text)
+		}
+		delete(it.extra)
 	}
 	clear(&c.items)
 	clear(&c.visible)
@@ -110,7 +122,9 @@ strip_snippet :: proc(s: string) -> (out: string, sel_start, sel_end: int) {
 	sel_start = -1
 	sel_end = -1
 	if !strings.contains_rune(s, '$') {
-		return s, -1, -1
+		// Copy even the no-op case: the caller frees the completion item
+		// (completion_close) before the returned text reaches the buffer.
+		return strings.clone(s, context.temp_allocator), -1, -1
 	}
 	sb := strings.builder_make(context.temp_allocator)
 	best_n := max(int)
@@ -186,6 +200,7 @@ impl App {
 	completion_close :: proc() {
 		completion.open = false
 		completion.requested = false
+		completion.import_mode = false
 		completion_items_clear(&completion)
 	}
 
@@ -242,6 +257,23 @@ impl App {
 	// Runs after every text insertion (from main's TEXT_INPUT).
 	completion_after_insert :: proc(text: string) {
 		last, _ := utf8.decode_last_rune(text)
+		// Inside an import string the popup offers path segments instead of
+		// server symbols (importcomp.odin).
+		if _, _, in_import := self.import_string_at(self.primary_cursor().head); in_import {
+			switch {
+			case last == '"' || last == ':' || last == '/':
+				self.completion_trigger_import()
+			case char_class(last) == 1:
+				if completion.open && completion.import_mode {
+					self.completion_filter()
+				} else {
+					self.completion_trigger_import()
+				}
+			case:
+				self.completion_close()
+			}
+			return
+		}
 		switch {
 		case last == '.':
 			self.completion_close()
@@ -298,11 +330,25 @@ impl App {
 			return
 		}
 		it := &c.items[c.visible[c.sel]]
+		was_import := c.import_mode
+		import_anchor := c.anchor
 		text, ss, se := strip_snippet(it.insert if len(it.insert) > 0 else it.label)
+		// Snapshot the companion edits (auto-import): the close below frees
+		// the item they live in.
+		extras := make([]Extra_Edit, len(it.extra), context.temp_allocator)
+		for e, i in it.extra {
+			extras[i] = e
+			extras[i].text = strings.clone(e.text, context.temp_allocator)
+		}
 		edits := make([dynamic]Edit, context.temp_allocator)
 		for cur in cursors {
 			r := cursor_range(cur)
 			start := word_start_before(&buf, r.start)
+			// Import segments can contain '-' etc.; replace from the segment
+			// start the import trigger recorded, not the word boundary.
+			if was_import && r.start.line == import_anchor.line && import_anchor.col <= r.start.col {
+				start = import_anchor
+			}
 			append(&edits, Edit{range = {start, r.end}, text = text})
 		}
 		self.completion_close()
@@ -320,6 +366,34 @@ impl App {
 			self.blink_reset()
 			// The selected placeholder is usually a call argument.
 			self.sighelp_trigger()
+		}
+		// additionalTextEdits last (typically an import line far above the
+		// insertion); cursors ride across each edit so the caret stays put.
+		for e in extras {
+			r := Range{
+				buf_pos_from_utf16(&buf, e.line, e.char),
+				buf_pos_from_utf16(&buf, e.eline, e.echar),
+			}
+			nr := buf.commit([]Edit{{range = r, text = e.text}}, cursors[:])
+			if len(nr) == 0 {
+				continue
+			}
+			for &cur in cursors {
+				if !pos_less(cur.head, r.end) {
+					cur.head = transform_pos(cur.head, r, nr[0].end)
+				}
+				if !pos_less(cur.anchor, r.end) {
+					cur.anchor = transform_pos(cur.anchor, r, nr[0].end)
+				}
+			}
+		}
+		// Accepting a collection ("core:") descends straight into it —
+		// regardless of whether the item came from the import lister or the
+		// server, so the follow-up list never needs a manual retype.
+		if strings.has_suffix(text, ":") || strings.has_suffix(text, "/") {
+			if _, _, in_import := self.import_string_at(self.primary_cursor().head); in_import {
+				self.completion_trigger_import()
+			}
 		}
 	}
 
@@ -452,11 +526,29 @@ lsp_on_completion :: proc(app: ^App, result: json.Value, id: int) {
 				break
 			}
 		}
+		extra: []Extra_Edit
+		if ae := jarr(jget(v, "additionalTextEdits")); len(ae) > 0 {
+			ex := make([dynamic]Extra_Edit, 0, len(ae))
+			for ev in ae {
+				r := jget(ev, "range")
+				s := jget(r, "start")
+				e := jget(r, "end")
+				append(&ex, Extra_Edit{
+					line  = jint(jget(s, "line")),
+					char  = jint(jget(s, "character")),
+					eline = jint(jget(e, "line")),
+					echar = jint(jget(e, "character")),
+					text  = strings.clone(jstr(jget(ev, "newText"))),
+				})
+			}
+			extra = ex[:]
+		}
 		append(&c.items, Comp_Item{
 			label  = strings.clone(jstr(jget(v, "label"))),
 			insert = strings.clone(insert),
 			detail = strings.clone(detail),
 			kind   = jint(jget(v, "kind")),
+			extra  = extra,
 		})
 	}
 	app.completion_filter()

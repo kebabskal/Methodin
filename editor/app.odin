@@ -16,7 +16,8 @@ OVERSCROLL_LINES :: 4
 UI_ROW_SCALE :: 1.55
 
 // Tab display width; a setting, adjustable from the command palette.
-tab_w: int = 4
+// Indentation is always tab characters — this is only how wide they render.
+tab_w: int = 2
 
 App :: struct {
 	// The active document's state; stashed into docs[active] on tab switch
@@ -77,6 +78,28 @@ App :: struct {
 
 	now_ms:      u64,
 	blink_start: u64,
+	focused:     bool, // window has keyboard focus (main tracks SDL focus events)
+
+	recent_dirs: [dynamic]string, // owned; most recent workspace first
+
+	odin_root_dir:  string, // owned; resolved lazily for import completion
+	odin_root_done: bool,
+
+	// Diagnostics (problems.odin): store + collapsible panel state.
+	problems:        [dynamic]Diagnostic,
+	problems_open:   bool,
+	problems_scroll: f32, // first visible row (fractional while wheeling)
+	problems_h:      f32, // panel height from the last draw (0: closed)
+	problems_top:    f32, // panel top edge (hit testing)
+	p_rows_y:        f32, // first row's top edge
+	p_row_h:         f32,
+	p_row0:          int, // first visible row index
+
+	// Format-on-save (toggle: "File: Toggle Format on Save").
+	format_on_save: bool,
+	fmt_req:        int,    // pending format request id (0: none)
+	fmt_path:       string, // owned; document the pending format belongs to
+	fmt_deadline:   u64,    // save unformatted when the reply misses this
 
 	// Mouse drag state.
 	selecting:   bool,
@@ -115,6 +138,8 @@ Move :: enum {
 
 app_init :: proc(app: ^App, path: string) {
 	app.theme = theme_default()
+	app.focused = true
+	app.format_on_save = true
 	b: Buffer
 	lang := Lang.Plain
 	if path != "" {
@@ -148,11 +173,28 @@ app_destroy :: proc(app: ^App) {
 	delete(app.hover_text)
 	delete(app.col_base)
 	delete(app.status_msg)
+	delete(app.fmt_path)
+	for d in app.recent_dirs {
+		delete(d)
+	}
+	delete(app.recent_dirs)
+	delete(app.odin_root_dir)
+	problems_destroy(app)
 }
 
 impl App {
 	blink_reset :: proc() {
 		blink_start = now_ms
+	}
+
+	// A caret blinks only where keystrokes actually land; pass whether this
+	// caret's widget has input. Carets elsewhere (unfocused window, editor
+	// behind the palette) hold steady instead.
+	caret_on :: proc(has_input: bool) -> bool {
+		if !focused || !has_input {
+			return true
+		}
+		return (now_ms-blink_start)/530%2 == 0
 	}
 
 	set_status :: proc(msg: string) {
@@ -479,9 +521,13 @@ impl App {
 		self.apply_and_place(edits, false)
 	}
 
-	// Enter: newline + copy the current line's leading whitespace.
+	// Enter: newline + copy the current line's leading whitespace. Right
+	// after an opening bracket the new line goes one level deeper, and a
+	// matching closer sitting at the caret drops onto its own line at the
+	// original level (the caret ends up on the indented middle line).
 	insert_newline :: proc() {
 		edits := make([]Edit, len(cursors), context.temp_allocator)
+		mid := make([]bool, len(cursors), context.temp_allocator)
 		for c, i in cursors {
 			r := cursor_range(c)
 			s := buf.line_str(r.start.line)
@@ -489,10 +535,38 @@ impl App {
 			for ws_end < len(s) && ws_end < r.start.col && (s[ws_end] == ' ' || s[ws_end] == '\t') {
 				ws_end += 1
 			}
-			text := strings.concatenate({"\n", s[:ws_end]}, context.temp_allocator)
+			ws := s[:ws_end]
+			opener := byte(0)
+			if r.start.col > 0 && r.start.col <= len(s) {
+				switch s[r.start.col-1] {
+				case '{', '(', '[':
+					opener = s[r.start.col-1]
+				}
+			}
+			text: string
+			e := buf.line_str(r.end.line)
+			if opener != 0 && r.end.col < len(e) && e[r.end.col] == close_for(opener) {
+				text = strings.concatenate({"\n", ws, "\t", "\n", ws}, context.temp_allocator)
+				mid[i] = true
+			} else if opener != 0 {
+				text = strings.concatenate({"\n", ws, "\t"}, context.temp_allocator)
+			} else {
+				text = strings.concatenate({"\n", ws}, context.temp_allocator)
+			}
 			edits[i] = Edit{range = r, text = text}
 		}
-		self.apply_and_place(edits, false)
+		new_ranges := buf.commit(edits, cursors[:])
+		clear(&cursors)
+		for r, i in new_ranges {
+			p := r.end
+			if mid[i] {
+				p = Pos{r.end.line - 1, buf.line_len(r.end.line - 1)}
+			}
+			append(&cursors, cursor_at(p))
+		}
+		primary = len(cursors) - 1
+		self.normalize_cursors()
+		self.blink_reset()
 	}
 
 	delete_backward :: proc() {
@@ -502,6 +576,14 @@ impl App {
 			r := cursor_range(c)
 			if range_empty(r) {
 				r.start = b.prev_pos(r.start)
+				// A caret between an empty pair removes both halves.
+				if r.start.line == r.end.line && r.end.col-r.start.col == 1 {
+					s := b.line_str(r.end.line)
+					if close := close_for(s[r.start.col]); close != 0 &&
+					   r.end.col < len(s) && s[r.end.col] == close {
+						r.end.col += 1
+					}
+				}
 			}
 			edits[i] = Edit{range = r, text = ""}
 		}
@@ -661,8 +743,19 @@ impl App {
 			self.set_status("no file path — start medit with a filename")
 			return
 		}
+		// With a live language server the write completes asynchronously,
+		// after textDocument/formatting answers (lsp.odin).
+		if format_on_save && self.format_request() {
+			self.set_status("formatting…")
+			return
+		}
+		self.save_now()
+	}
+
+	save_now :: proc() {
 		if buffer_save(&buf) {
 			self.set_status("saved")
+			lsp_did_save(self)
 		} else {
 			self.set_status("SAVE FAILED")
 		}
@@ -1171,7 +1264,11 @@ impl App {
 		gutter_cells := f32(gutter_digits + 2)
 		gutter_px = sidebar_px + gutter_cells*cell_w
 		view_w = width - gutter_px
-		view_h = height - status_h - tabbar_h
+		problems_h = 0
+		if problems_open {
+			problems_h = line_h*1.4 + f32(clamp(len(problems), 1, PROBLEMS_VISIBLE))*line_h*1.25
+		}
+		view_h = height - status_h - tabbar_h - problems_h
 
 		self.clamp_scroll(line_h)
 
@@ -1202,6 +1299,8 @@ impl App {
 				push_rect(r, x0, y, max(x1-x0, 2), line_h, theme.selection)
 			}
 		}
+
+		self.brackets_draw(r, first_line, last_line, cell_w, line_h)
 
 		// Text + gutter.
 		cursor_lines := make(map[int]bool, 16, context.temp_allocator)
@@ -1254,8 +1353,8 @@ impl App {
 			}
 		}
 
-		// Carets (blinking, ~1Hz cycle).
-		if (now_ms-blink_start)/530%2 == 0 {
+		// Carets (blinking, ~1Hz cycle; steady while the palette has input).
+		if self.caret_on(!palette.open) {
 			for c in cursors {
 				if c.head.line < first_line || c.head.line > last_line {
 					continue
@@ -1268,9 +1367,12 @@ impl App {
 			}
 		}
 
+		self.problems_draw_inline(r, first_line, last_line, cell_w, line_h)
+
 		self.tabbar_draw(r, width)
 		self.sidebar_draw(r, height)
 		self.draw_status(r, width, height)
+		self.problems_draw(r, width, height)
 		self.hover_draw(r, width, height)
 		self.sighelp_draw(r, width, height)
 		self.completion_draw(r, width, height)
@@ -1309,7 +1411,7 @@ impl App {
 			x = draw_str(r, x+cell_w*2, baseline, status_msg, theme.faces[.String])
 		}
 
-		// Right: language, cursor count, position.
+		// Right: problem counts, language, cursor count, position.
 		pc := self.primary_cursor()
 		right: string
 		if len(cursors) > 1 {
@@ -1317,6 +1419,12 @@ impl App {
 		} else {
 			right = fmt.tprintf("%s  %d:%d", LANG_NAMES[hl.lang], pc.head.line+1, visual_col(&buf, pc.head.line, pc.head.col)+1)
 		}
-		draw_str(r, width-f32(len(right)+2)*cell_w, baseline, right, theme.status_dim)
+		rx := width - f32(len(right)+2)*cell_w
+		draw_str(r, rx, baseline, right, theme.status_dim)
+		if errs, warns := self.problems_count(); errs > 0 || warns > 0 {
+			counts := fmt.tprintf("%dE %dW", errs, warns)
+			draw_str(r, rx-f32(len(counts)+2)*cell_w, baseline,
+				counts, theme.diag_err if errs > 0 else theme.diag_warn)
+		}
 	}
 }
