@@ -12,12 +12,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 
-SIDEBAR_CELLS :: 26
-
-// pending_open sentinel for ctrl+n's discard confirmation ('\x01' can never
-// appear in a real path).
-@(private)
-PENDING_NEW :: "\x01new"
+SIDEBAR_CELLS :: 32
 
 Tree_Node :: struct {
 	name:     string, // owned
@@ -29,10 +24,9 @@ Tree_Node :: struct {
 }
 
 Sidebar :: struct {
-	visible:      bool,
-	root:         Tree_Node,
-	scroll_y:     f32,
-	pending_open: string, // owned; file awaiting a discard-changes confirmation click
+	visible:  bool,
+	root:     Tree_Node,
+	scroll_y: f32,
 }
 
 // One row of the flattened tree, as drawn / hit-tested.
@@ -57,7 +51,6 @@ sidebar_destroy :: proc(sb: ^Sidebar) {
 	node_free_children(&sb.root)
 	delete(sb.root.name)
 	delete(sb.root.path)
-	delete(sb.pending_open)
 }
 
 @(private = "file")
@@ -173,9 +166,15 @@ push_tri :: proc(r: ^Renderer, x, y_center, size: f32, expanded: bool, c: Color)
 }
 
 impl App {
+	// Row index (into sidebar_rows) under a sidebar pixel y; -1 for none/header.
+	sidebar_row_at :: proc(py: f32, line_h: f32) -> int {
+		row_h := line_h * UI_ROW_SCALE
+		return int((py - tabbar_h + sidebar.scroll_y - row_h*0.25) / row_h) - 1
+	}
+
 	// A click at sidebar pixel coordinates: toggle a directory, open a file.
 	sidebar_click :: proc(py: f32, line_h: f32) {
-		row := int((py + sidebar.scroll_y) / line_h) - 1 // row 0 is the header
+		row := self.sidebar_row_at(py, line_h)
 		rows := sidebar_rows(&sidebar)
 		if row < 0 || row >= len(rows) {
 			return
@@ -184,13 +183,13 @@ impl App {
 		if n.is_dir {
 			node_toggle(n)
 		} else {
-			self.request_open(n.path)
+			self.open_file(n.path)
 		}
 	}
 
 	// Right-click on a sidebar file: context menu for it.
 	sidebar_context :: proc(py: f32, line_h: f32) {
-		row := int((py + sidebar.scroll_y) / line_h) - 1 // row 0 is the header
+		row := self.sidebar_row_at(py, line_h)
 		rows := sidebar_rows(&sidebar)
 		if row < 0 || row >= len(rows) {
 			return
@@ -202,17 +201,21 @@ impl App {
 	}
 
 	// Switch the workspace to dir: sidebar, file finder and language server
-	// re-root there. The current buffer survives — its path is re-anchored
+	// re-root there. Open documents survive — their paths are re-anchored
 	// (absolute, or relative to the new root when inside it).
 	open_workspace :: proc(dir: string) {
-		if buf.path != "" {
-			is_abs := strings.has_prefix(buf.path, "/") || (len(buf.path) > 1 && buf.path[1] == ':')
+		for i in 0 ..< len(docs) {
+			b := self.doc_buf(i)
+			if b.path == "" {
+				continue
+			}
+			is_abs := strings.has_prefix(b.path, "/") || (len(b.path) > 1 && b.path[1] == ':')
 			if !is_abs {
 				cwd, _ := os.get_working_directory(context.temp_allocator)
-				abs, jerr := filepath.join({cwd, buf.path}, context.allocator)
+				abs, jerr := filepath.join({cwd, b.path}, context.allocator)
 				if jerr == nil {
-					delete(buf.path)
-					buf.path = abs
+					delete(b.path)
+					b.path = abs
 				}
 			}
 		}
@@ -220,10 +223,14 @@ impl App {
 			self.set_status("could not open folder")
 			return
 		}
-		if buf.path != "" {
-			short := strings.clone(shorten_path(buf.path))
-			delete(buf.path)
-			buf.path = short
+		for i in 0 ..< len(docs) {
+			b := self.doc_buf(i)
+			if b.path == "" {
+				continue
+			}
+			short := strings.clone(shorten_path(b.path))
+			delete(b.path)
+			b.path = short
 		}
 		sidebar_destroy(&sidebar)
 		sidebar = {}
@@ -235,80 +242,23 @@ impl App {
 		self.set_status(fmt.tprintf("workspace: %s", cwd))
 	}
 
-	// Open path, but make losing unsaved changes take a second attempt.
-	request_open :: proc(path: string) {
-		if path == buf.path {
-			return
-		}
-		if buf.is_dirty() && sidebar.pending_open != path {
-			delete(sidebar.pending_open)
-			sidebar.pending_open = strings.clone(path)
-			self.set_status("unsaved changes — ctrl+s to save, open again to discard")
-			return
-		}
-		self.open_file(path)
-	}
-
-	open_file :: proc(path: string) {
-		b, ok := buffer_load(path)
-		if !ok {
-			self.set_status("could not open file")
-			return
-		}
-		buffer_destroy(&buf)
-		buf = b
-		self.reset_view(lang_from_path(path))
-	}
-
-	// ctrl+n: replace the buffer with an empty untitled one (dirty-guarded).
-	new_file :: proc() {
-		if buf.is_dirty() && sidebar.pending_open != PENDING_NEW {
-			delete(sidebar.pending_open)
-			sidebar.pending_open = strings.clone(PENDING_NEW)
-			self.set_status("unsaved changes — ctrl+s to save, ctrl+n again to discard")
-			return
-		}
-		buffer_destroy(&buf)
-		buf = buffer_make()
-		self.reset_view(.Plain)
-	}
-
-	// Shared tail of open_file/new_file: fresh highlight, cursors, view.
-	reset_view :: proc(lang: Lang) {
-		delete(sidebar.pending_open)
-		sidebar.pending_open = ""
-		self.hover_hide()
-		self.completion_close()
-		self.sighelp_close()
-		highlight_destroy(&hl)
-		hl = {}
-		hl.lang = lang
-		clear(&cursors)
-		append(&cursors, cursor_at(Pos{0, 0}))
-		primary = 0
-		scroll_x = 0
-		scroll_y = 0
-		selecting = false
-		self.clear_cursor_undo()
-		retitle = true
-		self.blink_reset()
-	}
-
 	sidebar_draw :: proc(r: ^Renderer, height: f32) {
 		if sidebar_px <= 0 {
 			return
 		}
 		line_h := r.line_h
 		cell_w := r.cell_w
+		row_h := line_h * UI_ROW_SCALE
+		top := tabbar_h
 		h := height - status_h
 
 		// Panel over anything the text area let bleed left, plus a border.
-		push_rect(r, 0, 0, sidebar_px, h, theme.status_bg)
-		push_rect(r, sidebar_px-1, 0, 1, h, color_alpha(theme.gutter_fg, 0.6))
+		push_rect(r, 0, top, sidebar_px, h-top, theme.status_bg)
+		push_rect(r, sidebar_px-1, top, 1, h-top, color_alpha(theme.gutter_fg, 0.6))
 
 		rows := sidebar_rows(&sidebar)
-		content_h := f32(len(rows)+1) * line_h
-		sidebar.scroll_y = clamp(sidebar.scroll_y, 0, max(0, content_h-h))
+		content_h := f32(len(rows)+1)*row_h + row_h*0.5
+		sidebar.scroll_y = clamp(sidebar.scroll_y, 0, max(0, content_h-(h-top)))
 
 		// Truncate with '…' before running into the border.
 		draw_name :: proc(r: ^Renderer, x, baseline, limit: f32, s: string, c: Color) {
@@ -323,31 +273,43 @@ impl App {
 			}
 		}
 
-		// Header: the root directory's name.
-		baseline := r.ascent - sidebar.scroll_y
-		draw_name(r, cell_w, baseline, sidebar_px, sidebar.root.name, theme.status_dim)
+		isz := line_h * 0.62
+
+		// Header: the workspace root, with a folder icon.
+		hy := top + row_h*0.25 - sidebar.scroll_y
+		if hy+row_h >= top {
+			push_icon_folder(r, cell_w*1.6, hy+(row_h-isz)*0.5, isz, theme.faces[.Function])
+			draw_name(r, cell_w*1.6+isz+cell_w*0.8, hy+(row_h-line_h)*0.5+r.ascent, sidebar_px-cell_w,
+				sidebar.root.name, theme.status_fg)
+		}
 
 		for row, i in rows {
-			y := f32(i+1)*line_h - sidebar.scroll_y
-			if y+line_h < 0 {
+			y := top + row_h*0.25 + f32(i+1)*row_h - sidebar.scroll_y
+			if y+row_h < top {
 				continue
 			}
 			if y > h {
 				break
 			}
 			n := row.node
-			if !n.is_dir && n.path == buf.path {
-				push_rect(r, 0, y, sidebar_px-1, line_h, theme.selection)
+			selected := !n.is_dir && n.path == buf.path
+			if selected {
+				push_rect(r, 0, y, sidebar_px-1, row_h, theme.selection)
 			}
-			x := cell_w * (1 + f32(row.depth)*1.5)
+			x := cell_w*1.6 + f32(row.depth)*cell_w*1.6
+			mid := y + row_h*0.5
 			if n.is_dir {
-				push_tri(r, x, y+line_h*0.5, cell_w*0.6, n.expanded, theme.status_dim)
+				push_tri(r, x, mid, cell_w*0.55, n.expanded, theme.status_dim)
 			}
-			color := theme.faces[.Function] if n.is_dir else theme.status_fg
-			if !n.is_dir && n.path == buf.path {
-				color = theme.fg
+			ix := x + cell_w*1.0
+			if n.is_dir {
+				push_icon_folder(r, ix, mid-isz*0.5, isz, color_alpha(theme.faces[.Function], 0.85))
+			} else {
+				push_icon_file(r, ix+isz*0.08, mid-isz*0.5, isz,
+					color_alpha(theme.fg if selected else theme.status_dim, 0.85))
 			}
-			draw_name(r, x+cell_w*1.4, y+r.ascent, sidebar_px, n.name, color)
+			color := theme.fg if selected else theme.status_fg
+			draw_name(r, ix+isz+cell_w*0.8, y+(row_h-line_h)*0.5+r.ascent, sidebar_px-cell_w*0.5, n.name, color)
 		}
 	}
 }

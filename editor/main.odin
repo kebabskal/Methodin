@@ -15,6 +15,11 @@ import gl "vendor:OpenGL"
 import sdl "vendor:sdl3"
 
 FONT_PT :: 15.0
+FONT_PT_MIN :: 7.0
+FONT_PT_MAX :: 40.0
+
+// Current font size; ctrl +/-/0 adjusts it at runtime.
+@(private = "file") font_pt: f32 = FONT_PT
 
 @(private = "file") cursor_ibeam: ^sdl.Cursor
 @(private = "file") cursor_arrow: ^sdl.Cursor
@@ -31,6 +36,16 @@ DIALOG_SAVE_AS :: 1
 DIALOG_OPEN_DIR :: 2
 
 @(private = "file") main_window: ^sdl.Window
+
+// One cmd+w press can arrive twice on macOS: as a KEY_DOWN and as the window
+// menu's Close action (WINDOW_CLOSE_REQUESTED). Each source stamps its tab
+// close so the other can skip the duplicate — without suppressing repeats
+// from the same source (holding ctrl+w keeps closing on Linux/Windows).
+@(private = "file") close_key_ms: u64
+@(private = "file") close_req_ms: u64
+
+@(private = "file")
+CLOSE_DEDUP_MS :: 500
 
 // Package-visible so the palette's "Open Folder…" command can call it.
 open_folder_dialog :: proc() {
@@ -89,6 +104,11 @@ main :: proc() {
 		}
 	}
 
+	// By default SDL also posts QUIT when the last (only) window asks to
+	// close; that would turn a cmd+w tab close into an app exit. Quitting is
+	// handled explicitly in handle_event instead.
+	_ = sdl.SetHint(sdl.HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0")
+
 	if !sdl.Init({.VIDEO, .EVENTS}) {
 		fmt.eprintfln("medit: SDL init failed: %s", sdl.GetError())
 		os.exit(1)
@@ -101,7 +121,9 @@ main :: proc() {
 	sdl.GL_SetAttribute(.DOUBLEBUFFER, 1)
 
 	title := fmt.ctprintf("medit — %s", path if path != "" else "[untitled]")
-	window := sdl.CreateWindow(title, 1200, 800, {.OPENGL, .RESIZABLE, .HIGH_PIXEL_DENSITY})
+	// Borderless: the tab bar doubles as the title bar (drag, window buttons);
+	// hit_test below tells the OS which regions drag and resize.
+	window := sdl.CreateWindow(title, 1200, 800, {.OPENGL, .RESIZABLE, .HIGH_PIXEL_DENSITY, .BORDERLESS})
 	if window == nil {
 		fmt.eprintfln("medit: window creation failed: %s", sdl.GetError())
 		os.exit(1)
@@ -140,6 +162,7 @@ main :: proc() {
 	// that loop, so redraw from one.
 	watch := Watch_Ctx{&app, &rend, window}
 	_ = sdl.AddEventWatch(resize_watch, &watch)
+	_ = sdl.SetWindowHitTest(window, hit_test, &app)
 	ev_file_picked = sdl.RegisterEvents(1)
 
 	_ = sdl.StartTextInput(window)
@@ -172,6 +195,11 @@ main :: proc() {
 			}
 		}
 
+		if app.zoom_req != .None {
+			zoom(&app, &rend, window, app.zoom_req)
+			app.zoom_req = .None
+		}
+
 		lsp_update(&app)
 		lsp_poll(&app)
 		app.lsp_hover_tick(rend.cell_w, rend.line_h)
@@ -191,14 +219,121 @@ main :: proc() {
 	}
 }
 
+// Change the font size: rebuild the glyph atlas and rescale every pixel
+// scroll so each view keeps showing the same spot.
+@(private = "file")
+zoom :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, req: Zoom_Req) {
+	old_pt := font_pt
+	switch req {
+	case .In:
+		font_pt = min(font_pt+1, FONT_PT_MAX)
+	case .Out:
+		font_pt = max(font_pt-1, FONT_PT_MIN)
+	case .Reset:
+		font_pt = FONT_PT
+	case .None:
+		return
+	}
+	if font_pt == old_pt {
+		return
+	}
+	scale := sdl.GetWindowDisplayScale(window)
+	if scale <= 0 {
+		scale = 1
+	}
+	old_cell := rend.cell_w
+	old_line := rend.line_h
+	if !renderer_build_atlas(rend, font_pt*scale) {
+		font_pt = old_pt // atlas kept the old glyphs; keep the old size
+		app.set_status("could not rebuild the font atlas at that size")
+		return
+	}
+	kx := rend.cell_w / old_cell
+	ky := rend.line_h / old_line
+	app.scroll_x *= kx
+	app.scroll_y *= ky
+	for &d, i in app.docs {
+		if i != app.active {
+			d.scroll_x *= kx
+			d.scroll_y *= ky
+		}
+	}
+	app.sidebar.scroll_y *= ky
+	app.tab_follow = true
+	app.set_status(fmt.tprintf("font size: %.0f pt", font_pt))
+}
+
 @(private = "file")
 render_frame :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window) {
+	// Hot reload: each reload dylib carries its own (zeroed) copies of
+	// vendor:OpenGL's impl_* function pointers — dependency-package globals
+	// are not shared with the host. Reload them once per code generation.
+	// (gl.Viewport itself is a wrapper proc, never nil — the loaded pointer
+	// behind it is impl_Viewport.)
+	if gl.impl_Viewport == nil {
+		gl.load_up_to(3, 3, sdl.gl_set_proc_address)
+	}
 	pw, ph: c.int
 	sdl.GetWindowSizeInPixels(window, &pw, &ph)
 	frame_begin(rend, pw, ph, app.theme.bg)
 	app.draw(rend, f32(pw), f32(ph))
 	flush(rend)
 	sdl.GL_SwapWindow(window)
+}
+
+// Tell the OS which parts of the borderless window drag and resize it.
+// Buttons and tabs return NORMAL so they keep receiving clicks; the rest of
+// the tab bar is the drag region.
+@(private = "file")
+hit_test :: proc "c" (win: ^sdl.Window, area: ^sdl.Point, data: rawptr) -> sdl.HitTestResult {
+	context = runtime.default_context()
+	app := (^App)(data)
+
+	// Resize borders (window coordinates, generous edges).
+	w, h: c.int
+	_ = sdl.GetWindowSize(win, &w, &h)
+	M :: 6
+	l := area.x < M
+	rt := area.x >= w-M
+	t := area.y < M
+	b := area.y >= h-M
+	switch {
+	case t && l:
+		return .RESIZE_TOPLEFT
+	case t && rt:
+		return .RESIZE_TOPRIGHT
+	case b && l:
+		return .RESIZE_BOTTOMLEFT
+	case b && rt:
+		return .RESIZE_BOTTOMRIGHT
+	case t:
+		return .RESIZE_TOP
+	case b:
+		return .RESIZE_BOTTOM
+	case l:
+		return .RESIZE_LEFT
+	case rt:
+		return .RESIZE_RIGHT
+	}
+
+	density := sdl.GetWindowPixelDensity(win)
+	if density <= 0 {
+		density = 1
+	}
+	px := f32(area.x) * density
+	py := f32(area.y) * density
+	if py < app.tabbar_h {
+		if app.traffic_hit(px, py) >= 0 {
+			return .NORMAL
+		}
+		for rect in app.tab_rects {
+			if px >= rect[0] && px < rect[1] {
+				return .NORMAL
+			}
+		}
+		return .DRAGGABLE
+	}
+	return .NORMAL
 }
 
 @(private = "file")
@@ -228,7 +363,7 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		raw := string(cstring(ev.user.data1))
 		switch ev.user.code {
 		case DIALOG_OPEN:
-			app.request_open(shorten_path(raw))
+			app.open_file(shorten_path(raw))
 		case DIALOG_SAVE_AS:
 			app.save_as(shorten_path(raw))
 		case DIALOG_OPEN_DIR:
@@ -240,9 +375,34 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 
 	#partial switch ev.type {
 	case .QUIT, .WINDOW_CLOSE_REQUESTED:
+		// On macOS cmd+w also triggers the window menu's Close item, arriving
+		// here as well as as a key event; it means "close tab", not quit.
+		if ev.type == .WINDOW_CLOSE_REQUESTED {
+			mods := sdl.GetModState()
+			if mods&sdl.KMOD_GUI != {} || mods&sdl.KMOD_CTRL != {} {
+				if close_key_ms == 0 || app.now_ms-close_key_ms > CLOSE_DEDUP_MS {
+					close_req_ms = app.now_ms
+					app.tab_close(app.active)
+				}
+				return true
+			}
+		}
+		// Quitting over unsaved changes takes a second attempt.
+		dirty := 0
+		for i in 0 ..< len(app.docs) {
+			if app.doc_buf(i).is_dirty() {
+				dirty += 1
+			}
+		}
+		if dirty > 0 && !app.pending_quit {
+			app.pending_quit = true
+			app.set_status(fmt.tprintf("%d unsaved file(s) — close again to quit anyway", dirty))
+			return true
+		}
 		return false
 
 	case .KEY_DOWN:
+		app.pending_quit = false
 		handle_key(app, rend, window, ev)
 
 	case .TEXT_INPUT:
@@ -259,6 +419,7 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		}
 
 	case .MOUSE_BUTTON_DOWN:
+		app.pending_quit = false
 		app.hover_hide()
 		app.completion_close()
 		app.sighelp_close()
@@ -267,12 +428,27 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		if ev.button.button == sdl.BUTTON_LEFT {
 			if app.palette.open {
 				app.palette_mouse(px, py, rend.line_h)
+			} else if py < app.tabbar_h {
+				switch app.traffic_hit(px, py) {
+				case 0: // close: through the regular quit path (dirty guard)
+					e: sdl.Event
+					e.type = .QUIT
+					_ = sdl.PushEvent(&e)
+				case 1:
+					_ = sdl.MinimizeWindow(window)
+				case 2:
+					fs := sdl.GetWindowFlags(window)&sdl.WINDOW_FULLSCREEN != {}
+					_ = sdl.SetWindowFullscreen(window, !fs)
+				case:
+					app.tabbar_click(px, rend.cell_w, 0)
+				}
 			} else if px < app.sidebar_px {
 				app.sidebar_click(py, rend.line_h)
 			} else {
 				mods := sdl.GetModState()
 				p := app.pos_at_pixel(px, py, rend.cell_w, rend.line_h)
-				if mods&sdl.KMOD_CTRL != {} && mods&sdl.KMOD_ALT == {} {
+				cmd := mods&sdl.KMOD_CTRL != {} || mods&sdl.KMOD_GUI != {} // cmd == ctrl on macOS
+				if cmd && mods&sdl.KMOD_ALT == {} {
 					// ctrl+click: go to definition; +shift: usages.
 					app.click(p, app.vis_at_pixel(px, rend.cell_w), 1, false, false)
 					app.mouse_up()
@@ -288,10 +464,16 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 				}
 			}
 		} else if ev.button.button == sdl.BUTTON_RIGHT && !app.palette.open {
-			if px < app.sidebar_px {
+			if py < app.tabbar_h {
+				app.tabbar_click(px, rend.cell_w, 2)
+			} else if px < app.sidebar_px {
 				app.sidebar_context(py, rend.line_h)
 			} else {
 				app.right_click(app.pos_at_pixel(px, py, rend.cell_w, rend.line_h))
+			}
+		} else if ev.button.button == sdl.BUTTON_MIDDLE && !app.palette.open {
+			if py < app.tabbar_h {
+				app.tabbar_click(px, rend.cell_w, 1)
 			}
 		}
 
@@ -301,7 +483,8 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		}
 
 	case .MOUSE_MOTION:
-		_ = sdl.SetCursor(cursor_arrow if ev.motion.x*density < app.sidebar_px else cursor_ibeam)
+		over_ui := ev.motion.x*density < app.sidebar_px || ev.motion.y*density < app.tabbar_h
+		_ = sdl.SetCursor(cursor_arrow if over_ui else cursor_ibeam)
 		app.hover_motion(ev.motion.x*density, ev.motion.y*density, rend.cell_w, rend.line_h)
 		if app.selecting && !app.palette.open {
 			p := app.pos_at_pixel(ev.motion.x*density, ev.motion.y*density, rend.cell_w, rend.line_h)
@@ -313,14 +496,23 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		app.hover_hide()
 		app.completion_close()
 		app.sighelp_close()
+		// Deltas already follow the system scroll direction (macOS natural
+		// scrolling arrives as .FLIPPED values); use them as-is so content
+		// tracks the fingers, and momentum events just keep scrolling.
 		dy := ev.wheel.y
 		dx := ev.wheel.x
-		if ev.wheel.direction == .FLIPPED {
-			dy = -dy
-			dx = -dx
-		}
-		if app.palette.open {
+		mods := sdl.GetModState()
+		if mods&sdl.KMOD_CTRL != {} || mods&sdl.KMOD_GUI != {} {
+			// Zoom wants the physical direction: wheel/fingers up = in.
+			zy := -dy if ev.wheel.direction == .FLIPPED else dy
+			if zy != 0 {
+				app.zoom_req = .In if zy > 0 else .Out
+			}
+		} else if app.palette.open {
 			app.palette_wheel(dy)
+		} else if ev.wheel.mouse_y*density < app.tabbar_h {
+			// Over the tab bar: scroll the tabs (clamped next draw).
+			app.tab_scroll -= (dy + dx) * rend.cell_w * 6
 		} else if ev.wheel.mouse_x*density < app.sidebar_px {
 			// Over the sidebar: scroll the tree (clamped next draw).
 			app.sidebar.scroll_y -= dy * rend.line_h * 3
@@ -453,6 +645,26 @@ handle_key :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.Eve
 	case key == sdl.K_ESCAPE:
 		app.escape()
 
+	// --- tabs ---
+	case ctrl && key == sdl.K_TAB:
+		app.tab_cycle(-1 if shift else 1)
+		follow = false
+	case ctrl && key == sdl.K_PAGEUP:
+		app.tab_cycle(-1)
+		follow = false
+	case ctrl && key == sdl.K_PAGEDOWN:
+		app.tab_cycle(1)
+		follow = false
+	case ctrl && key == sdl.K_W:
+		if close_req_ms == 0 || app.now_ms-close_req_ms > CLOSE_DEDUP_MS {
+			close_key_ms = app.now_ms
+			app.tab_close(app.active)
+		}
+		follow = false
+	case ctrl && !shift && !alt && key >= sdl.K_1 && key <= sdl.K_9:
+		app.tab_select(int(key - sdl.K_1))
+		follow = false
+
 	// --- movement ---
 	case key == sdl.K_LEFT:
 		app.move_cursors(.Word_Left if ctrl else .Left, shift)
@@ -495,6 +707,24 @@ handle_key :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.Eve
 		follow = false
 	case ctrl && key == sdl.K_P:
 		app.palette_open_with("")
+		follow = false
+	case ctrl && key == sdl.K_F:
+		app.open_search()
+		follow = false
+	case ctrl && key == sdl.K_E:
+		app.palette_open_with("!")
+		follow = false
+	case ctrl && key == sdl.K_T:
+		app.palette_open_with("#")
+		follow = false
+	case ctrl && (key == sdl.K_PLUS || key == sdl.K_EQUALS || key == sdl.K_KP_PLUS):
+		app.zoom_req = .In
+		follow = false
+	case ctrl && (key == sdl.K_MINUS || key == sdl.K_KP_MINUS):
+		app.zoom_req = .Out
+		follow = false
+	case ctrl && key == sdl.K_0:
+		app.zoom_req = .Reset
 		follow = false
 	case ctrl && key == sdl.K_B:
 		app.sidebar.visible = !app.sidebar.visible

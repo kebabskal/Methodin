@@ -315,6 +315,8 @@ sandbox/
 # in editor/, which names the output after the package directory)
 editor/medit
 editor/medit.exe
+editor/editor
+editor/editor.o
 editor/editor.exp
 editor/editor.lib
 editor/SDL3.dll

@@ -35,6 +35,11 @@ Palette_Item :: struct {
 	score:   int,
 	data:    int,    // mode-specific (command index, line, ...)
 	data2:   int,    // mode-specific (column, ...)
+
+	// Optional kind badge drawn before the label (symbol modes): a colored
+	// letter, like the completion popup. 0 = none.
+	kind_ch:   rune,
+	kind_face: Face,
 }
 
 Palette_Mode :: struct {
@@ -51,6 +56,22 @@ Palette_Command :: struct {
 	run:  proc(app: ^App),
 }
 
+// One LSP symbol, backing the outline (!) and workspace symbol (#) modes.
+Symbol_Item :: struct {
+	name:   string, // owned
+	detail: string, // owned; LSP detail or container name
+	path:   string, // owned; "" = the current document (outline)
+	kind:   int,    // LSP SymbolKind
+	line, char, eline, echar: int, // LSP (UTF-16) coordinates
+	depth:  int,    // outline nesting level
+}
+
+Sym_Mode :: enum {
+	None, // nothing fetched yet
+	Outline,
+	Workspace,
+}
+
 Palette :: struct {
 	open:   bool,
 	query:  [dynamic]u8,
@@ -64,8 +85,18 @@ Palette :: struct {
 	ctx_path:    string, // owned; file the context menu is about ("" = editor context)
 	ctx_pos:     Pos,    // symbol position for the rename mode
 	keep_open:   bool,   // an accept proc re-opened the palette; skip the close
+	home_doc:    int,    // tab the palette was opened from (esc returns there)
 
 	usages: [dynamic]Lsp_Location, // owned; backing data for the usages mode
+
+	// Symbol data fetched via LSP; cached across palette opens and refetched
+	// when the stamps below no longer match what is being asked for.
+	symbols:     [dynamic]Symbol_Item,
+	sym_mode:    Sym_Mode,
+	sym_req_id:  int,
+	sym_path:    string, // owned; document the outline was fetched for
+	sym_version: int,    // buffer version the outline was fetched at
+	sym_query:   string, // owned; last workspace query sent
 
 	files:   [dynamic]string, // owned; scanned lazily once per open
 	scanned: bool,
@@ -91,21 +122,33 @@ PALETTE_MODE_RENAME :: 6
 
 @(private = "file")
 PALETTE_MODES := []Palette_Mode{
-	{prefix = "", hint = "type to find a file   ·   > commands   / search   : line", refresh = files_refresh, accept = files_accept},
+	{prefix = "", hint = "find a file  ·  > commands  / search  : line  ! outline  # symbols", refresh = files_refresh, accept = files_accept},
 	{prefix = ">", hint = "run a command", refresh = commands_refresh, accept = commands_accept},
 	{prefix = "/", hint = "search the document", refresh = search_refresh, accept = accept_nothing, preview = search_preview},
 	{prefix = ":", hint = "go to line[:column]", refresh = goto_refresh, accept = accept_nothing, preview = goto_preview},
 	{prefix = "", hint = "context actions — type to filter", refresh = context_refresh, accept = context_accept},
 	{prefix = "", hint = "usages — enter jumps, esc restores", refresh = usages_refresh, accept = usages_accept, preview = usages_preview},
 	{prefix = "", hint = "new name for the symbol", refresh = rename_refresh, accept = rename_accept},
+	{prefix = "!", hint = "document outline — type to filter", refresh = outline_refresh, accept = accept_nothing, preview = outline_preview},
+	{prefix = "#", hint = "workspace symbols — type to search", refresh = wsymbols_refresh, accept = wsymbols_accept, preview = wsymbols_preview},
 }
 
 @(private = "file")
 PALETTE_COMMANDS := []Palette_Command{
 	{"File: Save", "ctrl+s", proc(app: ^App) { app.save() }},
 	{"File: New Untitled File", "ctrl+n", proc(app: ^App) { app.new_file() }},
+	{"File: Close Tab", "ctrl+w", proc(app: ^App) { app.tab_close(app.active) }},
 	{"File: Open Folder…", "", proc(app: ^App) { open_folder_dialog() }},
+	{"View: Next Tab", "ctrl+tab", proc(app: ^App) { app.tab_cycle(1) }},
+	{"View: Previous Tab", "ctrl+shift+tab", proc(app: ^App) { app.tab_cycle(-1) }},
 	{"View: Toggle File Tree Sidebar", "ctrl+b", proc(app: ^App) { app.sidebar.visible = !app.sidebar.visible }},
+	{"View: Increase Font Size", "ctrl+=", proc(app: ^App) { app.zoom_req = .In }},
+	{"View: Decrease Font Size", "ctrl+-", proc(app: ^App) { app.zoom_req = .Out }},
+	{"View: Reset Font Size", "ctrl+0", proc(app: ^App) { app.zoom_req = .Reset }},
+	{"Search Document", "ctrl+f", proc(app: ^App) {
+		app.open_search()
+		app.palette.keep_open = true
+	}},
 	{"Edit: Undo", "ctrl+z", proc(app: ^App) { app.undo() }},
 	{"Edit: Redo", "ctrl+shift+z", proc(app: ^App) { app.redo() }},
 	{"Edit: Toggle Line Comment", "ctrl+'", proc(app: ^App) { app.toggle_comment() }},
@@ -121,6 +164,14 @@ PALETTE_COMMANDS := []Palette_Command{
 	{"Selection: Transform to Uppercase", "", proc(app: ^App) { app.transform_case(true) }},
 	{"Selection: Transform to Lowercase", "", proc(app: ^App) { app.transform_case(false) }},
 	{"Go to Definition", "ctrl+g", proc(app: ^App) { app.lsp_goto_definition() }},
+	{"Go to Symbol in Document…", "ctrl+e", proc(app: ^App) {
+		app.palette_open_with("!")
+		app.palette.keep_open = true
+	}},
+	{"Go to Symbol in Workspace…", "ctrl+t", proc(app: ^App) {
+		app.palette_open_with("#")
+		app.palette.keep_open = true
+	}},
 	{"Find Usages", "ctrl+h", proc(app: ^App) { app.lsp_find_references() }},
 	{"Rename Symbol", "F2", proc(app: ^App) { app.lsp_rename_prompt() }},
 	{"LSP: Restart Language Server", "", proc(app: ^App) { app.lsp_restart() }},
@@ -172,17 +223,19 @@ palette_items_clear :: proc(p: ^Palette) {
 }
 
 @(private = "file")
-push_item :: proc(p: ^Palette, label, detail: string, matches: []int, dim_end := 0, score := 0, data := 0, data2 := 0) {
+push_item :: proc(p: ^Palette, label, detail: string, matches: []int, dim_end := 0, score := 0, data := 0, data2 := 0, kind_ch := rune(0), kind_face := Face.Text) {
 	m := make([]int, len(matches))
 	copy(m, matches)
 	append(&p.items, Palette_Item{
-		label   = strings.clone(label),
-		detail  = strings.clone(detail),
-		matches = m,
-		dim_end = dim_end,
-		score   = score,
-		data    = data,
-		data2   = data2,
+		label     = strings.clone(label),
+		detail    = strings.clone(detail),
+		matches   = m,
+		dim_end   = dim_end,
+		score     = score,
+		data      = data,
+		data2     = data2,
+		kind_ch   = kind_ch,
+		kind_face = kind_face,
 	})
 }
 
@@ -191,6 +244,10 @@ palette_destroy :: proc(p: ^Palette) {
 	delete(p.items)
 	usages_clear(p)
 	delete(p.usages)
+	symbols_clear(p)
+	delete(p.symbols)
+	delete(p.sym_path)
+	delete(p.sym_query)
 	for f in p.files {
 		delete(f)
 	}
@@ -437,7 +494,7 @@ files_refresh :: proc(app: ^App, q: string) {
 
 @(private = "file")
 files_accept :: proc(app: ^App, it: ^Palette_Item) {
-	app.request_open(it.label)
+	app.open_file(it.label)
 }
 
 // --- Mode: commands (>) ----------------------------------------------------------
@@ -711,7 +768,7 @@ context_accept :: proc(app: ^App, it: ^Palette_Item) {
 	p := &app.palette
 	switch Ctx_Action(it.data) {
 	case .Open_File:
-		app.request_open(p.ctx_path)
+		app.open_file(p.ctx_path)
 	case .Copy_Path:
 		clipboard_set(p.ctx_path)
 		app.set_status("path copied")
@@ -786,11 +843,12 @@ usages_refresh :: proc(app: ^App, q: string) {
 
 @(private = "file")
 usages_preview :: proc(app: ^App, it: ^Palette_Item) {
-	u := &app.palette.usages[it.data]
-	if u.path != app.buf.path {
-		return // no live preview across files
+	loc := app.palette.usages[it.data] // copy: open_preview switches documents
+	if loc.path != app.buf.path {
+		if !app.open_preview(loc.path) {
+			return
+		}
 	}
-	loc := u^
 	app.lsp_select_range(loc)
 }
 
@@ -798,6 +856,115 @@ usages_preview :: proc(app: ^App, it: ^Palette_Item) {
 usages_accept :: proc(app: ^App, it: ^Palette_Item) {
 	loc := app.palette.usages[it.data] // used before close frees the list
 	app.lsp_jump(loc)
+}
+
+// --- Modes: document outline (!) and workspace symbols (#) ----------------------------
+
+// Frees the symbol list backing the ! and # modes.
+symbols_clear :: proc(p: ^Palette) {
+	for s in p.symbols {
+		delete(s.name)
+		delete(s.detail)
+		delete(s.path)
+	}
+	clear(&p.symbols)
+}
+
+// LSP SymbolKind → (badge letter, face), like the completion popup.
+@(private = "file")
+sym_kind_badge :: proc(kind: int) -> (rune, Face) {
+	switch kind {
+	case 5, 10, 11, 23, 26: // class, enum, interface, struct, type parameter
+		return 't', .Type
+	case 6, 9, 12, 25: // method, constructor, function, operator
+		return 'f', .Function
+	case 7, 8, 20: // property, field, key
+		return '.', .Key
+	case 14, 16, 17, 22: // constant, number, boolean, enum member
+		return 'c', .Constant
+	case 1, 2, 3, 4: // file, module, namespace, package
+		return 'M', .Directive
+	}
+	return 'v', .Text
+}
+
+@(private = "file")
+outline_refresh :: proc(app: ^App, q: string) {
+	p := &app.palette
+	// Refetch when the cached outline is for another document or version.
+	if p.sym_mode != .Outline || p.sym_path != app.buf.path || p.sym_version != app.buf.version {
+		app.lsp_doc_symbols()
+	}
+	ms := make([dynamic]int, context.temp_allocator)
+	for &s, i in p.symbols {
+		if len(p.items) >= MAX_PALETTE_ITEMS {
+			break
+		}
+		indent := strings.repeat("  ", s.depth, context.temp_allocator)
+		label := strings.concatenate({indent, s.name}, context.temp_allocator)
+		score, ok := fuzzy_match(q, label, 0, &ms)
+		if !ok {
+			continue
+		}
+		detail := s.detail
+		if detail == "" {
+			detail = fmt.tprintf(":%d", s.line+1)
+		}
+		ch, face := sym_kind_badge(s.kind)
+		push_item(p, label, detail, ms[:], score = score, data = i, kind_ch = ch, kind_face = face)
+	}
+	if len(q) > 0 {
+		slice.sort_by(p.items[:], proc(a, b: Palette_Item) -> bool { return a.score > b.score })
+	}
+}
+
+@(private = "file")
+outline_preview :: proc(app: ^App, it: ^Palette_Item) {
+	s := &app.palette.symbols[it.data]
+	app.lsp_select_range(Lsp_Location{path = app.buf.path, line = s.line, char = s.char, eline = s.eline, echar = s.echar})
+}
+
+@(private = "file")
+wsymbols_refresh :: proc(app: ^App, q: string) {
+	p := &app.palette
+	// The server does the searching; re-ask when the query changes.
+	if p.sym_mode != .Workspace || p.sym_query != q {
+		app.lsp_workspace_symbols(q)
+	}
+	ms := make([dynamic]int, context.temp_allocator)
+	for &s, i in p.symbols {
+		if len(p.items) >= MAX_PALETTE_ITEMS {
+			break
+		}
+		score, ok := fuzzy_match(q, s.name, 0, &ms)
+		if !ok {
+			continue
+		}
+		ch, face := sym_kind_badge(s.kind)
+		push_item(p, s.name, fmt.tprintf("%s:%d", s.path, s.line+1), ms[:],
+			score = score, data = i, kind_ch = ch, kind_face = face)
+	}
+	if len(q) > 0 {
+		slice.sort_by(p.items[:], proc(a, b: Palette_Item) -> bool { return a.score > b.score })
+	}
+}
+
+@(private = "file")
+wsymbols_preview :: proc(app: ^App, it: ^Palette_Item) {
+	s := app.palette.symbols[it.data] // copy: open_preview switches documents
+	loc := Lsp_Location{path = s.path, line = s.line, char = s.char, eline = s.eline, echar = s.echar}
+	if loc.path != app.buf.path {
+		if !app.open_preview(loc.path) {
+			return
+		}
+	}
+	app.lsp_select_range(loc)
+}
+
+@(private = "file")
+wsymbols_accept :: proc(app: ^App, it: ^Palette_Item) {
+	s := app.palette.symbols[it.data]
+	app.lsp_jump(Lsp_Location{path = s.path, line = s.line, char = s.char, eline = s.eline, echar = s.echar})
 }
 
 // --- Mode: rename symbol (F2) --------------------------------------------------------
@@ -824,6 +991,7 @@ impl App {
 	palette_open_with :: proc(prefill: string, forced := -1) {
 		if !palette.open {
 			palette.open = true
+			palette.home_doc = active
 			clear(&palette.saved_cursors)
 			for c in cursors {
 				append(&palette.saved_cursors, c)
@@ -837,6 +1005,20 @@ impl App {
 		palette.caret = len(palette.query)
 		self.palette_refresh()
 		self.blink_reset()
+	}
+
+	// ctrl+f: document search, prefilled with the primary selection when it
+	// is a single-line one.
+	open_search :: proc() {
+		needle := ""
+		pc := self.primary_cursor()
+		if cursor_has_selection(pc^) {
+			r := cursor_range(pc^)
+			if r.start.line == r.end.line {
+				needle = buf.range_text(r, context.temp_allocator)
+			}
+		}
+		self.palette_open_with(strings.concatenate({"/", needle}, context.temp_allocator))
 	}
 
 	// ctrl+. anywhere in the editor: context actions for the selection or
@@ -986,6 +1168,7 @@ impl App {
 
 	palette_cancel :: proc() {
 		p := &palette
+		self.preview_abandon() // back to the home doc before restoring its view
 		clear(&cursors)
 		for c in p.saved_cursors {
 			append(&cursors, Cursor{head = buf.clamp_pos(c.head), anchor = buf.clamp_pos(c.anchor), goal_col = c.goal_col})
@@ -1002,6 +1185,22 @@ impl App {
 
 	palette_close :: proc() {
 		p := &palette
+		// The preview tab either becomes real (the user landed on it) or
+		// goes away with the palette.
+		preview = false
+		i := 0
+		for i < len(docs) {
+			if i != active && docs[i].preview {
+				doc_destroy(&docs[i])
+				ordered_remove(&docs, i)
+				if i < active {
+					active -= 1
+				}
+				tab_follow = true
+				continue
+			}
+			i += 1
+		}
 		p.open = false
 		p.forced_mode = -1
 		delete(p.ctx_path)
@@ -1026,7 +1225,7 @@ impl App {
 		if py < p.l_row0 {
 			return // input row
 		}
-		row := p.scroll + int((py-p.l_row0)/line_h)
+		row := p.scroll + int((py-p.l_row0)/(line_h*UI_ROW_SCALE))
 		if row >= 0 && row < len(p.items) {
 			p.sel = row
 			self.palette_accept()
@@ -1116,7 +1315,7 @@ impl App {
 		p := &palette
 		line_h := r.line_h
 		cell_w := r.cell_w
-		pad := cell_w
+		pad := cell_w * 1.5
 
 		draw_str :: proc(r: ^Renderer, x, baseline: f32, s: string, color: Color) -> f32 {
 			x := x
@@ -1132,21 +1331,22 @@ impl App {
 
 		mode := &PALETTE_MODES[p.mode_i]
 		vis := min(len(p.items), PALETTE_VISIBLE)
+		row_h := line_h * UI_ROW_SCALE
 
-		pw := min(cell_w*84, width*0.8)
+		pw := min(cell_w*92, width*0.85)
 		px := (width - pw) * 0.5
-		py := line_h * 0.7
-		input_h := line_h + pad
-		ph := input_h + f32(max(vis, 1))*line_h + pad*0.5
+		py := tabbar_h + line_h*0.6
+		input_h := line_h * 1.9
+		ph := input_h + f32(max(vis, 1))*row_h + pad*0.8
 
 		push_rect(r, px-1, py-1, pw+2, ph+2, color_alpha(theme.gutter_fg, 0.8))
 		push_rect(r, px, py, pw, ph, theme.status_bg)
-		push_rect(r, px+pad*0.5, py+pad*0.4, pw-pad, line_h+pad*0.2, theme.bg)
+		push_rect(r, px+pad*0.5, py+(input_h-line_h)*0.5-3, pw-pad, line_h+6, theme.bg)
 
 		// Input: prefix in accent, rest normal, hint while empty.
 		q := string(p.query[:])
 		qx := px + pad
-		qbase := py + pad*0.5 + r.ascent
+		qbase := py + (input_h-line_h)*0.5 + r.ascent
 		x := qx
 		for ch, i in q {
 			color := theme.faces[.Keyword] if i < len(mode.prefix) else theme.fg
@@ -1160,7 +1360,7 @@ impl App {
 		// Caret.
 		if (now_ms-blink_start)/530%2 == 0 {
 			cx := qx + f32(strings.rune_count(q[:p.caret]))*cell_w
-			push_rect(r, cx-1, py+pad*0.5, 2, line_h, theme.cursor)
+			push_rect(r, cx-1, py+(input_h-line_h)*0.5, 2, line_h, theme.cursor)
 		}
 
 		// Match counter, right-aligned in the input row.
@@ -1170,7 +1370,7 @@ impl App {
 		}
 
 		// Rows.
-		row0 := py + input_h + pad*0.25
+		row0 := py + input_h + pad*0.4
 		p.lx = px
 		p.ly = py
 		p.lw = pw
@@ -1188,19 +1388,20 @@ impl App {
 
 		if len(p.items) == 0 {
 			if len(q) > len(mode.prefix) {
-				draw_str(r, px+pad, row0+r.ascent, "no results", theme.status_dim)
+				draw_str(r, px+pad, row0+(row_h-line_h)*0.5+r.ascent, "no results", theme.status_dim)
 			}
 			return
 		}
 
+		isz := line_h * 0.62
 		for vi in 0 ..< vis {
 			i := p.scroll + vi
 			it := &p.items[i]
-			y := row0 + f32(vi)*line_h
+			y := row0 + f32(vi)*row_h
 			if i == p.sel {
-				push_rect(r, px, y, pw, line_h, theme.selection)
+				push_rect(r, px, y, pw, row_h, theme.selection)
 			}
-			baseline := y + r.ascent
+			baseline := y + (row_h-line_h)*0.5 + r.ascent
 
 			right := px + pw - pad
 			if len(it.detail) > 0 {
@@ -1208,7 +1409,15 @@ impl App {
 				_ = draw_str(r, right, baseline, it.detail, theme.status_dim)
 				right -= cell_w * 2
 			}
-			palette_draw_label(r, px+pad, baseline, right-(px+pad), it, &theme)
+			lx := px + pad
+			if it.kind_ch != 0 {
+				push_glyph(r, lx, baseline, it.kind_ch, theme.faces[it.kind_face])
+				lx += cell_w * 2
+			} else if p.mode_i == PALETTE_MODE_FILES || p.mode_i == PALETTE_MODE_USAGES {
+				push_icon_file(r, lx, y+(row_h-isz)*0.5, isz, color_alpha(theme.status_dim, 0.9))
+				lx += isz + cell_w*0.9
+			}
+			palette_draw_label(r, lx, baseline, right-lx, it, &theme)
 		}
 	}
 }

@@ -8,12 +8,32 @@ the editor's own internals use in-struct procs and `impl` blocks throughout
 
 ## What it does
 
+- **Custom title bar** — no native window chrome: the tab bar doubles as the
+  title bar, with traffic-light window buttons (close / minimize /
+  fullscreen), draggable empty space, and resizable window edges, all drawn
+  by the editor itself. Closing with unsaved files takes a confirming second
+  attempt.
+- **Tabs** — every file opens in its own tab with its own undo history,
+  cursors, scroll position and selection history. Click to switch, `×` or
+  middle-click to close (a dirty file shows a dot instead of `×`, and closing
+  it takes a confirming second attempt), right-click for the file context
+  menu, mouse wheel to scroll an overflowing tab bar. `ctrl+tab` /
+  `ctrl+shift+tab` (also `ctrl+pgup/pgdn`) cycle, `ctrl+1..9` jump,
+  `ctrl+w` closes. Go-to-definition and find-usages open their targets in
+  tabs too, and an LSP rename touching a file that is open in another tab
+  edits that buffer (undoable) instead of clobbering it on disk. Closing the
+  window with unsaved files anywhere also takes a second attempt.
 - **Command palette** — `ctrl+p`, vscode-style. Fuzzy file finder by default
   (`/` and `\` are interchangeable, matches highlighted, filename hits ranked
   first); prefix `>` for app commands and settings (`ctrl+shift+p` jumps
-  straight there), `/term` for live document search (up/down hops between
-  matches, esc restores the view), `:line[:col]` to jump. Modes are a table in
-  `palette.odin` — a new one is a prefix plus refresh/accept/preview procs.
+  straight there), `/term` for live document search (`ctrl+f`, up/down hops
+  between matches, esc restores the view), `:line[:col]` to jump,
+  `!` for the LSP document outline (`ctrl+e`) and `#` for workspace symbol
+  search (`ctrl+t`) — both with kind badges and live preview. Previews of
+  results in other files open them in a single transient preview tab: enter
+  keeps it as a real tab, esc drops it and restores where you were. Modes are
+  a table in `palette.odin` — a new one is a prefix plus refresh/accept/preview
+  procs.
   The context menu (`ctrl+.`, or right-click) is a palette mode too: actions
   for the current selection or symbol (select all occurrences, search, case
   transforms, ...), or for a file when triggered on the sidebar or a palette
@@ -34,9 +54,9 @@ the editor's own internals use in-struct procs and `impl` blocks throughout
   Other languages are one case in `lsp_server_exe` (`lsp.odin`). The client
   is thread-free: JSON-RPC over stdio, polled from the main loop.
 - **File tree sidebar** — the working directory as a lazily-loaded tree
-  (`ctrl+b` to toggle). Click a directory to expand it, a file to open it;
-  collapsing and re-expanding a directory re-reads it from disk. Opening over
-  unsaved changes takes a confirming second click.
+  (`ctrl+b` to toggle). Click a directory to expand it, a file to open it
+  (in its existing tab if it already has one); collapsing and re-expanding
+  a directory re-reads it from disk.
 - **Multiple cursors** — `ctrl+alt+↑/↓` to stack cursors, `ctrl+d` to select
   the next occurrence, `alt+click` to add a cursor anywhere. Every editing
   action is a batch of `(range, text)` replacements, one per cursor, applied
@@ -116,10 +136,17 @@ at runtime (the current buffer survives the move).
 | `ctrl+a` | select all |
 | `ctrl+p` | command palette (files; `>` commands, `/` search, `:` goto) |
 | `ctrl+shift+p` | command palette, commands mode |
+| `ctrl+f` | search the document (prefills the selection) |
+| `ctrl+e` | document outline (palette `!` mode) |
+| `ctrl+t` | workspace symbol search (palette `#` mode) |
+| `ctrl++` / `ctrl+-` / `ctrl+0` | font size up / down / reset (also ctrl+wheel) |
 | `ctrl+b` | toggle the file tree sidebar |
-| `ctrl+n` | new untitled file |
+| `ctrl+n` | new untitled tab |
 | `ctrl+o` | open file (system dialog) |
 | `ctrl+s` | save (untitled: system save dialog) |
+| `ctrl+w` | close tab (unsaved: press twice) |
+| `ctrl+tab` / `ctrl+shift+tab` | next / previous tab (also `ctrl+pgup/pgdn`) |
+| `ctrl+1..9` | jump to tab 1..9 |
 
 `cmd` works as `ctrl` on macOS.
 
@@ -127,6 +154,7 @@ at runtime (the current buffer survives the move).
 
 ```
 buffer.odin     line-array buffer, batched edits, undo/redo   (tested)
+tabs.odin       multiple documents + tab bar (per-doc undo/cursors/scroll)   (tested)
 filetree.odin   file tree sidebar (lazy directory nodes, open-on-click)
 palette.odin    ctrl+p palette (mode registry: files / commands / search / goto / ...)
 lsp.odin        LSP client (stdio JSON-RPC, polled; definition/references/rename/hover)
@@ -144,6 +172,6 @@ are completion, hover, and `publishDiagnostics` squiggles (notifications are
 already received, just ignored), plus per-language server configs
 (`glsl_analyzer`, `vscode-json-language-server`, ...).
 
-Known limits, deliberately: one buffer per window, no splits yet, undo is
-per-keystroke (not coalesced), whole-buffer relex, glyph atlas covers
-ASCII + Latin-1 + common punctuation (anything else renders as a box).
+Known limits, deliberately: no splits yet, undo is per-keystroke (not
+coalesced), whole-buffer relex, glyph atlas covers ASCII + Latin-1 + common
+punctuation (anything else renders as a box).

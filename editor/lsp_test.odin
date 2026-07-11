@@ -38,7 +38,10 @@ send_frame :: proc(w: ^os.File, body: string) {
 test_uri :: proc() -> string {
 	cwd, _ := os.get_working_directory(context.temp_allocator)
 	sb := strings.builder_make(context.temp_allocator)
-	strings.write_string(&sb, "file:///")
+	strings.write_string(&sb, "file://")
+	if len(cwd) > 0 && cwd[0] != '/' {
+		strings.write_byte(&sb, '/') // Windows drive paths: file:///C:/...
+	}
 	for i in 0 ..< len(cwd) {
 		strings.write_byte(&sb, '/' if cwd[i] == '\\' else cwd[i])
 	}
@@ -51,6 +54,13 @@ test_uri :: proc() -> string {
 @(private = "file")
 with_uri :: proc(template: string) -> string {
 	out, _ := strings.replace_all(template, "@URI@", test_uri(), context.temp_allocator)
+	return out
+}
+
+// @URI@ and @ID@ substitution (JSON braces must stay away from tprintf).
+@(private = "file")
+with_uri_id :: proc(template: string, id: int) -> string {
+	out, _ := strings.replace_all(with_uri(template), "@ID@", fmt.tprintf("%d", id), context.temp_allocator)
 	return out
 }
 
@@ -263,6 +273,70 @@ test_lsp_sighelp :: proc(t: ^testing.T) {
 	send_frame(srv, `{"jsonrpc":"2.0","id":8,"result":null}`)
 	lsp_poll(&app)
 	testing.expect(t, !app.sighelp.open)
+}
+
+@test
+test_palette_workspace_symbols :: proc(t: ^testing.T) {
+	app, srv := lsp_test_app("x := 1\n")
+	defer app_destroy(&app)
+	app.lsp.open_uri = strings.clone(test_uri())
+
+	// Opening the palette in # mode fires the workspace/symbol request.
+	app.palette_open_with("#buf")
+	testing.expect_value(t, app.palette.sym_mode, Sym_Mode.Workspace)
+	testing.expect_value(t, app.palette.sym_query, "buf")
+	req_id := app.palette.sym_req_id
+
+	send_frame(srv, with_uri_id(`{"jsonrpc":"2.0","id":@ID@,"result":[`+
+		`{"name":"Buffer","kind":23,"location":{"uri":"@URI@","range":{"start":{"line":47,"character":0},"end":{"line":47,"character":6}}}},`+
+		`{"name":"buffer_make","kind":12,"location":{"uri":"@URI@","range":{"start":{"line":427,"character":0},"end":{"line":427,"character":11}}}}]}`,
+		req_id))
+	lsp_poll(&app)
+
+	testing.expect_value(t, len(app.palette.symbols), 2)
+	testing.expect_value(t, len(app.palette.items), 2)
+	if len(app.palette.items) == 2 {
+		testing.expect_value(t, app.palette.items[0].label, "Buffer")
+		testing.expect_value(t, app.palette.items[0].kind_ch, 't')
+	}
+
+	// Typing re-queries; a stale answer for the old query is dropped.
+	app.palette_insert("f")
+	testing.expect_value(t, app.palette.sym_query, "buff")
+	send_frame(srv, with_uri_id(`{"jsonrpc":"2.0","id":@ID@,"result":[{"name":"stale","kind":12,"location":{"uri":"@URI@","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}`,
+		req_id))
+	lsp_poll(&app)
+	testing.expect_value(t, len(app.palette.symbols), 2) // unchanged
+}
+
+@test
+test_palette_outline :: proc(t: ^testing.T) {
+	app, srv := lsp_test_app("Foo :: struct {}\nbar :: proc() {}\n")
+	defer app_destroy(&app)
+	app.lsp.open_uri = strings.clone(test_uri())
+
+	app.palette_open_with("!")
+	testing.expect_value(t, app.palette.sym_mode, Sym_Mode.Outline)
+	req_id := app.palette.sym_req_id
+
+	// Hierarchical DocumentSymbol with a child.
+	send_frame(srv, with_uri_id(`{"jsonrpc":"2.0","id":@ID@,"result":[`+
+		`{"name":"Foo","kind":23,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":16}},`+
+		`"selectionRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},`+
+		`"children":[{"name":"x","kind":8,"selectionRange":{"start":{"line":0,"character":14},"end":{"line":0,"character":15}}}]},`+
+		`{"name":"bar","kind":12,"selectionRange":{"start":{"line":1,"character":0},"end":{"line":1,"character":3}}}]}`,
+		req_id))
+	lsp_poll(&app)
+
+	testing.expect_value(t, len(app.palette.symbols), 3)
+	testing.expect_value(t, len(app.palette.items), 3)
+	if len(app.palette.items) == 3 {
+		testing.expect_value(t, app.palette.items[0].label, "Foo")
+		testing.expect_value(t, app.palette.items[1].label, "  x") // indented child
+	}
+	// Selecting the second symbol previews it: cursor lands on its range.
+	app.palette_move(1)
+	testing.expect_value(t, cursor_range(app.cursors[0]).start, Pos{0, 14})
 }
 
 @test

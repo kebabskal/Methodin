@@ -38,6 +38,8 @@ Lsp_Req :: enum {
 	Hover,
 	Completion,
 	Sig_Help,
+	Doc_Symbols,
+	Workspace_Symbols,
 }
 
 Hover_State :: enum {
@@ -168,7 +170,10 @@ jesc :: proc(s: string) -> string {
 @(private = "file")
 uri_from_abs :: proc(abs: string) -> string {
 	sb := strings.builder_make(context.temp_allocator)
-	strings.write_string(&sb, "file:///")
+	strings.write_string(&sb, "file://")
+	if len(abs) > 0 && abs[0] != '/' {
+		strings.write_byte(&sb, '/') // Windows drive paths: file:///C:/...
+	}
 	for i in 0 ..< len(abs) {
 		c := abs[i]
 		switch c {
@@ -216,10 +221,8 @@ hexval :: proc(c: u8) -> int {
 @(private = "file")
 path_from_uri :: proc(uri: string) -> string {
 	s := uri
-	if strings.has_prefix(s, "file:///") {
-		s = s[len("file:///"):]
-	} else if strings.has_prefix(s, "file://") {
-		s = s[len("file://"):]
+	if strings.has_prefix(s, "file://") {
+		s = s[len("file://"):] // keeps the leading '/' of the absolute path
 	}
 	sb := strings.builder_make(context.temp_allocator)
 	i := 0
@@ -233,10 +236,21 @@ path_from_uri :: proc(uri: string) -> string {
 				continue
 			}
 		}
-		strings.write_byte(&sb, '\\' if c == '/' else c)
+		when ODIN_OS == .Windows {
+			strings.write_byte(&sb, '\\' if c == '/' else c)
+		} else {
+			strings.write_byte(&sb, c)
+		}
 		i += 1
 	}
-	return shorten_path(strings.to_string(sb))
+	path := strings.to_string(sb)
+	when ODIN_OS == .Windows {
+		// file:///C:/x decodes to \C:\x — drop the leading separator.
+		if len(path) > 2 && path[0] == '\\' && path[2] == ':' {
+			path = path[1:]
+		}
+	}
+	return shorten_path(path)
 }
 
 // LSP columns are UTF-16 code units; buffer columns are bytes.
@@ -336,12 +350,15 @@ lsp_start :: proc(app: ^App, exe: string) {
 	l.next_id = 1
 
 	cwd, _ := os.get_working_directory(context.temp_allocator)
+	root := jesc(uri_from_abs(cwd))
 	params := fmt.tprintf(
 		// snippetSupport matters: Methodin-ols only offers method completion
 		// to snippet-capable clients (its method inserts are snippets, which
 		// completion_accept resolves).
-		`{{"processId":null,"clientInfo":{{"name":"medit"}},"rootUri":"%s","capabilities":{{"textDocument":{{"definition":{{}},"references":{{}},"rename":{{}},"hover":{{}},"completion":{{"completionItem":{{"snippetSupport":true}}}},"signatureHelp":{{}}}}}}}}`,
-		jesc(uri_from_abs(cwd)))
+		// workspaceFolders matters too: ols indexes workspace symbols (and
+		// walks references) from that list, not from rootUri.
+		`{{"processId":null,"clientInfo":{{"name":"medit"}},"rootUri":"%s","workspaceFolders":[{{"uri":"%s","name":"%s"}}],"capabilities":{{"textDocument":{{"definition":{{}},"references":{{}},"rename":{{}},"hover":{{}},"completion":{{"completionItem":{{"snippetSupport":true}}}},"signatureHelp":{{}},"documentSymbol":{{"hierarchicalDocumentSymbolSupport":true}}}},"workspace":{{"symbol":{{}}}}}}}}`,
+		root, root, jesc(filepath.base(cwd)))
 	_ = lsp_request(l, .Initialize, "initialize", params)
 }
 
@@ -587,6 +604,97 @@ lsp_handle :: proc(app: ^App, body: string) {
 		lsp_on_completion(app, result, id)
 	case .Sig_Help:
 		lsp_on_sighelp(app, result, id)
+	case .Doc_Symbols:
+		lsp_on_doc_symbols(app, result, id)
+	case .Workspace_Symbols:
+		lsp_on_workspace_symbols(app, result, id)
+	}
+}
+
+// --- Symbols (palette ! outline and # workspace search) ---------------------------
+
+// DocumentSymbol {name, kind, selectionRange, children} (hierarchical) or
+// SymbolInformation {name, kind, location} (flat) — both are handled.
+@(private = "file")
+lsp_on_doc_symbols :: proc(app: ^App, result: json.Value, id: int) {
+	p := &app.palette
+	if id != p.sym_req_id {
+		return // stale
+	}
+	symbols_clear(p)
+	walk :: proc(p: ^Palette, v: json.Value, depth: int) {
+		if len(p.symbols) >= 2000 {
+			return
+		}
+		name := jstr(jget(v, "name"))
+		if name == "" {
+			return
+		}
+		rng := jget(v, "selectionRange")
+		if rng == nil {
+			rng = jget(jget(v, "location"), "range")
+		}
+		s := jget(rng, "start")
+		e := jget(rng, "end")
+		detail := jstr(jget(v, "detail"))
+		if detail == "" {
+			detail = jstr(jget(v, "containerName"))
+		}
+		append(&p.symbols, Symbol_Item{
+			name   = strings.clone(name),
+			detail = strings.clone(detail),
+			path   = strings.clone(""),
+			kind   = jint(jget(v, "kind")),
+			line   = jint(jget(s, "line")),
+			char   = jint(jget(s, "character")),
+			eline  = jint(jget(e, "line")),
+			echar  = jint(jget(e, "character")),
+			depth  = depth,
+		})
+		for c in jarr(jget(v, "children")) {
+			walk(p, c, depth+1)
+		}
+	}
+	for v in jarr(result) {
+		walk(p, v, 0)
+	}
+	if p.open {
+		app.palette_refresh()
+	}
+}
+
+@(private = "file")
+lsp_on_workspace_symbols :: proc(app: ^App, result: json.Value, id: int) {
+	p := &app.palette
+	if id != p.sym_req_id {
+		return // an answer for an older query
+	}
+	symbols_clear(p)
+	for v in jarr(result) {
+		if len(p.symbols) >= 500 {
+			break
+		}
+		name := jstr(jget(v, "name"))
+		if name == "" {
+			continue
+		}
+		loc := jget(v, "location")
+		rng := jget(loc, "range")
+		s := jget(rng, "start")
+		e := jget(rng, "end")
+		append(&p.symbols, Symbol_Item{
+			name   = strings.clone(name),
+			detail = strings.clone(jstr(jget(v, "containerName"))),
+			path   = strings.clone(path_from_uri(jstr(jget(loc, "uri")))),
+			kind   = jint(jget(v, "kind")),
+			line   = jint(jget(s, "line")),
+			char   = jint(jget(s, "character")),
+			eline  = jint(jget(e, "line")),
+			echar  = jint(jget(e, "character")),
+		})
+	}
+	if p.open {
+		app.palette_refresh()
 	}
 }
 
@@ -681,6 +789,19 @@ lsp_apply_file_edits :: proc(app: ^App, path: string, edits: json.Array) -> bool
 
 	if path == app.buf.path {
 		app.apply_keep_selections(to_buf_edits(&app.buf, edits))
+		return true
+	}
+	// Open in another tab: edit that buffer (kept dirty, in its undo history)
+	// instead of clobbering it on disk behind its back.
+	for &d, i in app.docs {
+		if i == app.active || d.buf.path != path {
+			continue
+		}
+		d.buf.commit(to_buf_edits(&d.buf, edits), d.cursors[:])
+		for &c in d.cursors {
+			c.head = d.buf.clamp_pos(c.head)
+			c.anchor = d.buf.clamp_pos(c.anchor)
+		}
 		return true
 	}
 	b, ok := buffer_load(path)
@@ -813,6 +934,32 @@ impl App {
 		lsp_request(&lsp, .Rename, "textDocument/rename", params)
 	}
 
+	// Fetch the document outline (palette ! mode). Stamps what it fetched so
+	// the palette only refetches when the document actually changed.
+	lsp_doc_symbols :: proc() {
+		if !self.lsp_ready_quiet() {
+			return
+		}
+		palette.sym_mode = .Outline
+		delete(palette.sym_path)
+		palette.sym_path = strings.clone(buf.path)
+		palette.sym_version = buf.version
+		palette.sym_req_id = lsp_request(&lsp, .Doc_Symbols, "textDocument/documentSymbol",
+			fmt.tprintf(`{{"textDocument":{{"uri":"%s"}}}}`, jesc(lsp.open_uri)))
+	}
+
+	// Search workspace symbols (palette # mode); the latest query wins.
+	lsp_workspace_symbols :: proc(q: string) {
+		if !self.lsp_ready_quiet() {
+			return
+		}
+		palette.sym_mode = .Workspace
+		delete(palette.sym_query)
+		palette.sym_query = strings.clone(q)
+		palette.sym_req_id = lsp_request(&lsp, .Workspace_Symbols, "workspace/symbol",
+			fmt.tprintf(`{{"query":"%s"}}`, jesc(q)))
+	}
+
 	// Select loc's range in the current buffer (no file switch, no undo mark) —
 	// live preview for the usages list.
 	lsp_select_range :: proc(loc: Lsp_Location) {
@@ -825,12 +972,12 @@ impl App {
 		self.blink_reset()
 	}
 
-	// Jump to a resolved location, opening its file if needed.
+	// Jump to a resolved location, opening its file (in a tab) if needed.
 	lsp_jump :: proc(loc: Lsp_Location) {
 		if loc.path != buf.path {
-			self.request_open(loc.path)
+			self.open_file(loc.path)
 			if buf.path != loc.path {
-				return // dirty guard blocked it; the status bar explains
+				return // could not be opened; the status bar explains
 			}
 		}
 		self.push_cursor_undo()
@@ -916,7 +1063,7 @@ impl App {
 		if now_ms - mouse_moved_ms < HOVER_DELAY_MS {
 			return
 		}
-		if mouse_x < gutter_px || mouse_y < 0 || mouse_y >= view_h {
+		if mouse_x < gutter_px || mouse_y < tabbar_h || mouse_y >= tabbar_h+view_h {
 			return
 		}
 		p := self.pos_at_pixel(mouse_x, mouse_y, cell_w, line_h)
@@ -988,10 +1135,10 @@ impl App {
 
 		// Anchor under the hovered word; flip above if it doesn't fit.
 		ax := gutter_px + f32(visual_col(&buf, hover_pos.line, hover_pos.col))*cell_w - scroll_x
-		ay := f32(hover_pos.line+1)*line_h - scroll_y + 2
+		ay := tabbar_h + f32(hover_pos.line+1)*line_h - scroll_y + 2
 		ax = clamp(ax, sidebar_px, max(sidebar_px, width-w))
 		if ay+h > height-status_h {
-			ay = f32(hover_pos.line)*line_h - scroll_y - h - 2
+			ay = tabbar_h + f32(hover_pos.line)*line_h - scroll_y - h - 2
 		}
 		ay = max(ay, 0)
 

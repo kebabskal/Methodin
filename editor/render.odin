@@ -5,12 +5,14 @@
 package medit
 
 import "core:fmt"
+import "core:math"
 import "core:os"
 import gl "vendor:OpenGL"
 import stbtt "vendor:stb/truetype"
 
-ATLAS_W :: 1024
-ATLAS_H :: 1024
+// 2048² fits the ~190 packed glyphs up to ~40pt at 2× display scale.
+ATLAS_W :: 2048
+ATLAS_H :: 2048
 ASCII_FIRST :: 32
 ASCII_COUNT :: 95 // 32..126
 LATIN1_FIRST :: 0xA0
@@ -112,8 +114,45 @@ load_font_file :: proc() -> (data: []byte, ok: bool) {
 }
 
 renderer_init :: proc(r: ^Renderer, font_px: f32) -> bool {
-	r.font_px = font_px
+	// GL objects.
+	program, prog_ok := gl.load_shaders_source(VS_SRC, FS_SRC)
+	if !prog_ok {
+		msg, _ := gl.get_last_error_message()
+		fmt.eprintfln("medit: shader compile failed: %s", msg)
+		return false
+	}
+	r.program = program
+	r.u_screen = gl.GetUniformLocation(program, "u_screen")
 
+	gl.GenVertexArrays(1, &r.vao)
+	gl.BindVertexArray(r.vao)
+	gl.GenBuffers(1, &r.vbo)
+	gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
+	stride := i32(VERTEX_FLOATS * size_of(f32))
+	gl.VertexAttribPointer(0, 2, gl.FLOAT, false, stride, 0)
+	gl.EnableVertexAttribArray(0)
+	gl.VertexAttribPointer(1, 2, gl.FLOAT, false, stride, 2*size_of(f32))
+	gl.EnableVertexAttribArray(1)
+	gl.VertexAttribPointer(2, 4, gl.FLOAT, false, stride, 4*size_of(f32))
+	gl.EnableVertexAttribArray(2)
+
+	gl.GenTextures(1, &r.atlas_tex)
+	gl.BindTexture(gl.TEXTURE_2D, r.atlas_tex)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+
+	gl.Enable(gl.BLEND)
+	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+
+	return renderer_build_atlas(r, font_px)
+}
+
+// (Re)pack the glyph atlas at font_px and refresh the metrics — also called
+// at runtime for font-size changes. On failure the renderer keeps its
+// previous atlas and metrics.
+renderer_build_atlas :: proc(r: ^Renderer, font_px: f32) -> bool {
 	ttf, ok := load_font_file()
 	if !ok {
 		fmt.eprintln("medit: no usable monospace font found (set MEDIT_FONT=/path/to/font.ttf)")
@@ -132,6 +171,10 @@ renderer_init :: proc(r: ^Renderer, font_px: f32) -> bool {
 		return false
 	}
 
+	ascii:  [ASCII_COUNT]stbtt.packedchar
+	latin1: [LATIN1_COUNT]stbtt.packedchar
+	punct:  [PUNCT_COUNT]stbtt.packedchar
+
 	bitmap := make([]byte, ATLAS_W*ATLAS_H, context.temp_allocator)
 
 	spc: stbtt.pack_context
@@ -139,10 +182,17 @@ renderer_init :: proc(r: ^Renderer, font_px: f32) -> bool {
 		return false
 	}
 	stbtt.PackSetOversampling(&spc, 2, 2)
-	stbtt.PackFontRange(&spc, raw_data(ttf), 0, font_px, ASCII_FIRST, ASCII_COUNT, &r.ascii[0])
-	stbtt.PackFontRange(&spc, raw_data(ttf), 0, font_px, LATIN1_FIRST, LATIN1_COUNT, &r.latin1[0])
-	stbtt.PackFontRange(&spc, raw_data(ttf), 0, font_px, PUNCT_FIRST, PUNCT_COUNT, &r.punct[0])
+	ok1 := stbtt.PackFontRange(&spc, raw_data(ttf), 0, font_px, ASCII_FIRST, ASCII_COUNT, &ascii[0])
+	ok2 := stbtt.PackFontRange(&spc, raw_data(ttf), 0, font_px, LATIN1_FIRST, LATIN1_COUNT, &latin1[0])
+	ok3 := stbtt.PackFontRange(&spc, raw_data(ttf), 0, font_px, PUNCT_FIRST, PUNCT_COUNT, &punct[0])
 	stbtt.PackEnd(&spc)
+	if ok1 == 0 || ok2 == 0 || ok3 == 0 {
+		return false // glyphs did not fit; keep the previous atlas
+	}
+	r.ascii = ascii
+	r.latin1 = latin1
+	r.punct = punct
+	r.font_px = font_px
 
 	// Stamp a solid white block in the bottom-right corner for rect fills.
 	// Glyphs pack top-down, so with ~190 glyphs the bottom rows are free.
@@ -169,39 +219,9 @@ renderer_init :: proc(r: ^Renderer, font_px: f32) -> bool {
 		r.line_h = font_px * 1.2
 	}
 
-	// GL objects.
-	program, prog_ok := gl.load_shaders_source(VS_SRC, FS_SRC)
-	if !prog_ok {
-		msg, _ := gl.get_last_error_message()
-		fmt.eprintfln("medit: shader compile failed: %s", msg)
-		return false
-	}
-	r.program = program
-	r.u_screen = gl.GetUniformLocation(program, "u_screen")
-
-	gl.GenVertexArrays(1, &r.vao)
-	gl.BindVertexArray(r.vao)
-	gl.GenBuffers(1, &r.vbo)
-	gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
-	stride := i32(VERTEX_FLOATS * size_of(f32))
-	gl.VertexAttribPointer(0, 2, gl.FLOAT, false, stride, 0)
-	gl.EnableVertexAttribArray(0)
-	gl.VertexAttribPointer(1, 2, gl.FLOAT, false, stride, 2*size_of(f32))
-	gl.EnableVertexAttribArray(1)
-	gl.VertexAttribPointer(2, 4, gl.FLOAT, false, stride, 4*size_of(f32))
-	gl.EnableVertexAttribArray(2)
-
-	gl.GenTextures(1, &r.atlas_tex)
 	gl.BindTexture(gl.TEXTURE_2D, r.atlas_tex)
 	gl.PixelStorei(gl.UNPACK_ALIGNMENT, 1)
 	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.R8, ATLAS_W, ATLAS_H, 0, gl.RED, gl.UNSIGNED_BYTE, raw_data(bitmap))
-	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-
-	gl.Enable(gl.BLEND)
-	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 	return true
 }
 
@@ -237,6 +257,37 @@ push_quad :: proc(r: ^Renderer, x0, y0, x1, y1, u0, v0, u1, v1: f32, c: Color) {
 
 push_rect :: proc(r: ^Renderer, x, y, w, h: f32, c: Color) {
 	push_quad(r, x, y, x+w, y+h, r.white_uv.x, r.white_uv.y, r.white_uv.x, r.white_uv.y, c)
+}
+
+// --- Icons: tiny vector shapes built from rects, so they scale with the
+// font and need nothing from the atlas. ---------------------------------------
+
+// Filled disc approximated with horizontal slices.
+push_disc :: proc(r: ^Renderer, cx, cy, radius: f32, c: Color) {
+	SLICES :: 10
+	step := radius * 2 / SLICES
+	for i in 0 ..< SLICES {
+		y0 := -radius + f32(i)*step
+		ymid := y0 + step*0.5
+		half := math.sqrt(max(radius*radius - ymid*ymid, 0))
+		push_rect(r, cx-half, cy+y0, half*2, step+0.4, c)
+	}
+}
+
+// A document sheet with a folded top-right corner.
+push_icon_file :: proc(r: ^Renderer, x, y, size: f32, c: Color) {
+	w := size * 0.78
+	fold := size * 0.32
+	push_rect(r, x, y, w-fold, size, c)
+	push_rect(r, x+w-fold, y+fold, fold, size-fold, c)
+	push_rect(r, x+w-fold, y+fold*0.45, fold*0.55, fold*0.55, color_alpha(c, 0.55))
+}
+
+// A folder: tab on top of the body.
+push_icon_folder :: proc(r: ^Renderer, x, y, size: f32, c: Color) {
+	tab_h := size * 0.22
+	push_rect(r, x, y+size*0.10, size*0.45, tab_h, c)
+	push_rect(r, x, y+size*0.10+tab_h*0.6, size*0.92, size*0.62, c)
 }
 
 // Draw one glyph with its baseline at (x, baseline_y). Unknown runes render

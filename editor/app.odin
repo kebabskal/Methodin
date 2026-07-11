@@ -12,17 +12,43 @@ import "core:unicode/utf8"
 
 OVERSCROLL_LINES :: 4
 
+// UI list rows (sidebar, palette) in line_h units — roomier than text lines.
+UI_ROW_SCALE :: 1.55
+
 // Tab display width; a setting, adjustable from the command palette.
 tab_w: int = 4
 
 App :: struct {
+	// The active document's state; stashed into docs[active] on tab switch
+	// (see tabs.odin).
 	buf:     Buffer,
 	hl:      Highlight,
-	theme:   Theme,
 	cursors: [dynamic]Cursor,
 	primary: int, // index of the most recently active cursor
 
 	scroll_x, scroll_y: f32, // pixels
+
+	// Selection history for ctrl+u (cursor undo).
+	cursor_undo: [dynamic][]Cursor,
+
+	preview: bool, // this document is the transient palette-preview tab
+
+	docs:   [dynamic]Doc, // every open document; docs[active] is stale (see tabs.odin)
+	active: int,
+
+	pending_close: int,  // tab awaiting a discard-changes confirmation; -1 = none
+	pending_quit:  bool, // window close was refused once over unsaved changes
+
+	tab_scroll: f32,             // tab bar horizontal scroll (pixels)
+	tab_follow: bool,            // scroll the active tab into view on the next draw
+	tab_rects:  [dynamic][2]f32, // per-tab [x0, x1] from the last draw (hit testing)
+
+	// Window control buttons in the custom title bar: {cx, cy, radius} each,
+	// and where the tab strip starts (from the last draw).
+	traffic:     [3][3]f32,
+	traffic_end: f32,
+
+	theme: Theme,
 
 	sidebar:    Sidebar,
 	palette:    Palette,
@@ -31,6 +57,7 @@ App :: struct {
 	sighelp:    Sig_Help,
 	retitle: bool, // buffer path changed; main should refresh the window title
 	want_follow: bool, // something moved the cursor; main should scroll to it
+	zoom_req: Zoom_Req, // font-size change for main to apply (owns the renderer)
 
 	// Hover tooltip (LSP), driven by mouse dwell.
 	hover_state:    Hover_State,
@@ -42,9 +69,10 @@ App :: struct {
 	mouse_moved_ms: u64,
 
 	// View geometry, updated every draw (pixels).
-	view_w, view_h: f32, // text viewport (excludes sidebar, gutter and status bar)
+	view_w, view_h: f32, // text viewport (excludes sidebar, gutter, tab bar and status bar)
 	sidebar_px:     f32,
 	gutter_px:      f32, // left edge of the text area (includes sidebar_px)
+	tabbar_h:       f32, // top edge of the text area
 	status_h:       f32,
 
 	now_ms:      u64,
@@ -61,11 +89,15 @@ App :: struct {
 	col_origin_vis:  int,
 	col_base:        [dynamic]Cursor, // cursors present when the gesture started
 
-	// Selection history for ctrl+u (cursor undo).
-	cursor_undo: [dynamic][]Cursor,
-
 	status_msg:      string,
 	status_msg_time: u64,
+}
+
+Zoom_Req :: enum {
+	None,
+	In,
+	Out,
+	Reset,
 }
 
 Move :: enum {
@@ -83,35 +115,38 @@ Move :: enum {
 
 app_init :: proc(app: ^App, path: string) {
 	app.theme = theme_default()
+	b: Buffer
+	lang := Lang.Plain
 	if path != "" {
-		if b, ok := buffer_load(path); ok {
-			app.buf = b
-		} else {
-			app.buf = buffer_make(path) // new file at that path
+		ok: bool
+		if b, ok = buffer_load(path); !ok {
+			b = buffer_make(path) // new file at that path
 		}
+		lang = lang_from_path(path)
 	} else {
-		app.buf = buffer_make()
+		b = buffer_make()
 	}
-	app.hl.lang = lang_from_path(path)
-	append(&app.cursors, cursor_at(Pos{0, 0}))
+	app.doc_append(b, lang)
 	sidebar_init(&app.sidebar)
 }
 
 app_destroy :: proc(app: ^App) {
-	buffer_destroy(&app.buf)
-	highlight_destroy(&app.hl)
+	for &d, i in app.docs {
+		if i != app.active {
+			doc_destroy(&d)
+		}
+	}
+	delete(app.docs)
+	delete(app.tab_rects)
+	live := app.live_doc()
+	doc_destroy(&live)
 	sidebar_destroy(&app.sidebar)
 	palette_destroy(&app.palette)
 	lsp_stop(&app.lsp)
 	completion_destroy(&app.completion)
 	delete(app.sighelp.label)
 	delete(app.hover_text)
-	delete(app.cursors)
 	delete(app.col_base)
-	for s in app.cursor_undo {
-		delete(s)
-	}
-	delete(app.cursor_undo)
 	delete(app.status_msg)
 }
 
@@ -963,7 +998,7 @@ impl App {
 
 	// Convert a pixel position (already in framebuffer scale) to a buffer Pos.
 	pos_at_pixel :: proc(px, py: f32, cell_w, line_h: f32) -> Pos {
-		line := int((py + scroll_y) / line_h)
+		line := int((py - tabbar_h + scroll_y) / line_h)
 		line = clamp(line, 0, buf.line_count()-1)
 		vis := self.vis_at_pixel(px, cell_w)
 		return Pos{line, col_from_visual(&buf, line, vis)}
@@ -1093,11 +1128,21 @@ impl App {
 	ensure_cursor_visible :: proc(cell_w, line_h: f32) {
 		p := self.primary_cursor().head
 		y := f32(p.line) * line_h
-		if y < scroll_y {
-			scroll_y = y
-		}
-		if y+line_h > scroll_y+view_h {
-			scroll_y = y + line_h - view_h
+		if palette.open {
+			// Palette previews: always anchor the target a few rows below the
+			// floating palette — a fixed spot the eye can stay on, never at
+			// the bottom of the screen or behind the palette. (The generous
+			// margin also absorbs the stored layout lagging a frame when the
+			// item list grows.)
+			occ_top := clamp(palette.ly+palette.lh-tabbar_h+line_h*3, 0, max(view_h-line_h*3, 0))
+			scroll_y = y - occ_top
+		} else {
+			if y < scroll_y {
+				scroll_y = y
+			}
+			if y+line_h > scroll_y+view_h {
+				scroll_y = y + line_h - view_h
+			}
 		}
 		x := f32(visual_col(&buf, p.line, p.col)) * cell_w
 		if x < scroll_x {
@@ -1119,13 +1164,14 @@ impl App {
 
 		line_h := r.line_h
 		cell_w := r.cell_w
-		status_h = line_h + 8
+		status_h = line_h * 1.8
+		tabbar_h = line_h * 2.1
 		sidebar_px = min(SIDEBAR_CELLS*cell_w, width*0.35) if sidebar.visible else 0
 		gutter_digits := count_digits(buf.line_count())
 		gutter_cells := f32(gutter_digits + 2)
 		gutter_px = sidebar_px + gutter_cells*cell_w
 		view_w = width - gutter_px
-		view_h = height - status_h
+		view_h = height - status_h - tabbar_h
 
 		self.clamp_scroll(line_h)
 
@@ -1134,7 +1180,7 @@ impl App {
 
 		// Current-line highlight (single cursor, no selection).
 		if len(cursors) == 1 && !cursor_has_selection(cursors[0]) {
-			y := f32(cursors[0].head.line)*line_h - scroll_y
+			y := tabbar_h + f32(cursors[0].head.line)*line_h - scroll_y
 			push_rect(r, sidebar_px, y, width-sidebar_px, line_h, theme.current_line)
 		}
 
@@ -1152,7 +1198,7 @@ impl App {
 				if line != sel.end.line {
 					x1 += cell_w * 0.5 // show the selected newline
 				}
-				y := f32(line)*line_h - scroll_y
+				y := tabbar_h + f32(line)*line_h - scroll_y
 				push_rect(r, x0, y, max(x1-x0, 2), line_h, theme.selection)
 			}
 		}
@@ -1163,7 +1209,7 @@ impl App {
 			cursor_lines[c.head.line] = true
 		}
 		for line in first_line ..= last_line {
-			y := f32(line) * line_h - scroll_y
+			y := tabbar_h + f32(line)*line_h - scroll_y
 			baseline := y + r.ascent + (line_h-r.line_h)*0.5
 
 			// Line number, right-aligned in the gutter.
@@ -1215,13 +1261,14 @@ impl App {
 					continue
 				}
 				x := gutter_px + f32(visual_col(&buf, c.head.line, c.head.col))*cell_w - scroll_x
-				y := f32(c.head.line)*line_h - scroll_y
+				y := tabbar_h + f32(c.head.line)*line_h - scroll_y
 				if x >= gutter_px-1 {
 					push_rect(r, x-1, y+1, 2, line_h-2, theme.cursor)
 				}
 			}
 		}
 
+		self.tabbar_draw(r, width)
 		self.sidebar_draw(r, height)
 		self.draw_status(r, width, height)
 		self.hover_draw(r, width, height)
@@ -1235,7 +1282,8 @@ impl App {
 		cell_w := r.cell_w
 		y := height - status_h
 		push_rect(r, 0, y, width, status_h, theme.status_bg)
-		baseline := y + 4 + r.ascent
+		push_rect(r, 0, y, width, 1, color_alpha(theme.gutter_fg, 0.6))
+		baseline := y + (status_h-line_h)*0.5 + r.ascent
 
 		draw_str :: proc(r: ^Renderer, x, baseline: f32, s: string, color: Color) -> f32 {
 			x := x
@@ -1246,12 +1294,16 @@ impl App {
 			return x
 		}
 
-		// Left: dirty marker + path (+ transient message).
-		x := cell_w
-		name := buf.path if buf.path != "" else "[untitled]"
+		// Left: dirty dot + file icon + path (+ transient message).
+		x := cell_w * 2
 		if buf.is_dirty() {
-			x = draw_str(r, x, baseline, "● ", theme.faces[.Number])
+			push_disc(r, x+cell_w*0.3, y+status_h*0.5, cell_w*0.3, theme.faces[.Number])
+			x += cell_w * 1.7
 		}
+		isz := line_h * 0.62
+		push_icon_file(r, x, y+(status_h-isz)*0.5, isz, color_alpha(theme.status_dim, 0.9))
+		x += isz + cell_w*0.8
+		name := buf.path if buf.path != "" else "[untitled]"
 		x = draw_str(r, x, baseline, name, theme.status_fg)
 		if len(status_msg) > 0 && now_ms-status_msg_time < 3000 {
 			x = draw_str(r, x+cell_w*2, baseline, status_msg, theme.faces[.String])
@@ -1265,7 +1317,6 @@ impl App {
 		} else {
 			right = fmt.tprintf("%s  %d:%d", LANG_NAMES[hl.lang], pc.head.line+1, visual_col(&buf, pc.head.line, pc.head.col)+1)
 		}
-		draw_str(r, width-f32(len(right)+1)*cell_w, baseline, right, theme.status_dim)
-		_ = line_h
+		draw_str(r, width-f32(len(right)+2)*cell_w, baseline, right, theme.status_dim)
 	}
 }
