@@ -38,6 +38,27 @@ DIALOG_SAVE_AS :: 1
 @(private = "file")
 DIALOG_OPEN_DIR :: 2
 
+// The workspace folder as an SDL dialog start location. SDL splits the
+// location at the last path separator into folder + suggested filename, so
+// the trailing separator makes the dialog open *inside* the workspace (empty
+// filename) rather than in its parent. Temp cstring; SDL copies it here.
+@(private = "file")
+workspace_dialog_dir :: proc() -> cstring {
+	cwd, err := os.get_working_directory(context.temp_allocator)
+	if err != nil || cwd == "" {
+		return nil
+	}
+	when ODIN_OS == .Windows {
+		SEP :: "\\"
+	} else {
+		SEP :: "/"
+	}
+	if !strings.has_suffix(cwd, SEP) {
+		cwd = strings.concatenate({cwd, SEP}, context.temp_allocator)
+	}
+	return strings.clone_to_cstring(cwd, context.temp_allocator)
+}
+
 @(private = "file") main_window: ^sdl.Window
 
 // One cmd+w press can arrive twice on macOS: as a KEY_DOWN and as the window
@@ -52,7 +73,7 @@ CLOSE_DEDUP_MS :: 500
 
 // Package-visible so the palette's "Open Folder…" command can call it.
 open_folder_dialog :: proc() {
-	sdl.ShowOpenFolderDialog(dialog_done, rawptr(uintptr(DIALOG_OPEN_DIR)), main_window, nil, false)
+	sdl.ShowOpenFolderDialog(dialog_done, rawptr(uintptr(DIALOG_OPEN_DIR)), main_window, workspace_dialog_dir(), false)
 }
 
 // Keys whose held-down repeats may be dropped when frames fall behind:
@@ -1011,12 +1032,12 @@ handle_key :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.Eve
 		app.new_file()
 		follow = false
 	case ctrl && key == sdl.K_O:
-		sdl.ShowOpenFileDialog(dialog_done, rawptr(uintptr(DIALOG_OPEN)), window, nil, 0, nil, false)
+		sdl.ShowOpenFileDialog(dialog_done, rawptr(uintptr(DIALOG_OPEN)), window, nil, 0, workspace_dialog_dir(), false)
 		follow = false
 	case ctrl && key == sdl.K_S:
 		if app.buf.path == "" {
 			// Untitled: pick a path first.
-			sdl.ShowSaveFileDialog(dialog_done, rawptr(uintptr(DIALOG_SAVE_AS)), window, nil, 0, nil)
+			sdl.ShowSaveFileDialog(dialog_done, rawptr(uintptr(DIALOG_SAVE_AS)), window, nil, 0, workspace_dialog_dir())
 		} else {
 			app.save()
 		}
