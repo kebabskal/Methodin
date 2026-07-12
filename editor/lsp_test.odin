@@ -301,6 +301,8 @@ test_palette_workspace_symbols :: proc(t: ^testing.T) {
 	}
 
 	// Typing re-queries; a stale answer for the old query is dropped.
+	// (The prefill opens selected — collapse it first, as End would.)
+	app.palette_caret_move(2)
 	app.palette_insert("f")
 	testing.expect_value(t, app.palette.sym_query, "buff")
 	send_frame(srv, with_uri_id(`{"jsonrpc":"2.0","id":@ID@,"result":[{"name":"stale","kind":12,"location":{"uri":"@URI@","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}`,
@@ -329,9 +331,17 @@ test_palette_outline :: proc(t: ^testing.T) {
 	lsp_poll(&app)
 
 	testing.expect_value(t, len(app.palette.symbols), 3)
+	// The field child is hidden by default...
+	testing.expect_value(t, len(app.palette.items), 2)
+	if len(app.palette.items) == 2 {
+		testing.expect_value(t, app.palette.items[0].label, "Foo")
+		testing.expect_value(t, app.palette.items[1].label, "bar")
+	}
+	// ...and appears with "Settings: Toggle Outline Fields" on.
+	app.outline_fields = true
+	app.palette_refresh()
 	testing.expect_value(t, len(app.palette.items), 3)
 	if len(app.palette.items) == 3 {
-		testing.expect_value(t, app.palette.items[0].label, "Foo")
 		testing.expect_value(t, app.palette.items[1].label, "  x") // indented child
 	}
 	// Selecting the second symbol previews it: cursor lands on its range.

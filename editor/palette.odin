@@ -73,19 +73,27 @@ Sym_Mode :: enum {
 }
 
 Palette :: struct {
-	open:   bool,
-	query:  [dynamic]u8,
-	caret:  int, // byte offset into query
-	mode_i: int,
+	open:       bool,
+	query:      [dynamic]u8,
+	caret:      int, // byte offset into query
+	sel_anchor: int, // other end of the input selection (== caret: none)
+	mode_i:     int,
 	items:  [dynamic]Palette_Item,
 	sel:    int,
 	scroll: int, // first visible item index
+	hover:  int, // item under the mouse (-1 none); drawn as a faint highlight
 
 	forced_mode: int,    // ≥ 0: use this mode regardless of query prefix (context menu)
 	ctx_path:    string, // owned; file the context menu is about ("" = editor context)
+	ctx_is_dir:  bool,   // the context path is a directory ("." = the workspace root)
 	ctx_pos:     Pos,    // symbol position for the rename mode
 	keep_open:   bool,   // an accept proc re-opened the palette; skip the close
 	home_doc:    int,    // tab the palette was opened from (esc returns there)
+
+	// File-op prompt mode (new file / new folder / rename on ctx_path).
+	fileop:         File_Op,
+	fileop_dir:     string, // owned; directory a New File/Folder creates in
+	confirm_delete: string, // owned; path Delete was picked for once already
 
 	usages: [dynamic]Lsp_Location, // owned; backing data for the usages mode
 
@@ -112,6 +120,14 @@ Palette :: struct {
 	l_vis:          int,
 }
 
+// What the file-op prompt mode does with its query on enter.
+File_Op :: enum {
+	None,
+	New_File,
+	New_Folder,
+	Rename,
+}
+
 @(private = "file")
 PALETTE_MODE_FILES :: 0
 // Prefix-less modes, entered via forced_mode (ctrl+., right-click, LSP results).
@@ -119,10 +135,13 @@ PALETTE_MODE_FILES :: 0
 PALETTE_MODE_CONTEXT :: 4
 PALETTE_MODE_USAGES :: 5
 PALETTE_MODE_RENAME :: 6
+@(private = "file")
+PALETTE_MODE_FILEOP :: 10
+// The tasks mode (index 11) is prefix-driven ("$"), never forced.
 
 @(private = "file")
 PALETTE_MODES := []Palette_Mode{
-	{prefix = "", hint = "find a file  ·  > commands  / search  : line  ! outline  # symbols  ? problems", refresh = files_refresh, accept = files_accept},
+	{prefix = "", hint = ">commands  /search  :line  !outline  #symbols  ?problems  $tasks", refresh = files_refresh, accept = files_accept},
 	{prefix = ">", hint = "run a command", refresh = commands_refresh, accept = commands_accept},
 	{prefix = "/", hint = "search the document", refresh = search_refresh, accept = accept_nothing, preview = search_preview},
 	{prefix = ":", hint = "go to line[:column]", refresh = goto_refresh, accept = accept_nothing, preview = goto_preview},
@@ -132,12 +151,30 @@ PALETTE_MODES := []Palette_Mode{
 	{prefix = "!", hint = "document outline — type to filter", refresh = outline_refresh, accept = accept_nothing, preview = outline_preview},
 	{prefix = "#", hint = "workspace symbols — type to search", refresh = wsymbols_refresh, accept = wsymbols_accept, preview = wsymbols_preview},
 	{prefix = "?", hint = "problems — type to filter", refresh = problems_refresh, accept = problems_pal_accept, preview = problems_pal_preview},
+	{prefix = "", hint = "name — enter confirms, esc cancels", refresh = fileop_refresh, accept = fileop_accept},
+	{prefix = "$", hint = "run a task — enter runs, esc cancels", refresh = tasks_refresh, accept = tasks_accept},
 }
 
 @(private = "file")
 PALETTE_COMMANDS := []Palette_Command{
 	{"File: Save", "ctrl+s", proc(app: ^App) { app.save() }},
 	{"File: New Untitled File", "ctrl+n", proc(app: ^App) { app.new_file() }},
+	{"File: New File…", "", proc(app: ^App) { app.open_fileop_prompt(.New_File, ".") }},
+	{"File: New Folder…", "", proc(app: ^App) { app.open_fileop_prompt(.New_Folder, ".") }},
+	{"Tasks: Run Task…", "ctrl+shift+r", proc(app: ^App) {
+		if app.task_picker() {
+			app.palette.keep_open = true
+		}
+	}},
+	{"Tasks: Run Default Task", "ctrl+r", proc(app: ^App) { app.task_run_default() }},
+	{"Tasks: Stop Running Task", "", proc(app: ^App) { app.task_stop() }},
+	{"Tasks: Toggle Output Panel", "", proc(app: ^App) {
+		app.task.open = !app.task.open
+		if app.task.open {
+			app.problems_open = false
+		}
+	}},
+	{"Tasks: Configure (.medit/tasks.ini)", "", proc(app: ^App) { app.task_edit_config() }},
 	{"File: Close Tab", "ctrl+w", proc(app: ^App) { app.tab_close(app.active) }},
 	{"File: Open Folder…", "", proc(app: ^App) { open_folder_dialog() }},
 	{"File: Toggle Format on Save", "", proc(app: ^App) {
@@ -157,7 +194,12 @@ PALETTE_COMMANDS := []Palette_Command{
 	{"View: Next Tab", "ctrl+tab", proc(app: ^App) { app.tab_cycle(1) }},
 	{"View: Previous Tab", "ctrl+shift+tab", proc(app: ^App) { app.tab_cycle(-1) }},
 	{"View: Toggle File Tree Sidebar", "ctrl+b", proc(app: ^App) { app.sidebar.visible = !app.sidebar.visible }},
-	{"View: Toggle Problems Panel", "ctrl+m", proc(app: ^App) { app.problems_open = !app.problems_open }},
+	{"View: Toggle Problems Panel", "ctrl+shift+m", proc(app: ^App) {
+		app.problems_open = !app.problems_open
+		if app.problems_open {
+			app.task.open = false // the panels share the slot above the status bar
+		}
+	}},
 	{"View: Increase Font Size", "ctrl+=", proc(app: ^App) { app.zoom_req = .In }},
 	{"View: Decrease Font Size", "ctrl+-", proc(app: ^App) { app.zoom_req = .Out }},
 	{"View: Reset Font Size", "ctrl+0", proc(app: ^App) { app.zoom_req = .Reset }},
@@ -188,7 +230,7 @@ PALETTE_COMMANDS := []Palette_Command{
 		app.palette_open_with("#")
 		app.palette.keep_open = true
 	}},
-	{"Go to Problem…", "", proc(app: ^App) {
+	{"Go to Problem…", "ctrl+m", proc(app: ^App) {
 		app.palette_open_with("?")
 		app.palette.keep_open = true
 	}},
@@ -227,6 +269,12 @@ PALETTE_COMMANDS := []Palette_Command{
 	{"Settings: Toggle Smart Word Movement", "", proc(app: ^App) {
 		smart_word = !smart_word
 		app.set_status("word movement: smart (subwords)" if smart_word else "word movement: whole words")
+	}},
+	{"Settings: Open Settings", "", proc(app: ^App) { app.settings_open(project = false) }},
+	{"Settings: Open Project Settings", "", proc(app: ^App) { app.settings_open(project = true) }},
+	{"Settings: Toggle Outline Fields", "", proc(app: ^App) {
+		app.outline_fields = !app.outline_fields
+		app.set_status("outline: fields shown" if app.outline_fields else "outline: fields hidden")
 	}},
 }
 
@@ -274,6 +322,8 @@ palette_destroy :: proc(p: ^Palette) {
 	delete(p.files)
 	delete(p.query)
 	delete(p.ctx_path)
+	delete(p.fileop_dir)
+	delete(p.confirm_delete)
 	delete(p.saved_cursors)
 }
 
@@ -297,6 +347,42 @@ is_word_boundary :: proc(c: u8) -> bool {
 		return true
 	}
 	return false
+}
+
+// ctrl+arrow hops in the input: over one run of separators, then one run of
+// word bytes. Any ASCII punctuation separates (so a hop never swallows a
+// mode prefix like '>'); multi-byte runes always count as word bytes.
+@(private = "file")
+input_boundary :: proc(c: u8) -> bool {
+	switch c {
+	case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9':
+		return false
+	}
+	return c < 0x80
+}
+
+@(private = "file")
+input_word_left :: proc(q: string, caret: int) -> int {
+	i := caret
+	for i > 0 && input_boundary(q[i-1]) {
+		i -= 1
+	}
+	for i > 0 && !input_boundary(q[i-1]) {
+		i -= 1
+	}
+	return i
+}
+
+@(private = "file")
+input_word_right :: proc(q: string, caret: int) -> int {
+	i := caret
+	for i < len(q) && input_boundary(q[i]) {
+		i += 1
+	}
+	for i < len(q) && !input_boundary(q[i]) {
+		i += 1
+	}
+	return i
 }
 
 // Greedy fuzzy subsequence match, ASCII-case-insensitive. Fills matches with
@@ -703,7 +789,13 @@ accept_nothing :: proc(app: ^App, it: ^Palette_Item) {
 @(private = "file")
 Ctx_Action :: enum {
 	Open_File,
+	New_File,
+	New_Folder,
+	Rename_Path,
+	Delete_Path,
+	Reveal,
 	Copy_Path,
+	Copy_Rel_Path,
 	Copy_Name,
 	Copy,
 	Cut,
@@ -751,11 +843,29 @@ context_refresh :: proc(app: ^App, q: string) {
 	entries := make([dynamic]Entry, context.temp_allocator)
 
 	if len(p.ctx_path) > 0 {
-		// File context (sidebar right-click, or ctrl+. on a palette file item).
+		// File or directory context (sidebar right-click, or ctrl+. on a
+		// palette file item). "." is the workspace root row.
+		is_root := p.ctx_path == "."
 		name := p.ctx_path[base_start(p.ctx_path):]
-		append(&entries, Entry{fmt.tprintf("Open %s", name), .Open_File})
+		if !p.ctx_is_dir {
+			append(&entries, Entry{fmt.tprintf("Open %s", name), .Open_File})
+		}
+		append(&entries, Entry{"New File…", .New_File})
+		append(&entries, Entry{"New Folder…", .New_Folder})
+		if !is_root {
+			append(&entries, Entry{fmt.tprintf("Rename %s…", name), .Rename_Path})
+			if p.confirm_delete == p.ctx_path {
+				append(&entries, Entry{fmt.tprintf("Confirm Delete %s", name), .Delete_Path})
+			} else {
+				append(&entries, Entry{fmt.tprintf("Delete %s", name), .Delete_Path})
+			}
+		}
+		append(&entries, Entry{REVEAL_LABEL, .Reveal})
 		append(&entries, Entry{"Copy Path", .Copy_Path})
-		append(&entries, Entry{"Copy File Name", .Copy_Name})
+		if !is_root {
+			append(&entries, Entry{"Copy Relative Path", .Copy_Rel_Path})
+			append(&entries, Entry{"Copy File Name", .Copy_Name})
+		}
 	} else {
 		// Editor context: selection or symbol under the cursor.
 		needle := context_needle(app)
@@ -802,12 +912,44 @@ context_refresh :: proc(app: ^App, q: string) {
 @(private = "file")
 context_accept :: proc(app: ^App, it: ^Palette_Item) {
 	p := &app.palette
-	switch Ctx_Action(it.data) {
+	action := Ctx_Action(it.data) // before any re-open below frees the item
+	switch action {
 	case .Open_File:
 		app.open_file(p.ctx_path)
+	case .New_File, .New_Folder:
+		// Create in the directory itself, or next to the file.
+		dir := p.ctx_path if p.ctx_is_dir else p.ctx_path[:max(base_start(p.ctx_path)-1, 0)]
+		app.open_fileop_prompt(.New_File if action == .New_File else .New_Folder, dir)
+	case .Rename_Path:
+		app.open_fileop_prompt(.Rename, "")
+	case .Delete_Path:
+		if p.confirm_delete == p.ctx_path {
+			app.fs_delete(p.ctx_path, p.ctx_is_dir)
+			delete(p.confirm_delete)
+			p.confirm_delete = ""
+		} else {
+			delete(p.confirm_delete)
+			p.confirm_delete = strings.clone(p.ctx_path)
+			// Rebuild the menu so the entry reads "Confirm Delete" and is
+			// already selected; enter again performs it, esc backs out.
+			app.open_context_file(p.ctx_path, p.ctx_is_dir)
+			for item, i in p.items {
+				if Ctx_Action(item.data) == .Delete_Path {
+					p.sel = i
+					break
+				}
+			}
+			app.set_status("enter again to delete")
+			p.keep_open = true
+		}
+	case .Reveal:
+		app.reveal_in_file_manager(p.ctx_path)
 	case .Copy_Path:
-		clipboard_set(p.ctx_path)
-		app.set_status("path copied")
+		clipboard_set(abs_path(p.ctx_path))
+		app.set_status("absolute path copied")
+	case .Copy_Rel_Path:
+		clipboard_set(shorten_path(abs_path(p.ctx_path)))
+		app.set_status("relative path copied")
 	case .Copy_Name:
 		clipboard_set(p.ctx_path[base_start(p.ctx_path):])
 		app.set_status("file name copied")
@@ -935,6 +1077,11 @@ outline_refresh :: proc(app: ^App, q: string) {
 	for &s, i in p.symbols {
 		if len(p.items) >= MAX_PALETTE_ITEMS {
 			break
+		}
+		// Struct fields/properties are noise in most outlines — hidden
+		// unless ">Settings: Toggle Outline Fields" says otherwise.
+		if !app.outline_fields && (s.kind == 7 || s.kind == 8 || s.kind == 20) {
+			continue
 		}
 		indent := strings.repeat("  ", s.depth, context.temp_allocator)
 		label := strings.concatenate({indent, s.name}, context.temp_allocator)
@@ -1075,6 +1222,73 @@ rename_accept :: proc(app: ^App, it: ^Palette_Item) {
 	}
 }
 
+// --- Mode: file-op prompt (new file / new folder / rename on disk) --------------------
+
+@(private = "file")
+fileop_target :: proc(p: ^Palette, name: string) -> string {
+	t, err := filepath.join({p.fileop_dir if p.fileop_dir != "" else ".", name}, context.temp_allocator)
+	return name if err != nil else t
+}
+
+@(private = "file")
+fileop_refresh :: proc(app: ^App, q: string) {
+	p := &app.palette
+	if len(q) == 0 {
+		return
+	}
+	switch p.fileop {
+	case .New_File:
+		push_item(p, fmt.tprintf("Create file %s", fileop_target(p, q)), "enter", nil)
+	case .New_Folder:
+		push_item(p, fmt.tprintf("Create folder %s", fileop_target(p, q)), "enter", nil)
+	case .Rename:
+		push_item(p, fmt.tprintf("Rename %s to \"%s\"", p.ctx_path[base_start(p.ctx_path):], q), "enter", nil)
+	case .None:
+	}
+}
+
+@(private = "file")
+fileop_accept :: proc(app: ^App, it: ^Palette_Item) {
+	p := &app.palette
+	name := strings.trim_space(string(p.query[:]))
+	if len(name) == 0 {
+		return
+	}
+	switch p.fileop {
+	case .New_File:
+		app.fs_create(p.fileop_dir, name, is_dir = false)
+	case .New_Folder:
+		app.fs_create(p.fileop_dir, name, is_dir = true)
+	case .Rename:
+		app.fs_rename(p.ctx_path, name)
+	case .None:
+	}
+}
+
+// --- Mode: tasks (ctrl+shift+r) --------------------------------------------------------
+
+@(private = "file")
+tasks_refresh :: proc(app: ^App, q: string) {
+	p := &app.palette
+	tasks_load(&app.task) // tiny file; reloading per keystroke keeps it live
+	ms := make([dynamic]int, context.temp_allocator)
+	for t, i in app.task.tasks {
+		s, ok := fuzzy_match(q, t.name, 0, &ms)
+		if !ok {
+			continue
+		}
+		push_item(p, t.name, t.cmd, ms[:], score = s, data = i, kind_ch = '>', kind_face = .Function)
+	}
+	if len(q) > 0 {
+		slice.sort_by(p.items[:], proc(a, b: Palette_Item) -> bool { return a.score > b.score })
+	}
+}
+
+@(private = "file")
+tasks_accept :: proc(app: ^App, it: ^Palette_Item) {
+	app.task_run(it.data)
+}
+
 // --- Palette state machine -------------------------------------------------------
 
 impl App {
@@ -1094,6 +1308,9 @@ impl App {
 		append(&palette.query, prefill)
 		palette.caret = len(palette.query)
 		self.palette_refresh()
+		// A prefill past the mode prefix (search term, rename name) starts
+		// selected, ready to be typed over.
+		palette.sel_anchor = min(len(PALETTE_MODES[palette.mode_i].prefix), len(palette.query))
 		self.blink_reset()
 	}
 
@@ -1111,6 +1328,31 @@ impl App {
 		self.palette_open_with(strings.concatenate({"/", needle}, context.temp_allocator))
 	}
 
+	// The task picker (ctrl+shift+r, or typing "$" in the palette). With no
+	// tasks yet it opens the config instead — created from a template on
+	// first use. Returns whether the palette was (re)opened, so command
+	// accepts can set keep_open.
+	task_picker :: proc() -> bool {
+		tasks_load(&task)
+		if len(task.tasks) == 0 {
+			self.task_edit_config()
+			self.set_status("no tasks yet — define some in " + TASKS_PATH)
+			return false
+		}
+		self.palette_open_with("$")
+		return true
+	}
+
+	// ctrl+p while the palette is open: back to the file finder, or — when
+	// already there — close it (so ctrl+p stays a toggle).
+	palette_toggle_files :: proc() {
+		if palette.mode_i == PALETTE_MODE_FILES && palette.forced_mode < 0 {
+			self.palette_cancel()
+		} else {
+			self.palette_open_with("")
+		}
+	}
+
 	// ctrl+. anywhere in the editor: context actions for the selection or
 	// the word under the cursor.
 	open_context_editor :: proc() {
@@ -1119,12 +1361,27 @@ impl App {
 		self.palette_open_with("", forced = PALETTE_MODE_CONTEXT)
 	}
 
-	// Context actions for a file (sidebar right-click, palette file item).
-	open_context_file :: proc(path: string) {
+	// Context actions for a file or directory (sidebar right-click, palette
+	// file item, tab right-click).
+	open_context_file :: proc(path: string, is_dir := false) {
 		np := strings.clone(path) // before open_with frees the item it may come from
 		delete(palette.ctx_path)
 		palette.ctx_path = np
+		palette.ctx_is_dir = is_dir
 		self.palette_open_with("", forced = PALETTE_MODE_CONTEXT)
+	}
+
+	// Ask for a name, then run a file op on enter (the fileop palette mode).
+	// dir is where New File / New Folder create; a rename targets ctx_path
+	// and prefills its current name.
+	open_fileop_prompt :: proc(op: File_Op, dir: string) {
+		nd := strings.clone(dir)
+		delete(palette.fileop_dir)
+		palette.fileop_dir = nd
+		palette.fileop = op
+		prefill := palette.ctx_path[base_start(palette.ctx_path):] if op == .Rename else ""
+		self.palette_open_with(prefill, forced = PALETTE_MODE_FILEOP)
+		palette.keep_open = true
 	}
 
 	// ctrl+. while the palette is open: contextualize the selected file item.
@@ -1158,14 +1415,53 @@ impl App {
 		palette_items_clear(p)
 		p.sel = 0
 		p.scroll = 0
+		p.hover = -1
 		mode.refresh(self, strings.trim_left(rest, " "))
 		if mode.preview != nil && len(p.items) > 0 {
 			mode.preview(self, &p.items[0])
 		}
 	}
 
+	// Selected byte range of the input ([lo, hi); lo == hi: no selection).
+	palette_sel :: proc() -> (lo, hi: int) {
+		return min(palette.caret, palette.sel_anchor), max(palette.caret, palette.sel_anchor)
+	}
+
+	palette_select_all :: proc() {
+		palette.sel_anchor = 0
+		palette.caret = len(palette.query)
+		self.blink_reset()
+	}
+
+	// Remove the selected input text; false when nothing was selected.
+	palette_sel_delete :: proc() -> bool {
+		lo, hi := self.palette_sel()
+		if lo == hi {
+			return false
+		}
+		remove_range(&palette.query, lo, hi)
+		palette.caret = lo
+		palette.sel_anchor = lo
+		return true
+	}
+
+	// ctrl+c / ctrl+x on the input selection.
+	palette_copy :: proc(cut: bool) {
+		lo, hi := self.palette_sel()
+		if lo == hi {
+			return
+		}
+		clipboard_set(string(palette.query[lo:hi]))
+		if cut {
+			_ = self.palette_sel_delete()
+			self.palette_refresh()
+			self.blink_reset()
+		}
+	}
+
 	palette_insert :: proc(text: string) {
 		p := &palette
+		_ = self.palette_sel_delete() // typing replaces the selection
 		sb := strings.builder_make(context.temp_allocator)
 		strings.write_string(&sb, string(p.query[:p.caret]))
 		ins := 0
@@ -1180,24 +1476,36 @@ impl App {
 		clear(&p.query)
 		append(&p.query, strings.to_string(sb))
 		p.caret += ins
+		p.sel_anchor = p.caret
 		self.palette_refresh()
 		self.blink_reset()
 	}
 
 	palette_backspace :: proc() {
 		p := &palette
+		if self.palette_sel_delete() {
+			self.palette_refresh()
+			self.blink_reset()
+			return
+		}
 		if p.caret == 0 {
 			return
 		}
 		_, n := utf8.decode_last_rune(p.query[:p.caret])
 		remove_range(&p.query, p.caret-n, p.caret)
 		p.caret -= n
+		p.sel_anchor = p.caret
 		self.palette_refresh()
 		self.blink_reset()
 	}
 
 	palette_delete_forward :: proc() {
 		p := &palette
+		if self.palette_sel_delete() {
+			self.palette_refresh()
+			self.blink_reset()
+			return
+		}
 		if p.caret >= len(p.query) {
 			return
 		}
@@ -1207,20 +1515,36 @@ impl App {
 		self.blink_reset()
 	}
 
-	// d: ±1 = one rune, ±2 (or beyond) = home/end.
-	palette_caret_move :: proc(d: int) {
+	// d: ±1 = one rune (a word with word), ±2 and beyond = home/end. extend
+	// (shift) keeps the selection anchor where it is.
+	palette_caret_move :: proc(d: int, extend := false, word := false) {
 		p := &palette
+		lo, hi := self.palette_sel()
 		switch {
 		case d < -1:
 			p.caret = 0
 		case d > 1:
 			p.caret = len(p.query)
+		case !extend && lo != hi:
+			// A plain arrow collapses the selection onto its edge.
+			p.caret = lo if d < 0 else hi
 		case d == -1 && p.caret > 0:
-			_, n := utf8.decode_last_rune(p.query[:p.caret])
-			p.caret -= n
+			if word {
+				p.caret = input_word_left(string(p.query[:]), p.caret)
+			} else {
+				_, n := utf8.decode_last_rune(p.query[:p.caret])
+				p.caret -= n
+			}
 		case d == 1 && p.caret < len(p.query):
-			_, n := utf8.decode_rune(p.query[p.caret:])
-			p.caret += n
+			if word {
+				p.caret = input_word_right(string(p.query[:]), p.caret)
+			} else {
+				_, n := utf8.decode_rune(p.query[p.caret:])
+				p.caret += n
+			}
+		}
+		if !extend {
+			p.sel_anchor = p.caret
 		}
 		self.blink_reset()
 	}
@@ -1236,6 +1560,15 @@ impl App {
 			p.sel = (p.sel + d + n) % n
 		} else {
 			p.sel = clamp(p.sel+d, 0, n-1)
+		}
+		// Keyboard movement drags the window along; wheel scrolling (which
+		// leaves sel alone) is free to move away from it.
+		vis := min(n, PALETTE_VISIBLE)
+		if p.sel < p.scroll {
+			p.scroll = p.sel
+		}
+		if vis > 0 && p.sel >= p.scroll+vis {
+			p.scroll = p.sel - vis + 1
 		}
 		mode := &PALETTE_MODES[p.mode_i]
 		if mode.preview != nil {
@@ -1295,6 +1628,9 @@ impl App {
 		p.forced_mode = -1
 		delete(p.ctx_path)
 		p.ctx_path = ""
+		p.fileop = .None
+		delete(p.confirm_delete) // closing the menu resets the delete arm
+		p.confirm_delete = ""
 		palette_items_clear(p)
 		usages_clear(p)
 		for f in p.files {
@@ -1306,25 +1642,60 @@ impl App {
 
 	// --- Mouse ---
 
-	palette_mouse :: proc(px, py: f32, line_h: f32) {
+	// Item index under a pixel position; -1 for the input row, padding, or
+	// anywhere outside the list.
+	palette_row_at :: proc(px, py: f32, line_h: f32) -> int {
+		p := &palette
+		if px < p.lx || px > p.lx+p.lw || py < p.l_row0 || py > p.ly+p.lh {
+			return -1
+		}
+		row := p.scroll + int((py-p.l_row0)/(line_h*UI_ROW_SCALE))
+		if row < p.scroll || row >= min(p.scroll+p.l_vis, len(p.items)) {
+			return -1
+		}
+		return row
+	}
+
+	palette_mouse :: proc(px, py: f32, cell_w, line_h: f32) {
 		p := &palette
 		if px < p.lx || px > p.lx+p.lw || py < p.ly || py > p.ly+p.lh {
 			self.palette_cancel()
 			return
 		}
 		if py < p.l_row0 {
-			return // input row
+			// Click in the input row: place the caret (collapses selection).
+			q := string(p.query[:])
+			ri := max(int((px-(p.lx+cell_w*1.5))/cell_w + 0.5), 0) // rune index
+			off := 0
+			for _ in 0 ..< ri {
+				if off >= len(q) {
+					break
+				}
+				_, n := utf8.decode_rune(q[off:])
+				off += n
+			}
+			p.caret = off
+			p.sel_anchor = off
+			self.blink_reset()
+			return
 		}
-		row := p.scroll + int((py-p.l_row0)/(line_h*UI_ROW_SCALE))
-		if row >= 0 && row < len(p.items) {
+		row := self.palette_row_at(px, py, line_h)
+		if row >= 0 {
 			p.sel = row
 			self.palette_accept()
 		}
 	}
 
-	palette_wheel :: proc(dy: f32) {
+	// Track the row under the mouse for hover feedback.
+	palette_motion :: proc(px, py: f32, line_h: f32) {
+		palette.hover = self.palette_row_at(px, py, line_h)
+	}
+
+	palette_wheel :: proc(dy: f32, line_h: f32) {
 		p := &palette
 		p.scroll = clamp(p.scroll-int(dy*3), 0, max(0, len(p.items)-p.l_vis))
+		// The rows moved under the pointer: re-aim the hover highlight.
+		p.hover = self.palette_row_at(mouse_x, mouse_y, line_h)
 	}
 }
 
@@ -1437,26 +1808,42 @@ impl App {
 		q := string(p.query[:])
 		qx := px + pad
 		qbase := py + (input_h-line_h)*0.5 + r.ascent
+		if lo, hi := self.palette_sel(); lo != hi {
+			sx := qx + f32(strings.rune_count(q[:lo]))*cell_w
+			sw := f32(strings.rune_count(q[lo:hi])) * cell_w
+			push_rect(r, sx, py+(input_h-line_h)*0.5, sw, line_h, theme.selection)
+		}
 		x := qx
 		for ch, i in q {
 			color := theme.faces[.Keyword] if i < len(mode.prefix) else theme.fg
 			push_glyph(r, x, qbase, ch, color)
 			x += cell_w
 		}
+		// Match counter, right-aligned in the input row; its left edge also
+		// clips the hint so a long one never runs underneath it.
+		cnt_x := px + pw - pad
+		if len(p.items) > 0 {
+			cnt := fmt.tprintf("%d/%d", p.sel+1, len(p.items))
+			cnt_x -= f32(len(cnt)) * cell_w
+			draw_str(r, cnt_x, qbase, cnt, theme.status_dim)
+		}
+
 		if len(q) == len(mode.prefix) {
-			_ = draw_str(r, x+cell_w*0.5, qbase, mode.hint, theme.status_dim)
+			hx := x + cell_w*0.5
+			for ch in mode.hint {
+				if hx+cell_w*2.5 > cnt_x {
+					push_glyph(r, hx, qbase, '…', theme.status_dim)
+					break
+				}
+				push_glyph(r, hx, qbase, ch, theme.status_dim)
+				hx += cell_w
+			}
 		}
 
 		// Caret.
 		if self.caret_on(true) {
 			cx := qx + f32(strings.rune_count(q[:p.caret]))*cell_w
 			push_rect(r, cx-1, py+(input_h-line_h)*0.5, 2, line_h, theme.cursor)
-		}
-
-		// Match counter, right-aligned in the input row.
-		if len(p.items) > 0 {
-			cnt := fmt.tprintf("%d/%d", p.sel+1, len(p.items))
-			draw_str(r, px+pw-pad-f32(len(cnt))*cell_w, qbase, cnt, theme.status_dim)
 		}
 
 		// Rows.
@@ -1468,12 +1855,6 @@ impl App {
 		p.l_row0 = row0
 		p.l_vis = vis
 
-		if p.sel < p.scroll {
-			p.scroll = p.sel
-		}
-		if vis > 0 && p.sel >= p.scroll+vis {
-			p.scroll = p.sel - vis + 1
-		}
 		p.scroll = clamp(p.scroll, 0, max(0, len(p.items)-vis))
 
 		if len(p.items) == 0 {
@@ -1490,6 +1871,8 @@ impl App {
 			y := row0 + f32(vi)*row_h
 			if i == p.sel {
 				push_rect(r, px, y, pw, row_h, theme.selection)
+			} else if i == p.hover {
+				push_rect(r, px, y, pw, row_h, color_alpha(theme.selection, 0.45))
 			}
 			baseline := y + (row_h-line_h)*0.5 + r.ascent
 
@@ -1509,5 +1892,9 @@ impl App {
 			}
 			palette_draw_label(r, lx, baseline, right-lx, it, &theme)
 		}
+
+		// A slim scrollbar when the list overflows, so wheel scrolling has
+		// something to show for itself.
+		draw_vscrollbar(r, px+pw, row0, f32(vis)*row_h, f32(len(p.items))*row_h, f32(p.scroll)*row_h, &theme)
 	}
 }

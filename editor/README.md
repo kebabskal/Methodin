@@ -36,8 +36,12 @@ the editor's own internals use in-struct procs and `impl` blocks throughout
   procs.
   The context menu (`ctrl+.`, or right-click) is a palette mode too: actions
   for the current selection or symbol (select all occurrences, search, case
-  transforms, ...), or for a file when triggered on the sidebar or a palette
-  file item (open, copy path/name).
+  transforms, ...), or for a file or directory when triggered on the sidebar
+  (empty space targets the workspace root) or a palette file item: open,
+  new file/folder, rename, delete (enter twice — the menu re-arms as a
+  confirm), show in the system file manager, copy absolute/relative
+  path or name. New-file/folder and rename names are typed straight into
+  the palette input.
 - **LSP** — go to definition (`ctrl+g` / ctrl+click), find usages (`ctrl+h` /
   ctrl+shift+click, results in the palette with live preview), rename symbol
   (`F2`; edits to the current buffer are undoable, other files are updated on
@@ -55,8 +59,28 @@ the editor's own internals use in-struct procs and `impl` blocks throughout
   is thread-free: JSON-RPC over stdio, polled from the main loop.
 - **File tree sidebar** — the working directory as a lazily-loaded tree
   (`ctrl+b` to toggle). Click a directory to expand it, a file to open it
-  (in its existing tab if it already has one); collapsing and re-expanding
-  a directory re-reads it from disk.
+  (in its existing tab if it already has one); right-click anything (or the
+  empty space, for the workspace root) for the file context menu — create,
+  rename and delete files and folders from there. The tree re-reads its
+  expanded directories after every save and whenever the window regains
+  focus, so files created elsewhere show up on their own; collapsing and
+  re-expanding a directory still force-refreshes it.
+- **Tasks (run / debug)** — `ctrl+r` runs the project: the default (first)
+  task from `.medit/tasks.ini`, restarting whatever is already running; with
+  no config yet it creates one from a template and opens it. `ctrl+shift+r`
+  (or `$` in the palette) picks a task by name. Each `[section]` is a task
+  with a `cmd` and an optional `cwd`; `${file}`, `${fileName}`, `${fileDir}`
+  and `${workspaceFolder}` expand before the command runs. Output
+  (stdout+stderr) streams into a panel above the status bar; file references
+  in it (`main.odin(9:8)`, `src/foo.c:12:5`) are underlined and click
+  straight to the spot, and the exit code lands in the title and status bar.
+  While a task runs, a spinner with its name sits in the status bar and the
+  panel header grows a `kill` button (`close` hides the panel).
+- **Settings** — `>Settings: Open Settings` (user-wide, in the user config
+  directory) and `>Settings: Open Project Settings` (`.medit/settings.ini`);
+  both created from a template on first use, re-read on save, focus and
+  workspace switch, and the project file adds to the user one. Currently:
+  `[files] hide = *.exe *.pdb bin` — globs hidden from the file tree.
 - **Multiple cursors** — `ctrl+alt+↑/↓` to stack cursors, `ctrl+d` to select
   the next occurrence, `alt+click` to add a cursor anywhere. Every editing
   action is a batch of `(range, text)` replacements, one per cursor, applied
@@ -139,8 +163,10 @@ at runtime (the current buffer survives the move).
 | `ctrl+f` | search the document (prefills the selection) |
 | `ctrl+e` | document outline (palette `!` mode) |
 | `ctrl+t` | workspace symbol search (palette `#` mode) |
+| `ctrl+m` | go to problem (palette `?` mode; `ctrl+shift+m` toggles the panel) |
 | `ctrl++` / `ctrl+-` / `ctrl+0` | font size up / down / reset (also ctrl+wheel) |
 | `ctrl+b` | toggle the file tree sidebar |
+| `ctrl+r` / `ctrl+shift+r` | run default task (restart if running) / pick a task |
 | `ctrl+n` | new untitled tab |
 | `ctrl+o` | open file (system dialog) |
 | `ctrl+s` | save (untitled: system save dialog) |

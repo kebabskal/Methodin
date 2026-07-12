@@ -23,6 +23,7 @@ FONT_PT_MAX :: 40.0
 
 @(private = "file") cursor_ibeam: ^sdl.Cursor
 @(private = "file") cursor_arrow: ^sdl.Cursor
+@(private = "file") cursor_hand: ^sdl.Cursor
 
 // Custom event type carrying a system file-dialog result back to the loop
 // (the dialog callback may run on another thread; PushEvent is thread-safe).
@@ -197,8 +198,10 @@ main :: proc() {
 	defer { _ = sdl.StopTextInput(window) }
 	cursor_ibeam = sdl.CreateSystemCursor(.TEXT)
 	cursor_arrow = sdl.CreateSystemCursor(.DEFAULT)
+	cursor_hand = sdl.CreateSystemCursor(.POINTER)
 	defer sdl.DestroyCursor(cursor_ibeam)
 	defer sdl.DestroyCursor(cursor_arrow)
+	defer sdl.DestroyCursor(cursor_hand)
 	_ = sdl.SetCursor(cursor_ibeam)
 
 	running := true
@@ -248,12 +251,14 @@ main :: proc() {
 
 		lsp_update(&app)
 		lsp_poll(&app)
+		task_poll(&app)
 		app.format_save_tick()
 		app.lsp_hover_tick(rend.cell_w, rend.line_h)
 
 		if app.want_follow {
 			app.want_follow = false
-			app.ensure_cursor_visible(rend.cell_w, rend.line_h)
+			app.ensure_cursor_visible(rend.cell_w, rend.line_h, center = app.want_center)
+			app.want_center = false
 		}
 
 		if app.retitle {
@@ -452,6 +457,9 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 	case .WINDOW_FOCUS_GAINED:
 		app.focused = true
 		app.blink_reset() // start with a full visible phase
+		// Coming back from elsewhere: files (or settings) may have changed.
+		settings_load(app)
+		sidebar_refresh(&app.sidebar)
 
 	case .WINDOW_FOCUS_LOST:
 		app.focused = false
@@ -482,7 +490,7 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		py := ev.button.y * density
 		if ev.button.button == sdl.BUTTON_LEFT {
 			if app.palette.open {
-				app.palette_mouse(px, py, rend.line_h)
+				app.palette_mouse(px, py, rend.cell_w, rend.line_h)
 			} else if py < app.tabbar_h {
 				switch app.traffic_hit(px, py) {
 				case 0: // close: through the regular quit path (dirty guard)
@@ -497,6 +505,8 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 				case:
 					app.tabbar_click(px, rend.cell_w, 0)
 				}
+			} else if app.task.open && py >= app.task.top && py < app.task.top+app.task.h {
+				app.task_click(px, py, rend.cell_w)
 			} else if app.problems_open && py >= app.problems_top && py < app.problems_top+app.problems_h {
 				// Before the sidebar: the panel spans the full width.
 				app.problems_click(px, py)
@@ -541,10 +551,17 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		}
 
 	case .MOUSE_MOTION:
-		over_ui := ev.motion.x*density < app.sidebar_px || ev.motion.y*density < app.tabbar_h ||
-			(app.problems_open && ev.motion.y*density >= app.problems_top)
-		_ = sdl.SetCursor(cursor_arrow if over_ui else cursor_ibeam)
+		over_ui := app.palette.open ||
+			ev.motion.x*density < app.sidebar_px || ev.motion.y*density < app.tabbar_h ||
+			(app.problems_open && ev.motion.y*density >= app.problems_top) ||
+			(app.task.open && ev.motion.y*density >= app.task.top)
+		over_link := app.task_motion(ev.motion.x*density, ev.motion.y*density, rend.cell_w) &&
+			!app.palette.open
+		_ = sdl.SetCursor(cursor_hand if over_link else cursor_arrow if over_ui else cursor_ibeam)
 		app.hover_motion(ev.motion.x*density, ev.motion.y*density, rend.cell_w, rend.line_h)
+		if app.palette.open {
+			app.palette_motion(ev.motion.x*density, ev.motion.y*density, rend.line_h)
+		}
 		if app.selecting && !app.palette.open {
 			p := app.pos_at_pixel(ev.motion.x*density, ev.motion.y*density, rend.cell_w, rend.line_h)
 			app.drag(p, app.vis_at_pixel(ev.motion.x*density, rend.cell_w))
@@ -568,10 +585,14 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 				app.zoom_req = .In if zy > 0 else .Out
 			}
 		} else if app.palette.open {
-			app.palette_wheel(dy)
+			app.palette_wheel(dy, rend.line_h)
 		} else if ev.wheel.mouse_y*density < app.tabbar_h {
 			// Over the tab bar: scroll the tabs (clamped next draw).
 			app.tab_scroll -= (dy + dx) * rend.cell_w * 6
+		} else if app.task.open && ev.wheel.mouse_y*density >= app.task.top &&
+		   ev.wheel.mouse_y*density < app.task.top+app.task.h {
+			// Over the task output panel: scroll its lines.
+			app.task_wheel(dy, rend.cell_w)
 		} else if app.problems_open && ev.wheel.mouse_y*density >= app.problems_top &&
 		   ev.wheel.mouse_y*density < app.problems_top+app.problems_h {
 			// Over the problems panel: scroll its rows (clamped next draw).
@@ -621,23 +642,41 @@ handle_key :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.Eve
 		case key == sdl.K_PAGEDOWN:
 			app.palette_move(10)
 		case key == sdl.K_HOME:
-			app.palette_caret_move(-2)
+			app.palette_caret_move(-2, extend = shift)
 		case key == sdl.K_END:
-			app.palette_caret_move(2)
+			app.palette_caret_move(2, extend = shift)
 		case key == sdl.K_LEFT:
-			app.palette_caret_move(-1)
+			app.palette_caret_move(-1, extend = shift, word = ctrl)
 		case key == sdl.K_RIGHT:
-			app.palette_caret_move(1)
+			app.palette_caret_move(1, extend = shift, word = ctrl)
 		case key == sdl.K_BACKSPACE:
 			app.palette_backspace()
 		case key == sdl.K_DELETE:
 			app.palette_delete_forward()
+		case ctrl && key == sdl.K_A:
+			app.palette_select_all()
+		case ctrl && key == sdl.K_C:
+			app.palette_copy(cut = false)
+		case ctrl && key == sdl.K_X:
+			app.palette_copy(cut = true)
 		case ctrl && key == sdl.K_V:
 			app.palette_insert(clipboard_get())
 		case ctrl && key == sdl.K_PERIOD:
 			app.palette_context_here()
+		// Another palette hotkey while open: switch modes in place, no esc
+		// needed (the original view/cursors stay saved for esc).
+		case ctrl && shift && key == sdl.K_P:
+			app.palette_open_with(">")
 		case ctrl && key == sdl.K_P:
-			app.palette_cancel()
+			app.palette_toggle_files()
+		case ctrl && key == sdl.K_E:
+			app.palette_open_with("!")
+		case ctrl && key == sdl.K_T:
+			app.palette_open_with("#")
+		case ctrl && key == sdl.K_M:
+			app.palette_open_with("?")
+		case ctrl && key == sdl.K_F:
+			app.open_search()
 		}
 		return
 	}
@@ -799,8 +838,20 @@ handle_key :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.Eve
 	case ctrl && key == sdl.K_Q:
 		request_quit()
 		follow = false
-	case ctrl && key == sdl.K_M:
+	case ctrl && shift && key == sdl.K_M:
 		app.problems_open = !app.problems_open
+		if app.problems_open {
+			app.task.open = false // the panels share the slot above the status bar
+		}
+		follow = false
+	case ctrl && key == sdl.K_M:
+		app.palette_open_with("?")
+		follow = false
+	case ctrl && shift && key == sdl.K_R:
+		_ = app.task_picker()
+		follow = false
+	case ctrl && key == sdl.K_R:
+		app.task_run_default()
 		follow = false
 	case ctrl && key == sdl.K_A:
 		app.select_all()

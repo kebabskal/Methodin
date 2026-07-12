@@ -1042,6 +1042,7 @@ impl App {
 		append(&cursors, Cursor{head = e, anchor = s, goal_col = -1})
 		primary = 0
 		want_follow = true
+		want_center = true // a jump, not a keystroke: land mid-view
 		self.blink_reset()
 	}
 

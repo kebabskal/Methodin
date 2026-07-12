@@ -58,6 +58,7 @@ App :: struct {
 	sighelp:    Sig_Help,
 	retitle: bool, // buffer path changed; main should refresh the window title
 	want_follow: bool, // something moved the cursor; main should scroll to it
+	want_center: bool, // ...and it was a jump: land it mid-view, not at an edge
 	zoom_req: Zoom_Req, // font-size change for main to apply (owns the renderer)
 
 	// Hover tooltip (LSP), driven by mouse dwell.
@@ -86,6 +87,9 @@ App :: struct {
 	odin_root_done: bool,
 
 	// Diagnostics (problems.odin): store + collapsible panel state.
+	// Project tasks (ctrl+r) and their output panel (tasks.odin).
+	task: Task_State,
+
 	problems:        [dynamic]Diagnostic,
 	problems_open:   bool,
 	problems_scroll: f32, // first visible row (fractional while wheeling)
@@ -97,6 +101,8 @@ App :: struct {
 
 	// Format-on-save (toggle: "File: Toggle Format on Save").
 	format_on_save: bool,
+	// Show struct fields in the document outline ("Settings: Toggle Outline Fields").
+	outline_fields: bool,
 	fmt_req:        int,    // pending format request id (0: none)
 	fmt_path:       string, // owned; document the pending format belongs to
 	fmt_deadline:   u64,    // save unformatted when the reply misses this
@@ -152,6 +158,7 @@ app_init :: proc(app: ^App, path: string) {
 		b = buffer_make()
 	}
 	app.doc_append(b, lang)
+	settings_load(app) // before the tree first loads: [files] hide filters it
 	sidebar_init(&app.sidebar)
 }
 
@@ -180,6 +187,7 @@ app_destroy :: proc(app: ^App) {
 	delete(app.recent_dirs)
 	delete(app.odin_root_dir)
 	problems_destroy(app)
+	tasks_destroy(&app.task)
 }
 
 impl App {
@@ -756,6 +764,11 @@ impl App {
 		if buffer_save(&buf) {
 			self.set_status("saved")
 			lsp_did_save(self)
+			if strings.has_suffix(buf.path, "settings.ini") {
+				settings_load(self) // hide globs may have changed
+			}
+			// The write may have created the file: let the sidebar see it.
+			sidebar_refresh(&sidebar)
 		} else {
 			self.set_status("SAVE FAILED")
 		}
@@ -1206,6 +1219,18 @@ impl App {
 
 // --- Drawing -----------------------------------------------------------------
 
+// A discreet vertical scrollbar: a thin thumb hugging the right edge of a
+// view, drawn only while the content actually overflows it. Shared by the
+// editor, the sidebar and the palette so they all read the same.
+draw_vscrollbar :: proc(r: ^Renderer, right, top, view_h, content_h, scroll: f32, t: ^Theme) {
+	if view_h <= 0 || content_h <= view_h {
+		return
+	}
+	th := max(view_h*view_h/content_h, 24)
+	ty := top + (view_h-th)*clamp(scroll/(content_h-view_h), 0, 1)
+	push_rect(r, right-5, ty, 3, th, color_alpha(t.gutter_fg, 0.4))
+}
+
 @(private = "file")
 count_digits :: proc(n: int) -> int {
 	d := 1
@@ -1218,7 +1243,7 @@ count_digits :: proc(n: int) -> int {
 }
 
 impl App {
-	ensure_cursor_visible :: proc(cell_w, line_h: f32) {
+	ensure_cursor_visible :: proc(cell_w, line_h: f32, center := false) {
 		p := self.primary_cursor().head
 		y := f32(p.line) * line_h
 		if palette.open {
@@ -1229,6 +1254,11 @@ impl App {
 			// item list grows.)
 			occ_top := clamp(palette.ly+palette.lh-tabbar_h+line_h*3, 0, max(view_h-line_h*3, 0))
 			scroll_y = y - occ_top
+		} else if center && (y < scroll_y || y+line_h > scroll_y+view_h) {
+			// A jump landing off-screen sits ~40% down the view: low enough
+			// to keep context above the symbol, high enough to show what
+			// follows it — never pinned to the bottom edge.
+			scroll_y = max(0, y-view_h*0.4)
 		} else {
 			if y < scroll_y {
 				scroll_y = y
@@ -1268,7 +1298,11 @@ impl App {
 		if problems_open {
 			problems_h = line_h*1.4 + f32(clamp(len(problems), 1, PROBLEMS_VISIBLE))*line_h*1.25
 		}
-		view_h = height - status_h - tabbar_h - problems_h
+		task.h = 0
+		if task.open {
+			task.h = line_h*1.4 + OUTPUT_VISIBLE*line_h*1.1
+		}
+		view_h = height - status_h - tabbar_h - problems_h - task.h
 
 		self.clamp_scroll(line_h)
 
@@ -1369,10 +1403,15 @@ impl App {
 
 		self.problems_draw_inline(r, first_line, last_line, cell_w, line_h)
 
+		// Document scrollbar (the content keeps its overscroll tail).
+		draw_vscrollbar(r, width, tabbar_h, view_h,
+			f32(buf.line_count()+OVERSCROLL_LINES)*line_h, scroll_y, &theme)
+
 		self.tabbar_draw(r, width)
 		self.sidebar_draw(r, height)
 		self.draw_status(r, width, height)
 		self.problems_draw(r, width, height)
+		self.task_draw(r, width, height)
 		self.hover_draw(r, width, height)
 		self.sighelp_draw(r, width, height)
 		self.completion_draw(r, width, height)
@@ -1423,8 +1462,15 @@ impl App {
 		draw_str(r, rx, baseline, right, theme.status_dim)
 		if errs, warns := self.problems_count(); errs > 0 || warns > 0 {
 			counts := fmt.tprintf("%dE %dW", errs, warns)
-			draw_str(r, rx-f32(len(counts)+2)*cell_w, baseline,
-				counts, theme.diag_err if errs > 0 else theme.diag_warn)
+			rx -= f32(len(counts)+2) * cell_w
+			draw_str(r, rx, baseline, counts, theme.diag_err if errs > 0 else theme.diag_warn)
+		}
+		if task.running {
+			// A live task spins here even with its output panel closed.
+			spinner := [4]string{"|", "/", "-", "\\"}
+			run := fmt.tprintf("%s %s", spinner[now_ms/120%4], task.last)
+			rx -= f32(len(run)+2) * cell_w
+			draw_str(r, rx, baseline, run, theme.faces[.Function])
 		}
 	}
 }

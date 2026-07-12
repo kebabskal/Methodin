@@ -1,6 +1,6 @@
 // medit — diagnostics. The language server's publishDiagnostics
 // notifications feed a store of problems; they surface as colored underlines
-// in the text and as a collapsible panel above the status bar (ctrl+m). The
+// in the text and as a collapsible panel above the status bar (ctrl+shift+m). The
 // problem under the cursor is highlighted in the panel.
 package medit
 

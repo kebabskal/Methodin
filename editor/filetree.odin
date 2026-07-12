@@ -27,6 +27,7 @@ Sidebar :: struct {
 	visible:  bool,
 	root:     Tree_Node,
 	scroll_y: f32,
+	hide:     [dynamic]string, // owned; globs hidden from the tree ([files] hide)
 }
 
 // One row of the flattened tree, as drawn / hit-tested.
@@ -44,13 +45,17 @@ sidebar_init :: proc(sb: ^Sidebar) {
 		is_dir   = true,
 		expanded = true,
 	}
-	node_load(&sb.root)
+	node_load(&sb.root, sb.hide[:])
 }
 
 sidebar_destroy :: proc(sb: ^Sidebar) {
 	node_free_children(&sb.root)
 	delete(sb.root.name)
 	delete(sb.root.path)
+	for g in sb.hide {
+		delete(g)
+	}
+	delete(sb.hide)
 }
 
 @(private = "file")
@@ -83,7 +88,7 @@ node_less :: proc(a, b: Tree_Node) -> bool {
 }
 
 @(private = "file")
-node_load :: proc(n: ^Tree_Node) {
+node_load :: proc(n: ^Tree_Node, hide: []string) {
 	if n.loaded {
 		return
 	}
@@ -94,7 +99,7 @@ node_load :: proc(n: ^Tree_Node) {
 		return
 	}
 	for info in infos {
-		if info.name == ".git" {
+		if info.name == ".git" || settings_hidden(info.name, hide) {
 			continue
 		}
 		child := Tree_Node{
@@ -118,8 +123,79 @@ node_load :: proc(n: ^Tree_Node) {
 	}
 }
 
+// Re-read every loaded directory from disk, keeping expansion state — files
+// created since the last read (a save-as, or another program) show up
+// without collapsing and re-expanding their directory.
+sidebar_refresh :: proc(sb: ^Sidebar) {
+	node_refresh(&sb.root, sb.hide[:])
+}
+
 @(private = "file")
-node_toggle :: proc(n: ^Tree_Node) {
+node_refresh :: proc(n: ^Tree_Node, hide: []string) {
+	if !n.loaded {
+		if n.expanded {
+			node_load(n, hide)
+		}
+		return
+	}
+	old := n.children
+	n.children = nil
+	n.loaded = false
+	node_load(n, hide)
+	for &c in n.children {
+		// A surviving directory adopts its old subtree so expansion is kept.
+		for &o in old {
+			if o.name == c.name && o.is_dir == c.is_dir {
+				c.expanded = o.expanded
+				c.loaded = o.loaded
+				c.children = o.children
+				o.children = nil
+				o.loaded = false
+				break
+			}
+		}
+		if c.is_dir && (c.loaded || c.expanded) {
+			node_refresh(&c, hide)
+		}
+	}
+	for &o in old {
+		node_free_children(&o)
+		delete(o.name)
+		delete(o.path)
+	}
+	delete(old)
+}
+
+// Expand (and load) every directory along the workspace-relative path so
+// its last segment is visible in the tree.
+sidebar_reveal :: proc(sb: ^Sidebar, path: string) {
+	n := &sb.root
+	rest := path
+	for {
+		i := strings.index_any(rest, "/\\")
+		if i < 0 {
+			return
+		}
+		seg := rest[:i]
+		rest = rest[i+1:]
+		found := false
+		for &c in n.children {
+			if c.is_dir && c.name == seg {
+				c.expanded = true
+				node_load(&c, sb.hide[:])
+				n = &c
+				found = true
+				break
+			}
+		}
+		if !found {
+			return
+		}
+	}
+}
+
+@(private = "file")
+node_toggle :: proc(n: ^Tree_Node, hide: []string) {
 	if n.expanded {
 		// Collapse drops the children so the next expand re-reads the disk.
 		n.expanded = false
@@ -127,7 +203,7 @@ node_toggle :: proc(n: ^Tree_Node) {
 		n.loaded = false
 	} else {
 		n.expanded = true
-		node_load(n)
+		node_load(n, hide)
 	}
 }
 
@@ -181,22 +257,22 @@ impl App {
 		}
 		n := rows[row].node
 		if n.is_dir {
-			node_toggle(n)
+			node_toggle(n, sidebar.hide[:])
 		} else {
 			self.open_file(n.path)
 		}
 	}
 
-	// Right-click on a sidebar file: context menu for it.
+	// Right-click in the sidebar: context menu for the row's file or
+	// directory; the header and empty space get the workspace root (".").
 	sidebar_context :: proc(py: f32, line_h: f32) {
 		row := self.sidebar_row_at(py, line_h)
 		rows := sidebar_rows(&sidebar)
-		if row < 0 || row >= len(rows) {
-			return
-		}
-		n := rows[row].node
-		if !n.is_dir {
-			self.open_context_file(n.path)
+		if row >= 0 && row < len(rows) {
+			n := rows[row].node
+			self.open_context_file(n.path, n.is_dir)
+		} else {
+			self.open_context_file(".", true)
 		}
 	}
 
@@ -234,6 +310,7 @@ impl App {
 		}
 		sidebar_destroy(&sidebar)
 		sidebar = {}
+		settings_load(self) // the new workspace brings its own .medit/settings.ini
 		sidebar_init(&sidebar)
 		lsp_stop(&lsp) // restarts lazily with the new rootUri
 		self.clear_cursor_undo()
@@ -314,5 +391,7 @@ impl App {
 			color := theme.fg if selected else theme.status_fg
 			draw_name(r, ix+isz+cell_w*0.8, y+(row_h-line_h)*0.5+r.ascent, sidebar_px-cell_w*0.5, n.name, color)
 		}
+
+		draw_vscrollbar(r, sidebar_px-1, top, h-top, content_h, sidebar.scroll_y, &theme)
 	}
 }

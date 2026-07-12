@@ -12,6 +12,14 @@ import "core:path/filepath"
 import "core:slice"
 import "core:strings"
 
+// One step up the directory tree; ok=false once dir stops shrinking, i.e.
+// at the filesystem root — os.split_path hands back "/" and Windows drive
+// roots ("C:\") unchanged, so a walk that only checks len(dir) never ends.
+parent_dir :: proc(dir: string) -> (parent: string, ok: bool) {
+	parent, _ = os.split_path(dir)
+	return parent, len(parent) < len(dir)
+}
+
 // The Odin/Methodin root that owns base/core/vendor, resolved once:
 // $ODIN_ROOT, else a cwd ancestor that has the three collections (the
 // common case of hacking inside the compiler repo), else `odin root`.
@@ -30,10 +38,15 @@ find_odin_root :: proc() -> string {
 		return true
 	}
 	cwd, _ := os.get_working_directory(context.temp_allocator)
-	for dir := cwd; len(dir) > 1; dir, _ = os.split_path(dir) {
+	for dir := cwd; dir != ""; {
 		if has_collections(dir) {
 			return strings.clone(dir)
 		}
+		parent, ok := parent_dir(dir)
+		if !ok {
+			break
+		}
+		dir = parent
 	}
 	state, out, _, err := os.process_exec(
 		{command = []string{"odin", "root"}},

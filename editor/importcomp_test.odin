@@ -36,6 +36,28 @@ test_import_string_detection :: proc(t: ^testing.T) {
 	testing.expect_value(t, ok3, false)
 }
 
+@test
+test_parent_dir_walk_terminates :: proc(t: ^testing.T) {
+	// os.split_path returns "/" and drive roots ("C:\") unchanged; the root
+	// walk must notice the lack of progress or it spins forever (froze the
+	// editor on import completion outside an Odin root).
+	when ODIN_OS == .Windows {
+		dir := `C:\Users\nobody\project`
+	} else {
+		dir := "/home/nobody/project"
+	}
+	steps := 0
+	for dir != "" && steps < 64 {
+		steps += 1
+		parent, ok := parent_dir(dir)
+		if !ok {
+			break
+		}
+		dir = parent
+	}
+	testing.expect(t, steps < 64, "parent_dir walk did not terminate")
+}
+
 // Runs against the repo itself (cwd is an Odin root with base/core/vendor).
 @test
 test_import_completion_lists_and_accepts :: proc(t: ^testing.T) {

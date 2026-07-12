@@ -128,3 +128,38 @@ test_escape_and_selection_undo :: proc(t: ^testing.T) {
 	app.undo_selection()
 	testing.expect_value(t, len(app.cursors), 1)
 }
+
+@test
+test_jump_centers_offscreen_target :: proc(t: ^testing.T) {
+	app: App
+	app.theme = theme_default()
+	app.buf = buffer_make()
+	sb: [dynamic]u8
+	defer delete(sb)
+	for _ in 0 ..< 200 {
+		append(&sb, "x\n")
+	}
+	app.buf.commit([]Edit{{range = {}, text = string(sb[:])}}, nil)
+	append(&app.cursors, cursor_at(Pos{0, 0}))
+	defer app_destroy(&app)
+
+	line_h: f32 = 20
+	app.view_h = 400
+	app.view_w = 800
+
+	// A jump far below the view lands ~40% down, not at the bottom edge.
+	app.cursors[0] = cursor_at(Pos{100, 0})
+	app.ensure_cursor_visible(8, line_h, center = true)
+	testing.expect_value(t, app.scroll_y, 100*line_h-400*0.4)
+
+	// Already visible: centering does not move the view.
+	app.cursors[0] = cursor_at(Pos{105, 0})
+	before := app.scroll_y
+	app.ensure_cursor_visible(8, line_h, center = true)
+	testing.expect_value(t, app.scroll_y, before)
+
+	// Plain keystroke following still scrolls minimally (bottom edge).
+	app.cursors[0] = cursor_at(Pos{150, 0})
+	app.ensure_cursor_visible(8, line_h)
+	testing.expect_value(t, app.scroll_y, 150*line_h+line_h-400)
+}

@@ -49,3 +49,42 @@ test_palette_dir_segments :: proc(t: ^testing.T) {
 	// The dir segment must not consume the basename.
 	expect_match(t, "buffer/", `editor\buffer.odin`, false)
 }
+
+@test
+test_palette_input_selection :: proc(t: ^testing.T) {
+	app: App
+	app.theme = theme_default()
+	app.buf = buffer_make()
+	append(&app.cursors, cursor_at(Pos{0, 0}))
+	defer app_destroy(&app)
+
+	// A prefill past the mode prefix opens selected, ready to be typed over.
+	app.palette_open_with(">abc")
+	p := &app.palette
+	testing.expect_value(t, p.caret, 4)
+	testing.expect_value(t, p.sel_anchor, 1)
+
+	app.palette_insert("x") // typing replaces the selection
+	testing.expect_value(t, string(p.query[:]), ">x")
+
+	app.palette_select_all()
+	app.palette_backspace() // selection delete, not one rune
+	testing.expect_value(t, string(p.query[:]), "")
+
+	// shift+arrows extend; a plain arrow collapses onto the edge.
+	app.palette_insert(">word")
+	app.palette_caret_move(-1, extend = true)
+	app.palette_caret_move(-1, extend = true)
+	lo, hi := app.palette_sel()
+	testing.expect_value(t, hi-lo, 2)
+	app.palette_caret_move(-1)
+	lo, hi = app.palette_sel()
+	testing.expect_value(t, lo, hi)
+	testing.expect_value(t, p.caret, 3)
+
+	// ctrl+arrow hops a word, ctrl+shift selects it.
+	app.palette_caret_move(2)
+	app.palette_caret_move(-1, extend = true, word = true)
+	lo, hi = app.palette_sel()
+	testing.expect_value(t, string(p.query[lo:hi]), "word")
+}
