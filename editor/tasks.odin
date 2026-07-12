@@ -104,10 +104,13 @@ Task_State :: struct {
 	filter:                [dynamic]u8, // fuzzy filter over locals/globals names
 	filter_focus:          bool, // typing lands in the filter (click its header)
 
-	// Row drag-selection in the output (terminal-style: release copies).
+	// Drag-selection in the output (terminal-style: release copies). Each
+	// endpoint is a row plus a byte offset into that row's line.
 
 	drag_from:             int, // -1 = no drag
 	drag_to:               int,
+	drag_from_off:         int,
+	drag_to_off:           int,
 
 	// Hover feedback: the link span, header button or frame under the mouse.
 
@@ -373,6 +376,30 @@ task_cell_to_offset :: proc(line: string, px, cell_w: f32) -> int {
 	return off
 }
 
+// The drag selection with its endpoints ordered ((row, offset)
+// lexicographically); `from` is the anchor row (drag_from, which the
+// caller may already have consumed).
+task_sel_span :: proc(ts: ^Task_State, from: int) -> (a_row, a_off, b_row, b_off: int) {
+	a_row, a_off = from, ts.drag_from_off
+	b_row, b_off = ts.drag_to, ts.drag_to_off
+	if a_row > b_row || (a_row == b_row && a_off > b_off) {
+		a_row, b_row = b_row, a_row
+		a_off, b_off = b_off, a_off
+	}
+	return
+}
+
+// Inverse of task_cell_to_offset: the cell where byte offset off lands.
+task_offset_to_cell :: proc(line: string, off: int) -> int {
+	cell, o := 0, 0
+	for o < min(off, len(line)) {
+		_, n := utf8.decode_rune(line[o:])
+		o += n
+		cell += 1
+	}
+	return cell
+}
+
 // Every file reference in an output line.
 task_scan_links :: proc(s: string, out: ^[dynamic]Task_Link) {
 	i := 0
@@ -564,6 +591,10 @@ impl App {
 				0,
 				max(len(ts.lines) - 1, 0),
 			)
+			ts.drag_to_off = 0
+			if ts.drag_to < len(ts.lines) {
+				ts.drag_to_off = task_cell_to_offset(ts.lines[ts.drag_to], px, cell_w)
+			}
 			return false
 		}
 		if ts.stack_x0 > 0 && px >= ts.stack_x0 {
@@ -648,6 +679,8 @@ impl App {
 		// A drag starts here; mouse-up decides click (link) vs copy.
 		ts.drag_from = row
 		ts.drag_to = row
+		ts.drag_from_off = task_cell_to_offset(ts.lines[row], px, cell_w)
+		ts.drag_to_off = ts.drag_from_off
 	}
 
 	// Right-click on the panel: a context menu for the local under the
@@ -666,8 +699,8 @@ impl App {
 		}
 	}
 
-	// Mouse-up over the panel: a plain click opens a file link; a row drag
-	// copies the selected lines to the clipboard.
+	// Mouse-up over the panel: a plain click opens a file link; a drag
+	// copies the selected span to the clipboard.
 	task_drag_end :: proc(px, py: f32, cell_w: f32) {
 		ts := &task
 		from := ts.drag_from
@@ -675,15 +708,24 @@ impl App {
 		if from < 0 {
 			return
 		}
-		lo, hi := min(from, ts.drag_to), max(from, ts.drag_to)
-		if lo != hi {
+		a_row, a_off, b_row, b_off := task_sel_span(ts, from)
+		if a_row != b_row || a_off != b_off {
 			sb := strings.builder_make(context.temp_allocator)
-			for i in lo ..= min(hi, len(ts.lines) - 1) {
-				strings.write_string(&sb, ts.lines[i])
-				strings.write_byte(&sb, '\n')
+			for i in a_row ..= min(b_row, len(ts.lines) - 1) {
+				line := ts.lines[i]
+				lo := clamp(a_off if i == a_row else 0, 0, len(line))
+				hi := clamp(b_off if i == b_row else len(line), lo, len(line))
+				strings.write_string(&sb, line[lo:hi])
+				if i != b_row {
+					strings.write_byte(&sb, '\n')
+				}
 			}
 			clipboard_set(strings.to_string(sb))
-			self.set_status(fmt.tprintf("copied %d lines", hi - lo + 1))
+			if a_row == b_row {
+				self.set_status("copied selection")
+			} else {
+				self.set_status(fmt.tprintf("copied %d lines", b_row - a_row + 1))
+			}
 			return
 		}
 		if from >= len(ts.lines) {
@@ -1025,6 +1067,7 @@ impl App {
 		}
 
 		links := make([dynamic]Task_Link, context.temp_allocator)
+		sel_a_row, sel_a_off, sel_b_row, sel_b_off := task_sel_span(ts, ts.drag_from)
 		for vi in 0 ..< output_rows {
 			i := row0 + vi
 			if i >= len(ts.lines) {
@@ -1033,10 +1076,15 @@ impl App {
 			row_y := top + head_h + f32(vi) * row_h
 			baseline := row_y + (row_h - line_h) * 0.5 + r.ascent
 			line := ts.lines[i]
-			if ts.drag_from >= 0 &&
-			   i >= min(ts.drag_from, ts.drag_to) &&
-			   i <= max(ts.drag_from, ts.drag_to) {
-				push_rect(r, 0, row_y, out_w, row_h, theme.selection)
+			if ts.drag_from >= 0 && i >= sel_a_row && i <= sel_b_row {
+				lo := sel_a_off if i == sel_a_row else 0
+				hi := sel_b_off if i == sel_b_row else len(line)
+				x0 := cell_w + f32(task_offset_to_cell(line, lo)) * cell_w
+				x1 := cell_w + f32(task_offset_to_cell(line, hi)) * cell_w
+				if i != sel_b_row {
+					x1 += cell_w * 0.5 // show the selected newline
+				}
+				push_rect(r, x0, row_y, max(x1 - x0, 2), row_h, theme.selection)
 			}
 			// File references draw accented and underlined — they're
 			// clickable; the one under the mouse also gets a backdrop and a
