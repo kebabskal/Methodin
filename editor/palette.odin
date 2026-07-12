@@ -844,6 +844,8 @@ Ctx_Action :: enum {
 	Copy_Path,
 	Copy_Rel_Path,
 	Copy_Name,
+	Copy_Path_Line,
+	Copy_Abs_Path_Line,
 	Copy,
 	Cut,
 	Paste,
@@ -948,6 +950,10 @@ context_refresh :: proc(app: ^App, q: string) {
 			append(&entries, Entry{"Transform to Uppercase", .Uppercase})
 			append(&entries, Entry{"Transform to Lowercase", .Lowercase})
 		}
+		if app.buf.path != "" {
+			append(&entries, Entry{"Copy Relative Path : Line", .Copy_Path_Line})
+			append(&entries, Entry{"Copy Absolute Path : Line", .Copy_Abs_Path_Line})
+		}
 	}
 
 	ms := make([dynamic]int, context.temp_allocator)
@@ -1027,6 +1033,15 @@ context_accept :: proc(app: ^App, it: ^Palette_Item) {
 	case .Copy_Name:
 		clipboard_set(p.ctx_path[base_start(p.ctx_path):])
 		app.set_status("file name copied")
+	case .Copy_Path_Line:
+		loc := fmt.tprintf("%s:%d",
+			shorten_path(abs_path(app.buf.path)), app.primary_cursor().head.line+1)
+		clipboard_set(loc)
+		app.set_status(fmt.tprintf("copied %s", loc))
+	case .Copy_Abs_Path_Line:
+		loc := fmt.tprintf("%s:%d", abs_path(app.buf.path), app.primary_cursor().head.line+1)
+		clipboard_set(loc)
+		app.set_status(fmt.tprintf("copied %s", loc))
 	case .Copy:
 		clipboard_set(app.copy_text())
 	case .Cut:
