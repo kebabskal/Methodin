@@ -7,6 +7,8 @@
 // Read at startup, on workspace switch, when saved from a medit tab, and on
 // window focus (so external edits count too). Currently:
 //
+//   [ui]
+//   theme = tokyo-night       ; see THEMES in theme.odin
 //   [files]
 //   hide = *.exe *.pdb bin    ; globs hidden from the file tree
 package medit
@@ -19,6 +21,10 @@ import "core:strings"
 PROJECT_SETTINGS_PATH :: ".medit/settings.ini"
 
 SETTINGS_TEMPLATE :: `; medit settings — the project's .medit/settings.ini adds to the user-wide one.
+[ui]
+; color theme: tokyo-night, tokyo-day, paper, gruvbox
+theme = tokyo-night
+
 [files]
 ; space-separated globs hidden from the file tree, e.g.:
 ; hide = *.exe *.pdb *.obj bin
@@ -44,6 +50,11 @@ settings_parse :: proc(app: ^App, src: string) {
 				append(&app.sidebar.hide, strings.clone(g))
 			}
 		}
+		if it.section == "ui" && key == "theme" {
+			if t, ok := theme_by_name(strings.trim_space(value)); ok {
+				app.theme = t
+			}
+		}
 	}
 }
 
@@ -61,6 +72,55 @@ settings_load :: proc(app: ^App) {
 	if data, err := os.read_entire_file(PROJECT_SETTINGS_PATH, context.temp_allocator); err == nil {
 		settings_parse(app, string(data))
 	}
+}
+
+// Persist the theme choice into the user settings.ini: replace its first
+// [ui] theme line, or append a [ui] section (last key wins on load, so a
+// trailing section also overrides an untouched earlier one).
+settings_save_theme :: proc(name: string) -> bool {
+	path, ok := settings_user_path()
+	if !ok {
+		return false
+	}
+	src := ""
+	if data, err := os.read_entire_file(path, context.temp_allocator); err == nil {
+		src = string(data)
+	} else {
+		src = SETTINGS_TEMPLATE
+	}
+
+	sb := strings.builder_make(context.temp_allocator)
+	section := ""
+	replaced := false
+	rest := src
+	for line in strings.split_lines_iterator(&rest) {
+		t := strings.trim_space(line)
+		if strings.has_prefix(t, "[") && strings.has_suffix(t, "]") {
+			section = t[1:len(t)-1]
+		}
+		if !replaced && section == "ui" {
+			if key, eq, _ := strings.partition(t, "="); eq == "=" &&
+			   strings.trim_space(key) == "theme" {
+				strings.write_string(&sb, "theme = ")
+				strings.write_string(&sb, name)
+				strings.write_byte(&sb, '\n')
+				replaced = true
+				continue
+			}
+		}
+		strings.write_string(&sb, line)
+		strings.write_byte(&sb, '\n')
+	}
+	if !replaced {
+		strings.write_string(&sb, "\n[ui]\ntheme = ")
+		strings.write_string(&sb, name)
+		strings.write_byte(&sb, '\n')
+	}
+
+	if dir, _ := os.split_path(path); dir != "" {
+		_ = os.make_directory_all(dir)
+	}
+	return os.write_entire_file(path, transmute([]byte)strings.to_string(sb)) == nil
 }
 
 // Does name match any of the hide globs?

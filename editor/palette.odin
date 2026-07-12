@@ -311,6 +311,10 @@ PALETTE_COMMANDS := []Palette_Command{
 		app.outline_fields = !app.outline_fields
 		app.set_status("outline: fields shown" if app.outline_fields else "outline: fields hidden")
 	}},
+	{"Theme: Tokyo Night", "", proc(app: ^App) { app.theme_apply("tokyo-night") }},
+	{"Theme: Tokyo Day (light)", "", proc(app: ^App) { app.theme_apply("tokyo-day") }},
+	{"Theme: Paper (light, high contrast)", "", proc(app: ^App) { app.theme_apply("paper") }},
+	{"Theme: Gruvbox", "", proc(app: ^App) { app.theme_apply("gruvbox") }},
 }
 
 // --- Item plumbing -------------------------------------------------------------

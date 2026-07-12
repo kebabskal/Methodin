@@ -331,7 +331,10 @@ impl App {
 
 		close_w := tabbar_h * 1.4
 		win_close = {width - close_w, 0, width, tabbar_h - 1}
-		tabs_x0 = cell_w * 0.8
+		// Tabs start where the text area does (right of the sidebar), so the
+		// active tab sits flush over its buffer; the space above the sidebar
+		// stays draggable title bar.
+		tabs_x0 = sidebar_px + cell_w*0.8
 
 		resize(&tab_rects, len(docs))
 

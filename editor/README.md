@@ -103,7 +103,11 @@ the editor's own internals use in-struct procs and `impl` blocks throughout
   directory) and `>Settings: Open Project Settings` (`.medit/settings.ini`);
   both created from a template on first use, re-read on save, focus and
   workspace switch, and the project file adds to the user one. Currently:
-  `[files] hide = *.exe *.pdb bin` — globs hidden from the file tree.
+  `[files] hide = *.exe *.pdb bin` — globs hidden from the file tree — and
+  `[ui] theme = <name>`.
+- **Themes** — `>Theme: …` in the palette switches live and saves the
+  choice to the user settings: `tokyo-night` (default), `tokyo-day` and
+  high-contrast `paper` for daylight, and `gruvbox`.
 - **Multiple cursors** — `ctrl+alt+↑/↓` to stack cursors, `ctrl+d` to select
   the next occurrence, `alt+click` to add a cursor anywhere. Every editing
   action is a batch of `(range, text)` replacements, one per cursor, applied
