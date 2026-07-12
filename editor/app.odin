@@ -164,6 +164,7 @@ app_init :: proc(app: ^App, path: string) {
 	app.theme = theme_default()
 	app.focused = true
 	app.format_on_save = true
+	app.dap.stop_line = -1 // 0 would mark line 0 of a pathless buffer stopped
 	b: Buffer
 	lang := Lang.Plain
 	if path != "" {
