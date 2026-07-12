@@ -37,6 +37,7 @@ Dap_Req :: enum {
 	Evaluate,       // hover: runtime value of the expression under the mouse
 	Hover_Children, // hover on an aggregate: its fields/elements
 	Local_Children, // aggregate local: one level of fields, shown inline
+	Local_Expand,   // clicked aggregate: children become indented rows
 	Locations,      // a clicked local's declaration site
 	Resume,         // continue / next / stepIn / stepOut
 	Disconnect,
@@ -66,7 +67,8 @@ Dap :: struct {
 	frames:    [dynamic]Dap_Frame,
 	locals:    [dynamic]Dap_Var,
 	sel_frame:   int,
-	child_req:   map[int]int, // Local_Children request seq → locals index
+	child_req:   map[int]int, // Local_Children/Local_Expand request seq → Dap_Var id
+	next_var_id: int,         // ids keep in-flight replies aimed while rows shift
 	globals_req: int,         // seq of the Globals scope's variables request
 }
 
@@ -81,6 +83,10 @@ Dap_Var :: struct {
 	name:     string, // owned
 	value:    string, // owned
 	decl_ref: int,    // declarationLocationReference (0 = none)
+	ref:      int,    // variablesReference (>0: an aggregate, expandable)
+	id:       int,    // stable identity for in-flight child requests
+	depth:    int,    // tree indent (0 = top level)
+	expanded: bool,   // children shown as the rows below
 }
 
 dap_clear_stopped :: proc(d: ^Dap) {
@@ -96,6 +102,17 @@ dap_clear_stopped :: proc(d: ^Dap) {
 	clear(&d.locals)
 	clear(&d.child_req)
 	d.sel_frame = 0
+}
+
+// Index of the local with a given id; -1 once it is gone (rows shift under
+// in-flight child requests when an expansion inserts or a collapse removes).
+dap_local_by_id :: proc(d: ^Dap, id: int) -> int {
+	for &v, i in d.locals {
+		if v.id == id {
+			return i
+		}
+	}
+	return -1
 }
 
 Breakpoint :: struct {
@@ -531,6 +548,32 @@ impl App {
 		}
 	}
 
+	// Click on an aggregate local: its children become indented rows below
+	// it (fetched on first expand), or fold back up.
+	dap_local_toggle :: proc(i: int) {
+		d := &dap
+		if d.state != .Stopped || i < 0 || i >= len(d.locals) {
+			return
+		}
+		v := &d.locals[i]
+		if v.ref <= 0 || v.value == "" {
+			return
+		}
+		if v.expanded {
+			v.expanded = false
+			n := 0
+			for i+1+n < len(d.locals) && d.locals[i+1+n].depth > v.depth {
+				delete(d.locals[i+1+n].name)
+				delete(d.locals[i+1+n].value)
+				n += 1
+			}
+			remove_range(&d.locals, i+1, i+1+n)
+			return
+		}
+		s := dap_request(d, .Local_Expand, "variables", fmt.tprintf(`{{"variablesReference":%d}}`, v.ref))
+		d.child_req[s] = v.id
+	}
+
 	// Click on a call-stack frame: jump there and re-scope the locals.
 	dap_select_frame :: proc(i: int) {
 		d := &dap
@@ -842,21 +885,25 @@ dap_on_response :: proc(app: ^App, kind: Dap_Req, body: json.Value, seq: int) {
 				}
 				kept += 1
 			}
+			ref := jint(jget(v, "variablesReference"))
 			append(&d.locals, Dap_Var{
 				name     = strings.clone(name),
 				value    = strings.clone(jstr(jget(v, "value"))),
 				decl_ref = jint(jget(v, "declarationLocationReference")),
+				ref      = ref,
+				id       = d.next_var_id,
 			})
-			ref := jint(jget(v, "variablesReference"))
+			d.next_var_id += 1
 			if ref > 0 && len(d.locals) <= 48 {
 				s := dap_request(d, .Local_Children, "variables", fmt.tprintf(`{{"variablesReference":%d}}`, ref))
-				d.child_req[s] = len(d.locals) - 1
+				d.child_req[s] = d.locals[len(d.locals)-1].id
 			}
 		}
 	case .Local_Children:
-		i, known := d.child_req[seq]
+		id, known := d.child_req[seq]
 		delete_key(&d.child_req, seq)
-		if !known || i >= len(d.locals) {
+		i := dap_local_by_id(d, id)
+		if !known || i < 0 {
 			return
 		}
 		sb := strings.builder_make(context.temp_allocator)
@@ -880,6 +927,31 @@ dap_on_response :: proc(app: ^App, kind: Dap_Req, body: json.Value, seq: int) {
 		strings.write_byte(&sb, '}')
 		delete(d.locals[i].value)
 		d.locals[i].value = strings.clone(strings.to_string(sb))
+	case .Local_Expand:
+		id, eknown := d.child_req[seq]
+		delete_key(&d.child_req, seq)
+		pi := dap_local_by_id(d, id)
+		if !eknown || pi < 0 || d.locals[pi].expanded {
+			return
+		}
+		d.locals[pi].expanded = true
+		pdepth := d.locals[pi].depth
+		at := pi + 1
+		for v, j in jarr(jget(body, "variables")) {
+			if j >= 128 {
+				break
+			}
+			inject_at(&d.locals, at, Dap_Var{
+				name     = strings.clone(jstr(jget(v, "name"))),
+				value    = strings.clone(jstr(jget(v, "value"))),
+				decl_ref = jint(jget(v, "declarationLocationReference")),
+				ref      = jint(jget(v, "variablesReference")),
+				id       = d.next_var_id,
+				depth    = pdepth + 1,
+			})
+			d.next_var_id += 1
+			at += 1
+		}
 	case .Locations:
 		// A clicked local's declaration: jump there.
 		line := jint(jget(body, "line"))

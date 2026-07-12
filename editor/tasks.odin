@@ -666,7 +666,13 @@ impl App {
 				} else {
 					vis := self.task_locals_filtered()
 					if i := row + int(ts.locals_scroll); i < len(vis) {
-						self.dap_local_goto(vis[i])
+						// Aggregates expand/collapse; scalars jump to their
+						// declaration (the context menu still offers both).
+						if dap.locals[vis[i]].ref > 0 {
+							self.dap_local_toggle(vis[i])
+						} else {
+							self.dap_local_goto(vis[i])
+						}
 					}
 				}
 			}
@@ -1041,13 +1047,22 @@ impl App {
 					break
 				}
 				v := &dap.locals[vis_locals[i]]
-				y := ts.head_bot + f32(vi + 1) * row_h + (row_h - line_h) * 0.5 + r.ascent
+				ry := ts.head_bot + f32(vi + 1) * row_h
+				y := ry + (row_h - line_h) * 0.5 + r.ascent
 				if v.value == "" { 	// section divider (globals)
 					draw_clip(r, ts.locals_x0 + cell_w, y, width, v.name, theme.status_dim)
 				} else {
+					// Aggregates get a fold chevron; children indent under
+					// their parent.
+					ind := ts.locals_x0 + cell_w + f32(v.depth) * cell_w * 1.5
+					if v.ref > 0 {
+						isz := line_h * 0.5
+						push_icon(r, ind, ry + (row_h - isz) * 0.5, isz,
+							.Chevron_Down if v.expanded else .Chevron_Right, theme.status_dim)
+					}
 					draw_clip(
 						r,
-						ts.locals_x0 + cell_w,
+						ind + cell_w * 1.3,
 						y,
 						width,
 						fmt.tprintf("%s = %s", v.name, v.value),
