@@ -666,6 +666,62 @@ dap_handle :: proc(app: ^App, body: string) {
 	}
 }
 
+// lldb spells globals in the global namespace, duplicates disambiguated
+// by address: "::counter @ 0x7ff6…" → "counter".
+@(private = "file")
+dap_global_name :: proc(name: string) -> string {
+	n := name
+	if strings.has_prefix(n, "::") {
+		n = n[2:]
+	}
+	if at := strings.index(n, " @ "); at >= 0 {
+		n = n[:at]
+	}
+	return n
+}
+
+// CRT scalar statics whose names and types look exactly like user globals
+// (plain ints and bools), so the shape rules below can't catch them.
+@(private = "file")
+DAP_GLOBAL_NOISE := []string{
+	"errno_no_memory", "doserrno_no_memory", "fSystemSet",
+	"is_initialized_as_dll", "c_termination_complete",
+	"module_local_atexit_table_initialized", "function_pointers",
+	"module_names", "module_handles", "thread_local_exit_callback_func",
+}
+
+// Does a Globals-scope variable look like the user's own code? Compiler
+// and CRT statics carry _/$ name prefixes, C++ qualifiers, or C-only type
+// shapes (const arrays, templates, function pointers); Odin's runtime
+// internals carry runtime:: types or reserved __ name suffixes.
+@(private = "file")
+dap_global_user_space :: proc(name, type_name: string) -> bool {
+	if name == "" || name[0] == '_' || name[0] == '$' {
+		return false
+	}
+	if strings.contains(name, "::") || strings.contains_rune(name, '`') {
+		return false
+	}
+	if strings.has_suffix(name, "__") { // args__ and friends
+		return false
+	}
+	for noise in DAP_GLOBAL_NOISE {
+		if name == noise {
+			return false
+		}
+	}
+	if strings.has_prefix(type_name, "_") || strings.has_prefix(type_name, "const ") {
+		return false
+	}
+	if strings.contains(type_name, "(*") || strings.contains_rune(type_name, '<') {
+		return false
+	}
+	if strings.contains(type_name, "runtime::") {
+		return false
+	}
+	return true
+}
+
 @(private = "file")
 dap_on_response :: proc(app: ^App, kind: Dap_Req, body: json.Value, seq: int) {
 	d := &app.dap
@@ -681,15 +737,24 @@ dap_on_response :: proc(app: ^App, kind: Dap_Req, body: json.Value, seq: int) {
 			return
 		}
 		// The stack fills the panel's call-stack column (frames with a
-		// source are clickable); the first user frame is the anchor.
+		// source are clickable). The anchor is the first workspace frame
+		// when there is one (a trap unwinds through runtime internals
+		// first), else the first frame with any real source.
 		dap_clear_stopped(d)
 		anchor := -1
+		ws_anchor := -1
 		for f, i in frames {
 			if i >= 32 {
 				break
 			}
 			line := jint(jget(f, "line"))
-			path := jstr(jget(jget(f, "source"), "path"))
+			src := jget(f, "source")
+			path := jstr(jget(src, "path"))
+			// Frames without debug info get a synthetic disassembly
+			// source (a sourceReference and a dll`symbol path) — not a file.
+			if jint(jget(src, "sourceReference")) > 0 {
+				path = ""
+			}
 			short := shorten_path(path) if path != "" && line > 0 else ""
 			append(&d.frames, Dap_Frame{
 				name = strings.clone(jstr(jget(f, "name"))),
@@ -697,9 +762,17 @@ dap_on_response :: proc(app: ^App, kind: Dap_Req, body: json.Value, seq: int) {
 				line = line,
 				id   = jint(jget(f, "id")),
 			})
-			if anchor < 0 && short != "" {
-				anchor = i
+			if short != "" {
+				if anchor < 0 {
+					anchor = i
+				}
+				if ws_anchor < 0 && len(short) < len(path) { // relative ⇒ inside the workspace
+					ws_anchor = i
+				}
 			}
+		}
+		if ws_anchor >= 0 {
+			anchor = ws_anchor
 		}
 		if anchor < 0 {
 			return
@@ -742,39 +815,40 @@ dap_on_response :: proc(app: ^App, kind: Dap_Req, body: json.Value, seq: int) {
 		// The locals column of the panel. Aggregates ([3]f32, structs, …)
 		// report their value in children — fetch one level and show it
 		// inline, so locals read like hovers do.
-		// Globals are noisy (runtime and library statics): keep only the
-		// stopped frame's package (name prefix up to "::") plus unqualified
-		// names, and drop compiler-internal "__" symbols.
+		// The Globals scope arrives target-wide: user globals come
+		// unqualified ("::time", duplicates as "::name @ 0xADDR") mixed
+		// into hundreds of CRT and Odin-runtime statics, and DWARF gives
+		// them no declaration references to filter by. Keep what looks
+		// like user code by shape (dap_global_user_space).
 		is_globals := seq == d.globals_req
-		pkg := ""
-		if is_globals && d.sel_frame < len(d.frames) {
-			if c := strings.index(d.frames[d.sel_frame].name, "::"); c > 0 {
-				pkg = d.frames[d.sel_frame].name[:c+2]
-			}
-		}
 		sep_done := false
+		kept := 0
 		for v, i in jarr(jget(body, "variables")) {
-			if i >= 256 {
+			if i >= (4096 if is_globals else 256) {
 				break
 			}
+			name := jstr(jget(v, "name"))
 			if is_globals {
-				name := jstr(jget(v, "name"))
-				if strings.has_prefix(name, "__") ||
-				   (strings.contains(name, "::") && (pkg == "" || !strings.has_prefix(name, pkg))) {
+				if kept >= 64 {
+					break
+				}
+				name = dap_global_name(name)
+				if !dap_global_user_space(name, jstr(jget(v, "type"))) {
 					continue
 				}
 				if !sep_done {
 					append(&d.locals, Dap_Var{name = strings.clone("— globals —"), value = strings.clone("")})
 					sep_done = true
 				}
+				kept += 1
 			}
 			append(&d.locals, Dap_Var{
-				name     = strings.clone(jstr(jget(v, "name"))),
+				name     = strings.clone(name),
 				value    = strings.clone(jstr(jget(v, "value"))),
 				decl_ref = jint(jget(v, "declarationLocationReference")),
 			})
 			ref := jint(jget(v, "variablesReference"))
-			if ref > 0 && i < 32 {
+			if ref > 0 && len(d.locals) <= 48 {
 				s := dap_request(d, .Local_Children, "variables", fmt.tprintf(`{{"variablesReference":%d}}`, ref))
 				d.child_req[s] = len(d.locals) - 1
 			}
