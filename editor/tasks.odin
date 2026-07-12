@@ -874,6 +874,8 @@ impl App {
 		// and — while the debugger is stopped — the stepping controls. Icon
 		// buttons in square boxes; hovering fills the box faintly.
 		ts.head_bot = top + head_h
+		// A quiet line seats the header above the rows.
+		push_rect(r, 0, ts.head_bot - 1, width, 1, color_alpha(theme.gutter_fg, 0.4))
 		clear(&ts.btns)
 		bx := width - cell_w*0.5
 		put_btn :: proc(
