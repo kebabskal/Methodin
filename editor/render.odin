@@ -35,6 +35,9 @@ Icon :: enum {
 	Redo_Dot,          // step over
 	Arrow_Down_To_Dot, // step in
 	Arrow_Up_From_Dot, // step out
+	File,
+	Folder,
+	Folder_Open,
 }
 
 // Codepoints from vendor/lucide/codepoints.json (Lucide 1.24.0).
@@ -50,6 +53,9 @@ ICON_CODEPOINTS := [Icon]rune {
 	.Redo_Dot          = 0xE450,
 	.Arrow_Down_To_Dot = 0xE44D,
 	.Arrow_Up_From_Dot = 0xE44E,
+	.File              = 0xE0C0,
+	.Folder            = 0xE0D7,
+	.Folder_Open       = 0xE247,
 }
 
 @(private = "file")
@@ -408,10 +414,8 @@ push_rect :: proc(r: ^Renderer, x, y, w, h: f32, c: Color) {
 	push_quad(r, x, y, x+w, y+h, r.white_uv.x, r.white_uv.y, r.white_uv.x, r.white_uv.y, c)
 }
 
-// --- Icons: tiny vector shapes built from rects, so they scale with the
-// font and need nothing from the atlas. ---------------------------------------
-
-// Filled disc approximated with horizontal slices.
+// Filled disc approximated with horizontal slices, so it scales with the
+// font and needs nothing from the atlas (breakpoints, the dirty-tab dot).
 push_disc :: proc(r: ^Renderer, cx, cy, radius: f32, c: Color) {
 	SLICES :: 10
 	step := radius * 2 / SLICES
@@ -421,22 +425,6 @@ push_disc :: proc(r: ^Renderer, cx, cy, radius: f32, c: Color) {
 		half := math.sqrt(max(radius*radius - ymid*ymid, 0))
 		push_rect(r, cx-half, cy+y0, half*2, step+0.4, c)
 	}
-}
-
-// A document sheet with a folded top-right corner.
-push_icon_file :: proc(r: ^Renderer, x, y, size: f32, c: Color) {
-	w := size * 0.78
-	fold := size * 0.32
-	push_rect(r, x, y, w-fold, size, c)
-	push_rect(r, x+w-fold, y+fold, fold, size-fold, c)
-	push_rect(r, x+w-fold, y+fold*0.45, fold*0.55, fold*0.55, color_alpha(c, 0.55))
-}
-
-// A folder: tab on top of the body.
-push_icon_folder :: proc(r: ^Renderer, x, y, size: f32, c: Color) {
-	tab_h := size * 0.22
-	push_rect(r, x, y+size*0.10, size*0.45, tab_h, c)
-	push_rect(r, x, y+size*0.10+tab_h*0.6, size*0.92, size*0.62, c)
 }
 
 // One Lucide glyph, its ink box centered in the square (x, y, size). Icons

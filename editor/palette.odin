@@ -1968,7 +1968,7 @@ impl App {
 				push_glyph(r, lx, baseline, it.kind_ch, theme.faces[it.kind_face])
 				lx += cell_w * 2
 			} else if p.mode_i == PALETTE_MODE_FILES || p.mode_i == PALETTE_MODE_USAGES {
-				push_icon_file(r, lx, y+(row_h-isz)*0.5, isz, color_alpha(theme.status_dim, 0.9))
+				push_icon(r, lx, y+(row_h-isz)*0.5, isz, .File, color_alpha(theme.status_dim, 0.9))
 				lx += isz + cell_w*0.9
 			}
 			palette_draw_label(r, lx, baseline, right-lx, it, &theme)

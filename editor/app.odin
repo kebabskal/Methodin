@@ -1563,7 +1563,7 @@ impl App {
 			x += cell_w * 1.7
 		}
 		isz := line_h * 0.62
-		push_icon_file(r, x, y + (status_h - isz) * 0.5, isz, color_alpha(theme.status_dim, 0.9))
+		push_icon(r, x, y + (status_h - isz) * 0.5, isz, .File, color_alpha(theme.status_dim, 0.9))
 		x += isz + cell_w * 0.8
 		name := buf.path if buf.path != "" else "[untitled]"
 		x = utext(r, x, baseline, name, theme.status_fg)

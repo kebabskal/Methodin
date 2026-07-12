@@ -336,7 +336,7 @@ impl App {
 		// Header: the workspace root, with a folder icon.
 		hy := top + row_h*0.25 - sidebar.scroll_y
 		if hy+row_h >= top {
-			push_icon_folder(r, cell_w*1.6, hy+(row_h-isz)*0.5, isz, theme.faces[.Function])
+			push_icon(r, cell_w*1.6, hy+(row_h-isz)*0.5, isz, .Folder_Open, theme.faces[.Function])
 			draw_name(r, cell_w*1.6+isz+cell_w*0.8, hy+(row_h-line_h)*0.5+r.ascent, sidebar_px-cell_w,
 				sidebar.root.name, theme.status_fg)
 		}
@@ -362,9 +362,10 @@ impl App {
 			}
 			ix := x + cell_w*1.0
 			if n.is_dir {
-				push_icon_folder(r, ix, mid-isz*0.5, isz, color_alpha(theme.faces[.Function], 0.85))
+				push_icon(r, ix, mid-isz*0.5, isz, .Folder_Open if n.expanded else .Folder,
+					color_alpha(theme.faces[.Function], 0.85))
 			} else {
-				push_icon_file(r, ix+isz*0.08, mid-isz*0.5, isz,
+				push_icon(r, ix, mid-isz*0.5, isz, .File,
 					color_alpha(theme.fg if selected else theme.status_dim, 0.85))
 			}
 			color := theme.fg if selected else theme.status_fg

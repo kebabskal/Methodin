@@ -376,7 +376,7 @@ impl App {
 
 			name := self.tab_label(i)
 			color := theme.fg if i == active else theme.status_dim
-			push_icon_file(r, x+cell_w*1.5, (tabbar_h-isz)*0.5, isz, color_alpha(color, 0.75))
+			push_icon(r, x+cell_w*1.5, (tabbar_h-isz)*0.5, isz, .File, color_alpha(color, 0.75))
 			gx := x + cell_w*1.5 + isz + cell_w*0.8
 			_ = utext_clip(r, gx, baseline, gx+max_name+cell_w, name, color)
 
