@@ -151,7 +151,7 @@ impl App {
 					x1 = x0 + cell_w // zero-width range: mark one cell
 				}
 				x0 = max(x0, gutter_px)
-				y := tabbar_h + f32(line+1)*line_h - scroll_y - 2
+				y := text_top + f32(line+1)*line_h - scroll_y - 2
 				if x1 > x0 && y > tabbar_h && y < tabbar_h+view_h+line_h {
 					push_rect(r, x0, y, x1-x0, 2, color)
 				}

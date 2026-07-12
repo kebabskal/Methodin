@@ -1214,10 +1214,10 @@ impl App {
 
 		// Anchor under the hovered word; flip above if it doesn't fit.
 		ax := gutter_px + f32(visual_col(&buf, hover_pos.line, hover_pos.col))*cell_w - scroll_x
-		ay := tabbar_h + f32(hover_pos.line+1)*line_h - scroll_y + 2
+		ay := text_top + f32(hover_pos.line+1)*line_h - scroll_y + 2
 		ax = clamp(ax, sidebar_px, max(sidebar_px, width-w))
 		if ay+h > height-status_h {
-			ay = tabbar_h + f32(hover_pos.line)*line_h - scroll_y - h - 2
+			ay = text_top + f32(hover_pos.line)*line_h - scroll_y - h - 2
 		}
 		ay = max(ay, 0)
 

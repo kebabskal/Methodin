@@ -48,7 +48,7 @@ impl App {
 
 	// The live document fields as a Doc (for stashing or destroying).
 	live_doc :: proc() -> Doc {
-		return Doc{
+		return Doc {
 			buf         = buf,
 			hl          = hl,
 			cursors     = cursors,
@@ -248,7 +248,7 @@ impl App {
 				self.doc_install(buffer_make(), .Plain)
 				return
 			}
-			self.doc_load(min(i, len(docs)-1))
+			self.doc_load(min(i, len(docs) - 1))
 			self.doc_reset_transients()
 		} else {
 			doc_destroy(&docs[i])
@@ -293,7 +293,7 @@ impl App {
 			}
 			switch button {
 			case 0:
-				if px >= rect[1]-cell_w*2.4 {
+				if px >= rect[1] - cell_w * 2.4 {
 					self.tab_close(i)
 				} else {
 					self.doc_switch(i)
@@ -327,14 +327,14 @@ impl App {
 		cell_w := r.cell_w
 
 		push_rect(r, 0, 0, width, tabbar_h, theme.status_bg)
-		push_rect(r, 0, tabbar_h-1, width, 1, color_alpha(theme.gutter_fg, 0.6))
+		push_rect(r, 0, tabbar_h - 1, width, 1, color_alpha(theme.gutter_fg, 0.6))
 
 		close_w := tabbar_h * 1.4
 		win_close = {width - close_w, 0, width, tabbar_h - 1}
 		// Tabs start where the text area does (right of the sidebar), so the
 		// active tab sits flush over its buffer; the space above the sidebar
 		// stays draggable title bar.
-		tabs_x0 = sidebar_px + cell_w*0.8
+		tabs_x0 = sidebar_px + cell_w * 0.8
 
 		resize(&tab_rects, len(docs))
 
@@ -343,7 +343,7 @@ impl App {
 		total: f32 = 0
 		for i in 0 ..< len(docs) {
 			name_w := min(utext_width(r, self.tab_label(i)), max_name)
-			w := name_w + cell_w*7.0
+			w := name_w + cell_w * 7.0
 			tab_rects[i] = {total, w}
 			total += w
 		}
@@ -352,60 +352,95 @@ impl App {
 			tab_follow = false
 			x0 := tab_rects[active][0]
 			x1 := x0 + tab_rects[active][1]
-			if x1 > tab_scroll+avail {
+			if x1 > tab_scroll + avail {
 				tab_scroll = x1 - avail
 			}
 			if x0 < tab_scroll {
 				tab_scroll = x0
 			}
 		}
-		tab_scroll = clamp(tab_scroll, 0, max(0, total-avail))
+		tab_scroll = clamp(tab_scroll, 0, max(0, total - avail))
 
-		baseline := (tabbar_h-line_h)*0.5 + r.ascent
+		baseline := (tabbar_h - line_h) * 0.5 + r.ascent
 		isz := line_h * 0.62
 		for i in 0 ..< len(docs) {
 			x := tabs_x0 + tab_rects[i][0] - tab_scroll
 			w := tab_rects[i][1]
 			tab_rects[i] = {x, x + w}
-			if x+w <= tabs_x0 || x >= width-close_w {
+			if x + w <= tabs_x0 || x >= width - close_w {
 				continue
 			}
 			if i == active {
 				push_rect(r, x, 0, w, tabbar_h, theme.bg) // merge into the editor
-				push_rect(r, x, 0, w, 2, theme.faces[.Function])
+				// push_rect(r, x, 0, w, 2, theme.faces[.Function])
 			} else {
-				push_rect(r, x+w-1, tabbar_h*0.3, 1, tabbar_h*0.4, color_alpha(theme.gutter_fg, 0.6))
+				push_rect(
+					r,
+					x + w - 1,
+					tabbar_h * 0.3,
+					1,
+					tabbar_h * 0.4,
+					color_alpha(theme.gutter_fg, 0.6),
+				)
 			}
 
 			name := self.tab_label(i)
 			color := theme.fg if i == active else theme.status_dim
-			push_icon(r, x+cell_w*1.5, (tabbar_h-isz)*0.5, isz, .File, color_alpha(color, 0.75))
-			gx := x + cell_w*1.5 + isz + cell_w*0.8
-			_ = utext_clip(r, gx, baseline, gx+max_name+cell_w, name, color)
+			push_icon(
+				r,
+				x + cell_w * 1.5,
+				(tabbar_h - isz) * 0.5,
+				isz,
+				.File,
+				color_alpha(color, 0.75),
+			)
+			gx := x + cell_w * 1.5 + isz + cell_w * 0.8
+			_ = utext_clip(r, gx, baseline, gx + max_name + cell_w, name, color)
 
 			// Close box: a dirty dot that becomes × once the file is clean.
-			cx := x + w - cell_w*2.4
+			cx := x + w - cell_w * 2.4
 			if self.doc_buf(i).is_dirty() {
-				push_disc(r, cx+cell_w*0.5, tabbar_h*0.5, cell_w*0.32, theme.faces[.Number])
+				push_disc(
+					r,
+					cx + cell_w * 0.5,
+					tabbar_h * 0.5,
+					cell_w * 0.32,
+					theme.faces[.Number],
+				)
 			} else {
 				xsz := line_h * 0.55
-				push_icon(r, cx+cell_w*0.5-xsz*0.5, (tabbar_h-xsz)*0.5, xsz, .X,
-					color_alpha(color, 0.8))
+				push_icon(
+					r,
+					cx + cell_w * 0.5 - xsz * 0.5,
+					(tabbar_h - xsz) * 0.5,
+					xsz,
+					.X,
+					color_alpha(color, 0.8),
+				)
 			}
 		}
 
 		// Cover tabs scrolled past either edge, then the window ×, hovered
 		// like a native titlebar button.
 		push_rect(r, 0, 0, tabs_x0, tabbar_h, theme.status_bg)
-		push_rect(r, width-close_w, 0, close_w, tabbar_h, theme.status_bg)
-		push_rect(r, 0, tabbar_h-1, width, 1, color_alpha(theme.gutter_fg, 0.6))
-		hovered := mouse_x >= win_close[0] && mouse_x < win_close[2] &&
-			mouse_y >= win_close[1] && mouse_y < win_close[3]
+		push_rect(r, width - close_w, 0, close_w, tabbar_h, theme.status_bg)
+		push_rect(r, 0, tabbar_h - 1, width, 1, color_alpha(theme.gutter_fg, 0.6))
+		hovered :=
+			mouse_x >= win_close[0] &&
+			mouse_x < win_close[2] &&
+			mouse_y >= win_close[1] &&
+			mouse_y < win_close[3]
 		if hovered {
-			push_rect(r, win_close[0], 0, close_w, tabbar_h-1, Color{0.83, 0.18, 0.18, 1.0})
+			push_rect(r, win_close[0], 0, close_w, tabbar_h - 1, Color{0.83, 0.18, 0.18, 1.0})
 		}
 		wsz := line_h * 0.6
-		push_icon(r, width-close_w*0.5-wsz*0.5, (tabbar_h-1-wsz)*0.5, wsz, .X,
-			Color{1, 1, 1, 1} if hovered else theme.status_fg)
+		push_icon(
+			r,
+			width - close_w * 0.5 - wsz * 0.5,
+			(tabbar_h - 1 - wsz) * 0.5,
+			wsz,
+			.X,
+			Color{1, 1, 1, 1} if hovered else theme.status_fg,
+		)
 	}
 }

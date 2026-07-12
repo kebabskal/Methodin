@@ -82,6 +82,7 @@ App :: struct {
 	sidebar_px:         f32,
 	gutter_px:          f32, // left edge of the text area (includes sidebar_px)
 	tabbar_h:           f32, // top edge of the text area
+	text_top:           f32, // first text line's top: tabbar_h plus a half-line breather
 	status_h:           f32,
 
 	now_ms:             u64,
@@ -1183,7 +1184,7 @@ impl App {
 
 	// Convert a pixel position (already in framebuffer scale) to a buffer Pos.
 	pos_at_pixel :: proc(px, py: f32, cell_w, line_h: f32) -> Pos {
-		line := int((py - tabbar_h + scroll_y) / line_h)
+		line := int((py - text_top + scroll_y) / line_h)
 		line = clamp(line, 0, buf.line_count() - 1)
 		vis := self.vis_at_pixel(px, cell_w)
 		return Pos{line, col_from_visual(&buf, line, vis)}
@@ -1371,7 +1372,8 @@ impl App {
 		line_h := r.line_h
 		cell_w := r.cell_w
 		status_h = line_h * 1.8
-		tabbar_h = line_h * 1.4
+		tabbar_h = line_h * 1.8
+		text_top = tabbar_h + line_h*0.5
 		sidebar_px = min(sidebar_cells * cell_w, width * 0.6) if sidebar.visible else 0
 		gutter_digits := count_digits(buf.line_count())
 		// Two extra cells on the left make room for the breakpoint disc and
@@ -1386,24 +1388,26 @@ impl App {
 		}
 		task.h = 0
 		if task.open {
-			task.h = line_h*PANEL_HEAD_SCALE + f32(output_rows)*line_h*PANEL_ROW_SCALE
+			task.h = line_h * PANEL_HEAD_SCALE + f32(output_rows) * line_h * PANEL_ROW_SCALE
 		}
 		view_h = height - status_h - tabbar_h - problems_h - task.h
 
 		self.clamp_scroll(line_h)
 
-		first_line := max(0, int(scroll_y / line_h))
+		// The half-line margin lets a line peek out under the tab bar for
+		// an extra half line of scroll — start one line early.
+		first_line := max(0, int(scroll_y/line_h) - 1)
 		last_line := min(buf.line_count() - 1, int((scroll_y + view_h) / line_h) + 1)
 
 		// Current-line highlight (single cursor, no selection).
 		if len(cursors) == 1 && !cursor_has_selection(cursors[0]) {
-			y := tabbar_h + f32(cursors[0].head.line) * line_h - scroll_y
+			y := text_top + f32(cursors[0].head.line) * line_h - scroll_y
 			push_rect(r, sidebar_px, y, width - sidebar_px, line_h, theme.current_line)
 		}
 
 		// The debugger's stop line.
 		if dap.stop_line >= 0 && dap.stop_path == buf.path {
-			y := tabbar_h + f32(dap.stop_line) * line_h - scroll_y
+			y := text_top + f32(dap.stop_line) * line_h - scroll_y
 			push_rect(
 				r,
 				sidebar_px,
@@ -1428,7 +1432,7 @@ impl App {
 				if line != sel.end.line {
 					x1 += cell_w * 0.5 // show the selected newline
 				}
-				y := tabbar_h + f32(line) * line_h - scroll_y
+				y := text_top + f32(line) * line_h - scroll_y
 				push_rect(r, x0, y, max(x1 - x0, 2), line_h, theme.selection)
 			}
 		}
@@ -1441,7 +1445,7 @@ impl App {
 			cursor_lines[c.head.line] = true
 		}
 		for line in first_line ..= last_line {
-			y := tabbar_h + f32(line) * line_h - scroll_y
+			y := text_top + f32(line) * line_h - scroll_y
 			baseline := y + r.ascent + (line_h - r.line_h) * 0.5
 
 			// Breakpoint disc and the debugger's stop marker, in the marker
@@ -1508,7 +1512,7 @@ impl App {
 					continue
 				}
 				x := gutter_px + f32(visual_col(&buf, c.head.line, c.head.col)) * cell_w - scroll_x
-				y := tabbar_h + f32(c.head.line) * line_h - scroll_y
+				y := text_top + f32(c.head.line) * line_h - scroll_y
 				if x >= gutter_px - 1 {
 					push_rect(r, x - 1, y + 1, 2, line_h - 2, theme.cursor)
 				}

@@ -267,7 +267,7 @@ impl App {
 				return
 			}
 			x := app.gutter_px + f32(visual_col(&app.buf, q.line, q.col))*cell_w - app.scroll_x
-			y := app.tabbar_h + f32(q.line)*line_h - app.scroll_y
+			y := app.text_top + f32(q.line)*line_h - app.scroll_y
 			if x >= app.gutter_px-0.5 {
 				push_rect(r, x, y, cell_w, line_h, color)
 			}

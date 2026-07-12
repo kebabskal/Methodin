@@ -428,10 +428,10 @@ impl App {
 		h := f32(vis)*line_h + pad*0.5
 
 		ax := gutter_px + f32(visual_col(&buf, c.anchor.line, c.anchor.col))*cell_w - scroll_x
-		ay := tabbar_h + f32(c.anchor.line+1)*line_h - scroll_y + 1
+		ay := text_top + f32(c.anchor.line+1)*line_h - scroll_y + 1
 		ax = clamp(ax, sidebar_px, max(sidebar_px, width-w))
 		if ay+h > height-status_h {
-			ay = tabbar_h + f32(c.anchor.line)*line_h - scroll_y - h - 1
+			ay = text_top + f32(c.anchor.line)*line_h - scroll_y - h - 1
 		}
 		ay = max(ay, 0)
 
@@ -602,10 +602,10 @@ impl App {
 
 		p := self.primary_cursor().head
 		ax := gutter_px + f32(visual_col(&buf, p.line, p.col))*cell_w - scroll_x - pad
-		ay := tabbar_h + f32(p.line)*line_h - scroll_y - h - 2
+		ay := text_top + f32(p.line)*line_h - scroll_y - h - 2
 		ax = clamp(ax, sidebar_px, max(sidebar_px, width-w))
 		if ay < tabbar_h {
-			ay = tabbar_h + f32(p.line+1)*line_h - scroll_y + 2
+			ay = text_top + f32(p.line+1)*line_h - scroll_y + 2
 		}
 
 		push_rect(r, ax-1, ay-1, w+2, h+2, color_alpha(theme.gutter_fg, 0.8))
