@@ -310,23 +310,18 @@ impl App {
 		}
 	}
 
-	// Which window-control button (if any) is under a pixel: 0 close,
-	// 1 minimize, 2 fullscreen, -1 none. Hit area is generous.
+	// The window close button (the top-right ×): 0 when hit, -1 otherwise.
+	// (Minimize/maximize stay on the system shortcuts and window edges.)
 	traffic_hit :: proc(px, py: f32) -> int {
-		for t, i in traffic {
-			dx := px - t[0]
-			dy := py - t[1]
-			reach := t[2] * 1.7
-			if dx*dx+dy*dy <= reach*reach {
-				return i
-			}
+		if px >= win_close[0] && px < win_close[2] && py >= win_close[1] && py < win_close[3] {
+			return 0
 		}
 		return -1
 	}
 
-	// The tab bar doubles as the window title bar: window controls at the
-	// left, then the tab strip; empty space drags the window (hit test in
-	// main.odin).
+	// The tab bar doubles as the window title bar: the tab strip, then a
+	// lone × in the top-right corner; empty space drags the window (hit
+	// test in main.odin).
 	tabbar_draw :: proc(r: ^Renderer, width: f32) {
 		line_h := r.line_h
 		cell_w := r.cell_w
@@ -334,26 +329,22 @@ impl App {
 		push_rect(r, 0, 0, width, tabbar_h, theme.status_bg)
 		push_rect(r, 0, tabbar_h-1, width, 1, color_alpha(theme.gutter_fg, 0.6))
 
-		// Window controls (macOS traffic-light style).
-		btn_r := line_h * 0.28
-		step := btn_r*2 + cell_w
-		bx := cell_w*2.2 + btn_r
-		for i in 0 ..< 3 {
-			traffic[i] = {bx + f32(i)*step, tabbar_h * 0.5, btn_r}
-		}
-		traffic_end = bx + 2*step + btn_r + cell_w*2.2
+		close_w := tabbar_h * 1.4
+		win_close = {width - close_w, 0, width, tabbar_h - 1}
+		tabs_x0 = cell_w * 0.8
 
 		resize(&tab_rects, len(docs))
 
 		// Pass 1: widths (stored as {offset, width}, fixed up in pass 2).
+		max_name := f32(TAB_MAX_NAME_CELLS) * cell_w
 		total: f32 = 0
 		for i in 0 ..< len(docs) {
-			cells := min(strings.rune_count(self.tab_label(i)), TAB_MAX_NAME_CELLS)
-			w := (f32(cells) + 7.0) * cell_w
+			name_w := min(utext_width(r, self.tab_label(i)), max_name)
+			w := name_w + cell_w*7.0
 			tab_rects[i] = {total, w}
 			total += w
 		}
-		avail := width - traffic_end
+		avail := width - tabs_x0 - close_w
 		if tab_follow {
 			tab_follow = false
 			x0 := tab_rects[active][0]
@@ -370,10 +361,10 @@ impl App {
 		baseline := (tabbar_h-line_h)*0.5 + r.ascent
 		isz := line_h * 0.62
 		for i in 0 ..< len(docs) {
-			x := traffic_end + tab_rects[i][0] - tab_scroll
+			x := tabs_x0 + tab_rects[i][0] - tab_scroll
 			w := tab_rects[i][1]
 			tab_rects[i] = {x, x + w}
-			if x+w <= traffic_end || x >= width {
+			if x+w <= tabs_x0 || x >= width-close_w {
 				continue
 			}
 			if i == active {
@@ -387,16 +378,7 @@ impl App {
 			color := theme.fg if i == active else theme.status_dim
 			push_icon_file(r, x+cell_w*1.5, (tabbar_h-isz)*0.5, isz, color_alpha(color, 0.75))
 			gx := x + cell_w*1.5 + isz + cell_w*0.8
-			n := 0
-			for ch in name {
-				if n >= TAB_MAX_NAME_CELLS-1 && strings.rune_count(name) > TAB_MAX_NAME_CELLS {
-					push_glyph(r, gx, baseline, '…', theme.status_dim)
-					break
-				}
-				push_glyph(r, gx, baseline, ch, color)
-				gx += cell_w
-				n += 1
-			}
+			_ = utext_clip(r, gx, baseline, gx+max_name+cell_w, name, color)
 
 			// Close box: a dirty dot that becomes × once the file is clean.
 			cx := x + w - cell_w*2.4
@@ -407,16 +389,17 @@ impl App {
 			}
 		}
 
-		// Cover tabs scrolled under the controls zone, then draw the buttons.
-		push_rect(r, 0, 0, traffic_end, tabbar_h, theme.status_bg)
-		push_rect(r, 0, tabbar_h-1, traffic_end, 1, color_alpha(theme.gutter_fg, 0.6))
-		traffic_colors := [3]Color{
-			{1.00, 0.37, 0.34, 1.0}, // close
-			{0.99, 0.74, 0.18, 1.0}, // minimize
-			{0.20, 0.78, 0.28, 1.0}, // fullscreen
+		// Cover tabs scrolled past either edge, then the window ×, hovered
+		// like a native titlebar button.
+		push_rect(r, 0, 0, tabs_x0, tabbar_h, theme.status_bg)
+		push_rect(r, width-close_w, 0, close_w, tabbar_h, theme.status_bg)
+		push_rect(r, 0, tabbar_h-1, width, 1, color_alpha(theme.gutter_fg, 0.6))
+		hovered := mouse_x >= win_close[0] && mouse_x < win_close[2] &&
+			mouse_y >= win_close[1] && mouse_y < win_close[3]
+		if hovered {
+			push_rect(r, win_close[0], 0, close_w, tabbar_h-1, Color{0.83, 0.18, 0.18, 1.0})
 		}
-		for t, i in traffic {
-			push_disc(r, t[0], t[1], t[2], traffic_colors[i])
-		}
+		push_glyph(r, width-close_w*0.5-cell_w*0.5, baseline, '×',
+			Color{1, 1, 1, 1} if hovered else theme.status_fg)
 	}
 }

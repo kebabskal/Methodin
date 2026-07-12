@@ -65,8 +65,9 @@ Dap :: struct {
 	// stack (click a frame to jump + re-scope) and the locals of sel_frame.
 	frames:    [dynamic]Dap_Frame,
 	locals:    [dynamic]Dap_Var,
-	sel_frame: int,
-	child_req: map[int]int, // Local_Children request seq → locals index
+	sel_frame:   int,
+	child_req:   map[int]int, // Local_Children request seq → locals index
+	globals_req: int,         // seq of the Globals scope's variables request
 }
 
 Dap_Frame :: struct {
@@ -498,6 +499,9 @@ impl App {
 			return
 		}
 		v := &d.locals[i]
+		if v.value == "" {
+			return // the globals divider row
+		}
 		if v.decl_ref > 0 {
 			_ = dap_request(d, .Locations, "locations", fmt.tprintf(`{{"locationReference":%d}}`, v.decl_ref))
 			return
@@ -719,18 +723,50 @@ dap_on_response :: proc(app: ^App, kind: Dap_Req, body: json.Value, seq: int) {
 		// Locals of that frame follow.
 		_ = dap_request(d, .Scopes, "scopes", fmt.tprintf(`{{"frameId":%d}}`, d.frame_id))
 	case .Scopes:
-		scopes := jarr(jget(body, "scopes"))
-		if len(scopes) > 0 {
-			_ = dap_request(d, .Variables, "variables", fmt.tprintf(
-				`{{"variablesReference":%d}}`, jint(jget(scopes[0], "variablesReference"))))
+		// Locals first, then a Globals/Statics scope when the adapter has
+		// one — separated in the panel by a divider row (value == "").
+		d.globals_req = 0
+		for s, i in jarr(jget(body, "scopes")) {
+			name := jstr(jget(s, "name"))
+			ref := jint(jget(s, "variablesReference"))
+			if ref <= 0 || name == "Registers" {
+				continue
+			}
+			if i == 0 || name == "Locals" {
+				_ = dap_request(d, .Variables, "variables", fmt.tprintf(`{{"variablesReference":%d}}`, ref))
+			} else if name == "Globals" || name == "Statics" {
+				d.globals_req = dap_request(d, .Variables, "variables", fmt.tprintf(`{{"variablesReference":%d}}`, ref))
+			}
 		}
 	case .Variables:
 		// The locals column of the panel. Aggregates ([3]f32, structs, …)
 		// report their value in children — fetch one level and show it
 		// inline, so locals read like hovers do.
+		// Globals are noisy (runtime and library statics): keep only the
+		// stopped frame's package (name prefix up to "::") plus unqualified
+		// names, and drop compiler-internal "__" symbols.
+		is_globals := seq == d.globals_req
+		pkg := ""
+		if is_globals && d.sel_frame < len(d.frames) {
+			if c := strings.index(d.frames[d.sel_frame].name, "::"); c > 0 {
+				pkg = d.frames[d.sel_frame].name[:c+2]
+			}
+		}
+		sep_done := false
 		for v, i in jarr(jget(body, "variables")) {
-			if i >= 128 {
+			if i >= 256 {
 				break
+			}
+			if is_globals {
+				name := jstr(jget(v, "name"))
+				if strings.has_prefix(name, "__") ||
+				   (strings.contains(name, "::") && (pkg == "" || !strings.has_prefix(name, pkg))) {
+					continue
+				}
+				if !sep_done {
+					append(&d.locals, Dap_Var{name = strings.clone("— globals —"), value = strings.clone("")})
+					sep_done = true
+				}
 			}
 			append(&d.locals, Dap_Var{
 				name     = strings.clone(jstr(jget(v, "name"))),

@@ -22,109 +22,122 @@ tab_w: int = 2
 App :: struct {
 	// The active document's state; stashed into docs[active] on tab switch
 	// (see tabs.odin).
-	buf:     Buffer,
-	hl:      Highlight,
-	cursors: [dynamic]Cursor,
-	primary: int, // index of the most recently active cursor
+	buf:                Buffer,
+	hl:                 Highlight,
+	cursors:            [dynamic]Cursor,
+	primary:            int, // index of the most recently active cursor
 
 	scroll_x, scroll_y: f32, // pixels
 
 	// Selection history for ctrl+u (cursor undo).
-	cursor_undo: [dynamic][]Cursor,
 
-	preview: bool, // this document is the transient palette-preview tab
+	cursor_undo:        [dynamic][]Cursor,
 
-	docs:   [dynamic]Doc, // every open document; docs[active] is stale (see tabs.odin)
-	active: int,
+	preview:            bool, // this document is the transient palette-preview tab
 
-	pending_close: int,  // tab awaiting a discard-changes confirmation; -1 = none
-	pending_quit:  bool, // window close was refused once over unsaved changes
+	docs:               [dynamic]Doc, // every open document; docs[active] is stale (see tabs.odin)
+	active:             int,
 
-	tab_scroll: f32,             // tab bar horizontal scroll (pixels)
-	tab_follow: bool,            // scroll the active tab into view on the next draw
-	tab_rects:  [dynamic][2]f32, // per-tab [x0, x1] from the last draw (hit testing)
+	pending_close:      int, // tab awaiting a discard-changes confirmation; -1 = none
+	pending_quit:       bool, // window close was refused once over unsaved changes
+
+	tab_scroll:         f32, // tab bar horizontal scroll (pixels)
+	tab_follow:         bool, // scroll the active tab into view on the next draw
+	tab_rects:          [dynamic][2]f32, // per-tab [x0, x1] from the last draw (hit testing)
 
 	// Window control buttons in the custom title bar: {cx, cy, radius} each,
 	// and where the tab strip starts (from the last draw).
-	traffic:     [3][3]f32,
-	traffic_end: f32,
 
-	theme: Theme,
+	win_close:          [4]f32, // the top-right window × (x0, y0, x1, y1)
+	tabs_x0:            f32, // where the tab strip starts
 
-	sidebar:    Sidebar,
-	palette:    Palette,
-	lsp:        Lsp,
-	completion: Completion,
-	sighelp:    Sig_Help,
-	retitle: bool, // buffer path changed; main should refresh the window title
-	want_follow: bool, // something moved the cursor; main should scroll to it
-	want_center: bool, // ...and it was a jump: land it mid-view, not at an edge
-	zoom_req: Zoom_Req, // font-size change for main to apply (owns the renderer)
+	resizing:           int, // 0 none, 1 sidebar border drag, 2 panel top-edge drag
+	edge_hover:         int, // same values; the edge currently under the mouse
+
+	theme:              Theme,
+
+	sidebar:            Sidebar,
+	palette:            Palette,
+	lsp:                Lsp,
+	completion:         Completion,
+	sighelp:            Sig_Help,
+	retitle:            bool, // buffer path changed; main should refresh the window title
+	want_follow:        bool, // something moved the cursor; main should scroll to it
+	want_center:        bool, // ...and it was a jump: land it mid-view, not at an edge
+	zoom_req:           Zoom_Req, // font-size change for main to apply (owns the renderer)
 
 	// Hover tooltip (LSP), driven by mouse dwell.
-	hover_state:    Hover_State,
-	hover_pos:      Pos,
-	hover_text:     string, // owned
-	hover_req_id:   int,
-	hover_armed:    bool, // mouse has moved since the last request/hide
-	mouse_x, mouse_y: f32, // last mouse position (framebuffer pixels)
-	mouse_moved_ms: u64,
+
+	hover_state:        Hover_State,
+	hover_pos:          Pos,
+	hover_text:         string, // owned
+	hover_req_id:       int,
+	hover_armed:        bool, // mouse has moved since the last request/hide
+	mouse_x, mouse_y:   f32, // last mouse position (framebuffer pixels)
+	mouse_moved_ms:     u64,
 
 	// View geometry, updated every draw (pixels).
-	view_w, view_h: f32, // text viewport (excludes sidebar, gutter, tab bar and status bar)
-	sidebar_px:     f32,
-	gutter_px:      f32, // left edge of the text area (includes sidebar_px)
-	tabbar_h:       f32, // top edge of the text area
-	status_h:       f32,
 
-	now_ms:      u64,
-	blink_start: u64,
-	focused:     bool, // window has keyboard focus (main tracks SDL focus events)
+	view_w, view_h:     f32, // text viewport (excludes sidebar, gutter, tab bar and status bar)
+	sidebar_px:         f32,
+	gutter_px:          f32, // left edge of the text area (includes sidebar_px)
+	tabbar_h:           f32, // top edge of the text area
+	status_h:           f32,
 
-	recent_dirs: [dynamic]string, // owned; most recent workspace first
+	now_ms:             u64,
+	blink_start:        u64,
+	focused:            bool, // window has keyboard focus (main tracks SDL focus events)
 
-	odin_root_dir:  string, // owned; resolved lazily for import completion
-	odin_root_done: bool,
+	recent_dirs:        [dynamic]string, // owned; most recent workspace first
+
+	odin_root_dir:      string, // owned; resolved lazily for import completion
+	odin_root_done:     bool,
 
 	// Diagnostics (problems.odin): store + collapsible panel state.
 	// Project tasks (ctrl+r) and their output panel (tasks.odin).
-	task: Task_State,
+
+	task:               Task_State,
 
 	// Debugging (dap.odin): the adapter session and the breakpoints, which
 	// outlive sessions (set them first, debug later).
-	dap:         Dap,
-	breakpoints: [dynamic]Breakpoint,
 
-	problems:        [dynamic]Diagnostic,
-	problems_open:   bool,
-	problems_scroll: f32, // first visible row (fractional while wheeling)
-	problems_h:      f32, // panel height from the last draw (0: closed)
-	problems_top:    f32, // panel top edge (hit testing)
-	p_rows_y:        f32, // first row's top edge
-	p_row_h:         f32,
-	p_row0:          int, // first visible row index
+	dap:                Dap,
+	breakpoints:        [dynamic]Breakpoint,
+
+	problems:           [dynamic]Diagnostic,
+	problems_open:      bool,
+	problems_scroll:    f32, // first visible row (fractional while wheeling)
+	problems_h:         f32, // panel height from the last draw (0: closed)
+	problems_top:       f32, // panel top edge (hit testing)
+	p_rows_y:           f32, // first row's top edge
+	p_row_h:            f32,
+	p_row0:             int, // first visible row index
 
 	// Format-on-save (toggle: "File: Toggle Format on Save").
-	format_on_save: bool,
+
+	format_on_save:     bool,
 	// Show struct fields in the document outline ("Settings: Toggle Outline Fields").
-	outline_fields: bool,
-	fmt_req:        int,    // pending format request id (0: none)
-	fmt_path:       string, // owned; document the pending format belongs to
-	fmt_deadline:   u64,    // save unformatted when the reply misses this
+
+	outline_fields:     bool,
+	fmt_req:            int, // pending format request id (0: none)
+	fmt_path:           string, // owned; document the pending format belongs to
+	fmt_deadline:       u64, // save unformatted when the reply misses this
 
 	// Mouse drag state.
-	selecting:   bool,
-	select_word: bool,
-	select_origin: Range, // word the drag started on (word mode)
+
+	selecting:          bool,
+	select_word:        bool,
+	select_origin:      Range, // word the drag started on (word mode)
 
 	// Column (alt+drag) selection state.
-	col_select:      bool,
-	col_origin_line: int,
-	col_origin_vis:  int,
-	col_base:        [dynamic]Cursor, // cursors present when the gesture started
 
-	status_msg:      string,
-	status_msg_time: u64,
+	col_select:         bool,
+	col_origin_line:    int,
+	col_origin_vis:     int,
+	col_base:           [dynamic]Cursor, // cursors present when the gesture started
+
+	status_msg:         string,
+	status_msg_time:    u64,
 }
 
 Zoom_Req :: enum {
@@ -213,7 +226,7 @@ impl App {
 		if !focused || !has_input {
 			return true
 		}
-		return (now_ms-blink_start)/530%2 == 0
+		return (now_ms - blink_start) / 530 % 2 == 0
 	}
 
 	set_status :: proc(msg: string) {
@@ -252,7 +265,7 @@ visual_col :: proc(b: ^Buffer, line: int, col: int) -> int {
 	vis := 0
 	for i := 0; i < min(col, len(s)); {
 		if s[i] == '\t' {
-			vis = (vis/tab_w + 1) * tab_w
+			vis = (vis / tab_w + 1) * tab_w
 			i += 1
 		} else {
 			_, n := utf8.decode_rune(s[i:])
@@ -270,7 +283,7 @@ col_from_visual :: proc(b: ^Buffer, line: int, target_vis: int) -> int {
 	i := 0
 	for i < len(s) && vis < target_vis {
 		if s[i] == '\t' {
-			vis = (vis/tab_w + 1) * tab_w
+			vis = (vis / tab_w + 1) * tab_w
 			i += 1
 		} else {
 			_, n := utf8.decode_rune(s[i:])
@@ -354,7 +367,7 @@ impl App {
 				c.goal_col = visual_col(b, c.head.line, c.head.col)
 			}
 			target := c.head.line - lines_per_page if up else c.head.line + lines_per_page
-			target = clamp(target, 0, b.line_count()-1)
+			target = clamp(target, 0, b.line_count() - 1)
 			c.head = b.clamp_pos(Pos{target, col_from_visual(b, target, c.goal_col)})
 			if !extend {
 				c.anchor = c.head
@@ -390,7 +403,14 @@ impl App {
 		snap := pop(&cursor_undo)
 		clear(&cursors)
 		for c in snap {
-			append(&cursors, Cursor{head = buf.clamp_pos(c.head), anchor = buf.clamp_pos(c.anchor), goal_col = -1})
+			append(
+				&cursors,
+				Cursor {
+					head     = buf.clamp_pos(c.head),
+					anchor   = buf.clamp_pos(c.anchor),
+					goal_col = -1,
+				},
+			)
 		}
 		delete(snap)
 		primary = len(cursors) - 1
@@ -535,7 +555,10 @@ impl App {
 	insert_text :: proc(text: string) {
 		edits := make([]Edit, len(cursors), context.temp_allocator)
 		for c, i in cursors {
-			edits[i] = Edit{range = cursor_range(c), text = text}
+			edits[i] = Edit {
+				range = cursor_range(c),
+				text  = text,
+			}
 		}
 		self.apply_and_place(edits, false)
 	}
@@ -551,15 +574,17 @@ impl App {
 			r := cursor_range(c)
 			s := buf.line_str(r.start.line)
 			ws_end := 0
-			for ws_end < len(s) && ws_end < r.start.col && (s[ws_end] == ' ' || s[ws_end] == '\t') {
+			for ws_end < len(s) &&
+			    ws_end < r.start.col &&
+			    (s[ws_end] == ' ' || s[ws_end] == '\t') {
 				ws_end += 1
 			}
 			ws := s[:ws_end]
 			opener := byte(0)
 			if r.start.col > 0 && r.start.col <= len(s) {
-				switch s[r.start.col-1] {
+				switch s[r.start.col - 1] {
 				case '{', '(', '[':
-					opener = s[r.start.col-1]
+					opener = s[r.start.col - 1]
 				}
 			}
 			text: string
@@ -572,7 +597,10 @@ impl App {
 			} else {
 				text = strings.concatenate({"\n", ws}, context.temp_allocator)
 			}
-			edits[i] = Edit{range = r, text = text}
+			edits[i] = Edit {
+				range = r,
+				text  = text,
+			}
 		}
 		new_ranges := buf.commit(edits, cursors[:])
 		clear(&cursors)
@@ -596,15 +624,18 @@ impl App {
 			if range_empty(r) {
 				r.start = b.prev_pos(r.start)
 				// A caret between an empty pair removes both halves.
-				if r.start.line == r.end.line && r.end.col-r.start.col == 1 {
+				if r.start.line == r.end.line && r.end.col - r.start.col == 1 {
 					s := b.line_str(r.end.line)
-					if close := close_for(s[r.start.col]); close != 0 &&
-					   r.end.col < len(s) && s[r.end.col] == close {
+					if close := close_for(s[r.start.col]);
+					   close != 0 && r.end.col < len(s) && s[r.end.col] == close {
 						r.end.col += 1
 					}
 				}
 			}
-			edits[i] = Edit{range = r, text = ""}
+			edits[i] = Edit {
+				range = r,
+				text  = "",
+			}
 		}
 		self.apply_and_place(edits, false)
 	}
@@ -617,7 +648,10 @@ impl App {
 			if range_empty(r) {
 				r.end = b.next_pos(r.end)
 			}
-			edits[i] = Edit{range = r, text = ""}
+			edits[i] = Edit {
+				range = r,
+				text  = "",
+			}
 		}
 		self.apply_and_place(edits, false)
 	}
@@ -639,7 +673,7 @@ impl App {
 		seen_last := -1
 		for c in cursors {
 			r := cursor_range(c)
-			for line in max(r.start.line, seen_last+1) ..= r.end.line {
+			for line in max(r.start.line, seen_last + 1) ..= r.end.line {
 				if buf.line_len(line) > 0 {
 					append(&edits, Edit{range = {{line, 0}, {line, 0}}, text = "\t"})
 				}
@@ -654,7 +688,7 @@ impl App {
 		seen_last := -1
 		for c in cursors {
 			r := cursor_range(c)
-			for line in max(r.start.line, seen_last+1) ..= r.end.line {
+			for line in max(r.start.line, seen_last + 1) ..= r.end.line {
 				s := buf.line_str(line)
 				n := 0
 				if len(s) > 0 && s[0] == '\t' {
@@ -721,7 +755,14 @@ impl App {
 		if len(restored) > 0 {
 			clear(&cursors)
 			for c in restored {
-				append(&cursors, Cursor{head = buf.clamp_pos(c.head), anchor = buf.clamp_pos(c.anchor), goal_col = -1})
+				append(
+					&cursors,
+					Cursor {
+						head     = buf.clamp_pos(c.head),
+						anchor   = buf.clamp_pos(c.anchor),
+						goal_col = -1,
+					},
+				)
 			}
 			primary = len(cursors) - 1
 		} else {
@@ -743,7 +784,14 @@ impl App {
 		if len(restored) > 0 {
 			clear(&cursors)
 			for c in restored {
-				append(&cursors, Cursor{head = buf.clamp_pos(c.head), anchor = buf.clamp_pos(c.anchor), goal_col = -1})
+				append(
+					&cursors,
+					Cursor {
+						head     = buf.clamp_pos(c.head),
+						anchor   = buf.clamp_pos(c.anchor),
+						goal_col = -1,
+					},
+				)
 			}
 			primary = len(cursors) - 1
 		} else {
@@ -816,7 +864,10 @@ impl App {
 					r.end = buf.end_pos()
 				}
 			}
-			edits[i] = Edit{range = r, text = ""}
+			edits[i] = Edit {
+				range = r,
+				text  = "",
+			}
 		}
 		self.apply_and_place(edits, false)
 		return text
@@ -831,7 +882,10 @@ impl App {
 		if len(lines) == len(cursors) && len(cursors) > 1 {
 			edits := make([]Edit, len(cursors), context.temp_allocator)
 			for c, i in cursors {
-				edits[i] = Edit{range = cursor_range(c), text = lines[i]}
+				edits[i] = Edit {
+					range = cursor_range(c),
+					text  = lines[i],
+				}
 			}
 			self.apply_and_place(edits, false)
 			return
@@ -842,7 +896,7 @@ impl App {
 
 // Per-language line comment prefix ("" = no line comments; toggle is a no-op).
 @(private = "file")
-COMMENT_PREFIX := [Lang]string{
+COMMENT_PREFIX := [Lang]string {
 	.Plain      = "",
 	.Odin       = "//",
 	.JSON       = "//", // jsonc
@@ -887,8 +941,8 @@ impl App {
 			if hi > lo && r.end.col == 0 {
 				hi -= 1
 			}
-			if len(spans) > 0 && lo <= spans[len(spans)-1][1]+1 {
-				spans[len(spans)-1][1] = max(spans[len(spans)-1][1], hi)
+			if len(spans) > 0 && lo <= spans[len(spans) - 1][1] + 1 {
+				spans[len(spans) - 1][1] = max(spans[len(spans) - 1][1], hi)
 			} else {
 				append(&spans, [2]int{lo, hi})
 			}
@@ -901,7 +955,7 @@ impl App {
 			if !down && lo == 0 {
 				continue
 			}
-			if down && hi >= b.line_count()-1 {
+			if down && hi >= b.line_count() - 1 {
 				continue
 			}
 			sb := strings.builder_make(context.temp_allocator)
@@ -911,14 +965,26 @@ impl App {
 					strings.write_byte(&sb, '\n')
 					strings.write_string(&sb, b.line_str(line))
 				}
-				append(&edits, Edit{range = {{lo, 0}, {hi + 1, b.line_len(hi + 1)}}, text = strings.to_string(sb)})
+				append(
+					&edits,
+					Edit {
+						range = {{lo, 0}, {hi + 1, b.line_len(hi + 1)}},
+						text  = strings.to_string(sb),
+					},
+				)
 			} else {
 				for line in lo ..= hi {
 					strings.write_string(&sb, b.line_str(line))
 					strings.write_byte(&sb, '\n')
 				}
 				strings.write_string(&sb, b.line_str(lo - 1))
-				append(&edits, Edit{range = {{lo - 1, 0}, {hi, b.line_len(hi)}}, text = strings.to_string(sb)})
+				append(
+					&edits,
+					Edit {
+						range = {{lo - 1, 0}, {hi, b.line_len(hi)}},
+						text  = strings.to_string(sb),
+					},
+				)
 			}
 			append(&moved, span)
 		}
@@ -972,7 +1038,7 @@ impl App {
 		seen_last := -1
 		for c in cursors {
 			r := cursor_range(c)
-			for line in max(r.start.line, seen_last+1) ..= r.end.line {
+			for line in max(r.start.line, seen_last + 1) ..= r.end.line {
 				s := b.line_str(line)
 				ws := leading_ws(s)
 				if ws == len(s) {
@@ -994,7 +1060,7 @@ impl App {
 		seen_last = -1
 		for c in cursors {
 			r := cursor_range(c)
-			for line in max(r.start.line, seen_last+1) ..= r.end.line {
+			for line in max(r.start.line, seen_last + 1) ..= r.end.line {
 				s := b.line_str(line)
 				ws := leading_ws(s)
 				if ws == len(s) {
@@ -1002,7 +1068,7 @@ impl App {
 				}
 				if all_commented {
 					n := len(prefix)
-					if ws+n < len(s) && s[ws+n] == ' ' {
+					if ws + n < len(s) && s[ws + n] == ' ' {
 						n += 1
 					}
 					append(&edits, Edit{range = {{line, ws}, {line, ws + n}}, text = ""})
@@ -1083,7 +1149,8 @@ impl App {
 				continue
 			}
 			text := buf.range_text(r, context.temp_allocator)
-			out := strings.to_upper(text, context.temp_allocator) if upper else strings.to_lower(text, context.temp_allocator)
+			out :=
+				strings.to_upper(text, context.temp_allocator) if upper else strings.to_lower(text, context.temp_allocator)
 			append(&edits, Edit{range = r, text = out})
 		}
 		self.apply_keep_selections(edits[:])
@@ -1116,7 +1183,7 @@ impl App {
 	// Convert a pixel position (already in framebuffer scale) to a buffer Pos.
 	pos_at_pixel :: proc(px, py: f32, cell_w, line_h: f32) -> Pos {
 		line := int((py - tabbar_h + scroll_y) / line_h)
-		line = clamp(line, 0, buf.line_count()-1)
+		line = clamp(line, 0, buf.line_count() - 1)
 		vis := self.vis_at_pixel(px, cell_w)
 		return Pos{line, col_from_visual(&buf, line, vis)}
 	}
@@ -1237,9 +1304,9 @@ draw_vscrollbar :: proc(r: ^Renderer, right, top, view_h, content_h, scroll: f32
 	if view_h <= 0 || content_h <= view_h {
 		return
 	}
-	th := max(view_h*view_h/content_h, 24)
-	ty := top + (view_h-th)*clamp(scroll/(content_h-view_h), 0, 1)
-	push_rect(r, right-5, ty, 3, th, color_alpha(t.gutter_fg, 0.4))
+	th := max(view_h * view_h / content_h, 24)
+	ty := top + (view_h - th) * clamp(scroll / (content_h - view_h), 0, 1)
+	push_rect(r, right - 5, ty, 3, th, color_alpha(t.gutter_fg, 0.4))
 }
 
 @(private = "file")
@@ -1263,33 +1330,37 @@ impl App {
 			// the bottom of the screen or behind the palette. (The generous
 			// margin also absorbs the stored layout lagging a frame when the
 			// item list grows.)
-			occ_top := clamp(palette.ly+palette.lh-tabbar_h+line_h*3, 0, max(view_h-line_h*3, 0))
+			occ_top := clamp(
+				palette.ly + palette.lh - tabbar_h + line_h * 3,
+				0,
+				max(view_h - line_h * 3, 0),
+			)
 			scroll_y = y - occ_top
-		} else if center && (y < scroll_y || y+line_h > scroll_y+view_h) {
+		} else if center && (y < scroll_y || y + line_h > scroll_y + view_h) {
 			// A jump landing off-screen sits ~40% down the view: low enough
 			// to keep context above the symbol, high enough to show what
 			// follows it — never pinned to the bottom edge.
-			scroll_y = max(0, y-view_h*0.4)
+			scroll_y = max(0, y - view_h * 0.4)
 		} else {
 			if y < scroll_y {
 				scroll_y = y
 			}
-			if y+line_h > scroll_y+view_h {
+			if y + line_h > scroll_y + view_h {
 				scroll_y = y + line_h - view_h
 			}
 		}
 		x := f32(visual_col(&buf, p.line, p.col)) * cell_w
 		if x < scroll_x {
-			scroll_x = max(0, x-cell_w*4)
+			scroll_x = max(0, x - cell_w * 4)
 		}
-		if x+cell_w > scroll_x+view_w {
-			scroll_x = x + cell_w*4 - view_w
+		if x + cell_w > scroll_x + view_w {
+			scroll_x = x + cell_w * 4 - view_w
 		}
 	}
 
 	clamp_scroll :: proc(line_h: f32) {
-		content_h := f32(buf.line_count()+OVERSCROLL_LINES) * line_h
-		scroll_y = clamp(scroll_y, 0, max(0, content_h-view_h))
+		content_h := f32(buf.line_count() + OVERSCROLL_LINES) * line_h
+		scroll_y = clamp(scroll_y, 0, max(0, content_h - view_h))
 		scroll_x = max(scroll_x, 0)
 	}
 
@@ -1299,39 +1370,47 @@ impl App {
 		line_h := r.line_h
 		cell_w := r.cell_w
 		status_h = line_h * 1.8
-		tabbar_h = line_h * 2.1
-		sidebar_px = min(SIDEBAR_CELLS*cell_w, width*0.35) if sidebar.visible else 0
+		tabbar_h = line_h * 1.4
+		sidebar_px = min(sidebar_cells * cell_w, width * 0.6) if sidebar.visible else 0
 		gutter_digits := count_digits(buf.line_count())
 		// Two extra cells on the left make room for the breakpoint disc and
 		// the debugger's stop marker next to the line numbers.
-		gutter_cells := f32(gutter_digits + 4)
-		gutter_px = sidebar_px + gutter_cells*cell_w
+		gutter_cells := f32(gutter_digits + 5)
+		gutter_px = sidebar_px + gutter_cells * cell_w
 		view_w = width - gutter_px
 		problems_h = 0
 		if problems_open {
-			problems_h = line_h*1.4 + f32(clamp(len(problems), 1, PROBLEMS_VISIBLE))*line_h*1.25
+			problems_h =
+				line_h * 1.4 + f32(clamp(len(problems), 1, PROBLEMS_VISIBLE)) * line_h * 1.25
 		}
 		task.h = 0
 		if task.open {
-			task.h = line_h*1.4 + OUTPUT_VISIBLE*line_h*1.1
+			task.h = line_h*PANEL_HEAD_SCALE + f32(output_rows)*line_h*PANEL_ROW_SCALE
 		}
 		view_h = height - status_h - tabbar_h - problems_h - task.h
 
 		self.clamp_scroll(line_h)
 
-		first_line := max(0, int(scroll_y/line_h))
-		last_line := min(buf.line_count()-1, int((scroll_y+view_h)/line_h)+1)
+		first_line := max(0, int(scroll_y / line_h))
+		last_line := min(buf.line_count() - 1, int((scroll_y + view_h) / line_h) + 1)
 
 		// Current-line highlight (single cursor, no selection).
 		if len(cursors) == 1 && !cursor_has_selection(cursors[0]) {
-			y := tabbar_h + f32(cursors[0].head.line)*line_h - scroll_y
-			push_rect(r, sidebar_px, y, width-sidebar_px, line_h, theme.current_line)
+			y := tabbar_h + f32(cursors[0].head.line) * line_h - scroll_y
+			push_rect(r, sidebar_px, y, width - sidebar_px, line_h, theme.current_line)
 		}
 
 		// The debugger's stop line.
 		if dap.stop_line >= 0 && dap.stop_path == buf.path {
-			y := tabbar_h + f32(dap.stop_line)*line_h - scroll_y
-			push_rect(r, sidebar_px, y, width-sidebar_px, line_h, color_alpha(theme.diag_warn, 0.16))
+			y := tabbar_h + f32(dap.stop_line) * line_h - scroll_y
+			push_rect(
+				r,
+				sidebar_px,
+				y,
+				width - sidebar_px,
+				line_h,
+				color_alpha(theme.diag_warn, 0.16),
+			)
 		}
 
 		// Selections.
@@ -1343,13 +1422,13 @@ impl App {
 			for line in max(sel.start.line, first_line) ..= min(sel.end.line, last_line) {
 				s_col := sel.start.col if line == sel.start.line else 0
 				e_col := sel.end.col if line == sel.end.line else buf.line_len(line)
-				x0 := gutter_px + f32(visual_col(&buf, line, s_col))*cell_w - scroll_x
-				x1 := gutter_px + f32(visual_col(&buf, line, e_col))*cell_w - scroll_x
+				x0 := gutter_px + f32(visual_col(&buf, line, s_col)) * cell_w - scroll_x
+				x1 := gutter_px + f32(visual_col(&buf, line, e_col)) * cell_w - scroll_x
 				if line != sel.end.line {
 					x1 += cell_w * 0.5 // show the selected newline
 				}
-				y := tabbar_h + f32(line)*line_h - scroll_y
-				push_rect(r, x0, y, max(x1-x0, 2), line_h, theme.selection)
+				y := tabbar_h + f32(line) * line_h - scroll_y
+				push_rect(r, x0, y, max(x1 - x0, 2), line_h, theme.selection)
 			}
 		}
 
@@ -1361,24 +1440,30 @@ impl App {
 			cursor_lines[c.head.line] = true
 		}
 		for line in first_line ..= last_line {
-			y := tabbar_h + f32(line)*line_h - scroll_y
-			baseline := y + r.ascent + (line_h-r.line_h)*0.5
+			y := tabbar_h + f32(line) * line_h - scroll_y
+			baseline := y + r.ascent + (line_h - r.line_h) * 0.5
 
 			// Breakpoint disc and the debugger's stop marker, in the marker
 			// column the gutter reserves left of the line numbers.
 			if self.breakpoint_at(buf.path, line) {
-				push_disc(r, sidebar_px+cell_w*1.0, y+line_h*0.5, cell_w*0.34, theme.diag_err)
+				push_disc(
+					r,
+					sidebar_px + cell_w * 1.0,
+					y + line_h * 0.5,
+					cell_w * 0.34,
+					theme.diag_err,
+				)
 			}
 			if dap.stop_line == line && dap.stop_path == buf.path {
-				push_glyph(r, sidebar_px+cell_w*1.8, baseline, '>', theme.diag_warn)
+				push_glyph(r, sidebar_px + cell_w * 1.8, baseline, '>', theme.diag_warn)
 			}
 
 			// Line number, right-aligned in the gutter.
-			num := fmt.tprintf("%d", line+1)
+			num := fmt.tprintf("%d", line + 1)
 			num_color := theme.gutter_cur if cursor_lines[line] else theme.gutter_fg
-			nx := gutter_px - cell_w*1.5 - f32(len(num))*cell_w
+			nx := gutter_px - cell_w * 1.5 - f32(len(num)) * cell_w
 			for ch, ci in num {
-				push_glyph(r, nx+f32(ci)*cell_w, baseline, ch, num_color)
+				push_glyph(r, nx + f32(ci) * cell_w, baseline, ch, num_color)
 			}
 
 			// Line text with highlight spans.
@@ -1392,7 +1477,7 @@ impl App {
 			for i := 0; i < len(s); {
 				ch, n := utf8.decode_rune(s[i:])
 				if ch == '\t' {
-					vis = (vis/tab_w + 1) * tab_w
+					vis = (vis / tab_w + 1) * tab_w
 					i += n
 					continue
 				}
@@ -1403,11 +1488,11 @@ impl App {
 				if span_i < len(spans) && spans[span_i].start <= i {
 					face = spans[span_i].face
 				}
-				x := gutter_px + f32(vis)*cell_w - scroll_x
+				x := gutter_px + f32(vis) * cell_w - scroll_x
 				if x > width {
 					break
 				}
-				if x+cell_w >= gutter_px {
+				if x + cell_w >= gutter_px {
 					push_glyph(r, x, baseline, ch, theme.faces[face])
 				}
 				vis += 1
@@ -1421,10 +1506,10 @@ impl App {
 				if c.head.line < first_line || c.head.line > last_line {
 					continue
 				}
-				x := gutter_px + f32(visual_col(&buf, c.head.line, c.head.col))*cell_w - scroll_x
-				y := tabbar_h + f32(c.head.line)*line_h - scroll_y
-				if x >= gutter_px-1 {
-					push_rect(r, x-1, y+1, 2, line_h-2, theme.cursor)
+				x := gutter_px + f32(visual_col(&buf, c.head.line, c.head.col)) * cell_w - scroll_x
+				y := tabbar_h + f32(c.head.line) * line_h - scroll_y
+				if x >= gutter_px - 1 {
+					push_rect(r, x - 1, y + 1, 2, line_h - 2, theme.cursor)
 				}
 			}
 		}
@@ -1432,8 +1517,15 @@ impl App {
 		self.problems_draw_inline(r, first_line, last_line, cell_w, line_h)
 
 		// Document scrollbar (the content keeps its overscroll tail).
-		draw_vscrollbar(r, width, tabbar_h, view_h,
-			f32(buf.line_count()+OVERSCROLL_LINES)*line_h, scroll_y, &theme)
+		draw_vscrollbar(
+			r,
+			width,
+			tabbar_h,
+			view_h,
+			f32(buf.line_count() + OVERSCROLL_LINES) * line_h,
+			scroll_y,
+			&theme,
+		)
 
 		self.tabbar_draw(r, width)
 		self.sidebar_draw(r, height)
@@ -1452,7 +1544,7 @@ impl App {
 		y := height - status_h
 		push_rect(r, 0, y, width, status_h, theme.status_bg)
 		push_rect(r, 0, y, width, 1, color_alpha(theme.gutter_fg, 0.6))
-		baseline := y + (status_h-line_h)*0.5 + r.ascent
+		baseline := y + (status_h - line_h) * 0.5 + r.ascent
 
 		draw_str :: proc(r: ^Renderer, x, baseline: f32, s: string, color: Color) -> f32 {
 			x := x
@@ -1466,45 +1558,61 @@ impl App {
 		// Left: dirty dot + file icon + path (+ transient message).
 		x := cell_w * 2
 		if buf.is_dirty() {
-			push_disc(r, x+cell_w*0.3, y+status_h*0.5, cell_w*0.3, theme.faces[.Number])
+			push_disc(r, x + cell_w * 0.3, y + status_h * 0.5, cell_w * 0.3, theme.faces[.Number])
 			x += cell_w * 1.7
 		}
 		isz := line_h * 0.62
-		push_icon_file(r, x, y+(status_h-isz)*0.5, isz, color_alpha(theme.status_dim, 0.9))
-		x += isz + cell_w*0.8
+		push_icon_file(r, x, y + (status_h - isz) * 0.5, isz, color_alpha(theme.status_dim, 0.9))
+		x += isz + cell_w * 0.8
 		name := buf.path if buf.path != "" else "[untitled]"
-		x = draw_str(r, x, baseline, name, theme.status_fg)
-		if len(status_msg) > 0 && now_ms-status_msg_time < 3000 {
-			x = draw_str(r, x+cell_w*2, baseline, status_msg, theme.faces[.String])
+		x = utext(r, x, baseline, name, theme.status_fg)
+		if len(status_msg) > 0 && now_ms - status_msg_time < 3000 {
+			x = utext(r, x + cell_w * 2, baseline, status_msg, theme.faces[.String])
 		}
 
 		// Right: problem counts, language, cursor count, position.
 		pc := self.primary_cursor()
 		right: string
 		if len(cursors) > 1 {
-			right = fmt.tprintf("%d cursors  %s  %d:%d", len(cursors), LANG_NAMES[hl.lang], pc.head.line+1, visual_col(&buf, pc.head.line, pc.head.col)+1)
+			right = fmt.tprintf(
+				"%d cursors  %s  %d:%d",
+				len(cursors),
+				LANG_NAMES[hl.lang],
+				pc.head.line + 1,
+				visual_col(&buf, pc.head.line, pc.head.col) + 1,
+			)
 		} else {
-			right = fmt.tprintf("%s  %d:%d", LANG_NAMES[hl.lang], pc.head.line+1, visual_col(&buf, pc.head.line, pc.head.col)+1)
+			right = fmt.tprintf(
+				"%s  %d:%d",
+				LANG_NAMES[hl.lang],
+				pc.head.line + 1,
+				visual_col(&buf, pc.head.line, pc.head.col) + 1,
+			)
 		}
-		rx := width - f32(len(right)+2)*cell_w
+		rx := width - f32(len(right) + 2) * cell_w
 		draw_str(r, rx, baseline, right, theme.status_dim)
 		if errs, warns := self.problems_count(); errs > 0 || warns > 0 {
 			counts := fmt.tprintf("%dE %dW", errs, warns)
-			rx -= f32(len(counts)+2) * cell_w
+			rx -= f32(len(counts) + 2) * cell_w
 			draw_str(r, rx, baseline, counts, theme.diag_err if errs > 0 else theme.diag_warn)
 		}
 		if task.running || self.dap_active() {
 			// A live task (or debug session) shows here even with the output
 			// panel closed: a spinner while running, "||" while stopped.
 			spinner := [4]string{"|", "/", "-", "\\"}
-			ind := spinner[now_ms/120%4]
+			ind := spinner[now_ms / 120 % 4]
 			if dap.state == .Stopped {
 				ind = "||"
 			}
 			run := fmt.tprintf("%s %s", ind, task.last)
-			rx -= f32(len(run)+2) * cell_w
-			draw_str(r, rx, baseline, run,
-				theme.diag_warn if dap.state == .Stopped else theme.faces[.Function])
+			rx -= f32(len(run) + 2) * cell_w
+			draw_str(
+				r,
+				rx,
+				baseline,
+				run,
+				theme.diag_warn if dap.state == .Stopped else theme.faces[.Function],
+			)
 		}
 	}
 }

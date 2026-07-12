@@ -34,6 +34,10 @@ Renderer :: struct {
 	ascii:  [ASCII_COUNT]stbtt.packedchar,
 	latin1: [LATIN1_COUNT]stbtt.packedchar,
 	punct:  [PUNCT_COUNT]stbtt.packedchar,
+	// The proportional UI face (tabs, sidebar, status bar); falls back to
+	// the monospace face when no system UI font is found.
+	ui_ascii:  [ASCII_COUNT]stbtt.packedchar,
+	ui_latin1: [LATIN1_COUNT]stbtt.packedchar,
 	white_uv: [2]f32, // uv of a solid white pixel in the atlas
 
 	// Font metrics (pixels).
@@ -120,6 +124,51 @@ when ODIN_OS == .Windows {
 		p := strings.trim_space(string(stdout))
 		return p, p != ""
 	}
+}
+
+// Candidate proportional UI fonts per OS (tabs, sidebar, ...).
+when ODIN_OS == .Windows {
+	@(private = "file")
+	UI_FONT_CANDIDATES := []string{"C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\arial.ttf"}
+} else when ODIN_OS == .Darwin {
+	@(private = "file")
+	UI_FONT_CANDIDATES := []string{"/System/Library/Fonts/Helvetica.ttc", "/System/Library/Fonts/Supplemental/Arial.ttf"}
+} else {
+	@(private = "file")
+	UI_FONT_CANDIDATES := []string{
+		"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+		"/usr/share/fonts/TTF/DejaVuSans.ttf",
+		"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+		"/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+	}
+}
+
+@(private = "file")
+load_ui_font_file :: proc() -> (data: []byte, ok: bool) {
+	if env := os.get_env("MEDIT_UI_FONT", context.temp_allocator); env != "" {
+		if d, err := os.read_entire_file(env, context.allocator); err == nil {
+			return d, true
+		}
+	}
+	when ODIN_OS != .Windows && ODIN_OS != .Darwin {
+		state, stdout, _, perr := os.process_exec(
+			{command = []string{"fc-match", "--format=%{file}", "sans-serif"}},
+			context.temp_allocator,
+		)
+		if perr == nil && state.exited && state.exit_code == 0 {
+			if p := strings.trim_space(string(stdout)); p != "" {
+				if d, err := os.read_entire_file(p, context.allocator); err == nil {
+					return d, true
+				}
+			}
+		}
+	}
+	for path in UI_FONT_CANDIDATES {
+		if d, err := os.read_entire_file(path, context.allocator); err == nil {
+			return d, true
+		}
+	}
+	return nil, false
 }
 
 @(private = "file")
@@ -217,6 +266,20 @@ renderer_build_atlas :: proc(r: ^Renderer, font_px: f32) -> bool {
 	ok1 := stbtt.PackFontRange(&spc, raw_data(ttf), 0, font_px, ASCII_FIRST, ASCII_COUNT, &ascii[0])
 	ok2 := stbtt.PackFontRange(&spc, raw_data(ttf), 0, font_px, LATIN1_FIRST, LATIN1_COUNT, &latin1[0])
 	ok3 := stbtt.PackFontRange(&spc, raw_data(ttf), 0, font_px, PUNCT_FIRST, PUNCT_COUNT, &punct[0])
+
+	// The proportional UI face rides in the same atlas.
+	ui_ascii:  [ASCII_COUNT]stbtt.packedchar
+	ui_latin1: [LATIN1_COUNT]stbtt.packedchar
+	ui_ok := false
+	if ui_ttf, uok := load_ui_font_file(); uok {
+		defer delete(ui_ttf)
+		u_off := stbtt.GetFontOffsetForIndex(raw_data(ui_ttf), 0)
+		if u_off >= 0 {
+			u1 := stbtt.PackFontRange(&spc, raw_data(ui_ttf), 0, font_px, ASCII_FIRST, ASCII_COUNT, &ui_ascii[0])
+			u2 := stbtt.PackFontRange(&spc, raw_data(ui_ttf), 0, font_px, LATIN1_FIRST, LATIN1_COUNT, &ui_latin1[0])
+			ui_ok = u1 != 0 && u2 != 0
+		}
+	}
 	stbtt.PackEnd(&spc)
 	if ok1 == 0 || ok2 == 0 || ok3 == 0 {
 		return false // glyphs did not fit; keep the previous atlas
@@ -224,6 +287,8 @@ renderer_build_atlas :: proc(r: ^Renderer, font_px: f32) -> bool {
 	r.ascii = ascii
 	r.latin1 = latin1
 	r.punct = punct
+	r.ui_ascii = ui_ascii if ui_ok else ascii
+	r.ui_latin1 = ui_latin1 if ui_ok else latin1
 	r.font_px = font_px
 
 	// Stamp a solid white block in the bottom-right corner for rect fills.
@@ -357,6 +422,70 @@ push_glyph :: proc(r: ^Renderer, x, baseline_y: f32, ch: rune, c: Color) {
 	q: stbtt.aligned_quad
 	stbtt.GetPackedQuad(base, ATLAS_W, ATLAS_H, index, &xpos, &ypos, &q, false)
 	push_quad(r, q.x0, q.y0, q.x1, q.y1, q.s0, q.t0, q.s1, q.t1, c)
+}
+
+// --- UI text: the proportional face, for chrome (tabs, sidebar, status) ------------
+
+// One UI-face glyph; returns its advance. Runes outside the UI ranges fall
+// back to the monospace face.
+push_uglyph :: proc(r: ^Renderer, x, baseline_y: f32, ch: rune, c: Color) -> f32 {
+	base: ^stbtt.packedchar
+	index: i32
+	switch {
+	case ch >= ASCII_FIRST && ch < ASCII_FIRST+ASCII_COUNT:
+		index = i32(ch) - ASCII_FIRST
+		base = &r.ui_ascii[0]
+	case ch >= LATIN1_FIRST && ch < LATIN1_FIRST+LATIN1_COUNT:
+		index = i32(ch) - LATIN1_FIRST
+		base = &r.ui_latin1[0]
+	case:
+		push_glyph(r, x, baseline_y, ch, c)
+		return r.cell_w
+	}
+	xpos := x
+	ypos := baseline_y
+	q: stbtt.aligned_quad
+	stbtt.GetPackedQuad(base, ATLAS_W, ATLAS_H, index, &xpos, &ypos, &q, false)
+	push_quad(r, q.x0, q.y0, q.x1, q.y1, q.s0, q.t0, q.s1, q.t1, c)
+	return xpos - x
+}
+
+// Width of s in the UI face, without drawing.
+utext_width :: proc(r: ^Renderer, s: string) -> f32 {
+	w: f32 = 0
+	for ch in s {
+		switch {
+		case ch >= ASCII_FIRST && ch < ASCII_FIRST+ASCII_COUNT:
+			w += r.ui_ascii[i32(ch)-ASCII_FIRST].xadvance
+		case ch >= LATIN1_FIRST && ch < LATIN1_FIRST+LATIN1_COUNT:
+			w += r.ui_latin1[i32(ch)-LATIN1_FIRST].xadvance
+		case:
+			w += r.cell_w
+		}
+	}
+	return w
+}
+
+// Draw s in the UI face; returns the end x.
+utext :: proc(r: ^Renderer, x, baseline: f32, s: string, c: Color) -> f32 {
+	x := x
+	for ch in s {
+		x += push_uglyph(r, x, baseline, ch, c)
+	}
+	return x
+}
+
+// Draw s in the UI face, truncating with an ellipsis before limit.
+utext_clip :: proc(r: ^Renderer, x, baseline, limit: f32, s: string, c: Color) -> f32 {
+	x := x
+	for ch in s {
+		if x+r.cell_w*1.5 > limit {
+			push_uglyph(r, x, baseline, '…', c)
+			return x + r.cell_w
+		}
+		x += push_uglyph(r, x, baseline, ch, c)
+	}
+	return x
 }
 
 flush :: proc(r: ^Renderer) {

@@ -9,10 +9,12 @@ the editor's own internals use in-struct procs and `impl` blocks throughout
 ## What it does
 
 - **Custom title bar** — no native window chrome: the tab bar doubles as the
-  title bar, with traffic-light window buttons (close / minimize /
-  fullscreen), draggable empty space, and resizable window edges, all drawn
-  by the editor itself. Closing with unsaved files takes a confirming second
-  attempt.
+  title bar, with a single × close button in the top-right corner (hovered
+  red, native-style, the same on every platform), draggable empty space,
+  and resizable window edges, all drawn by the editor itself. Closing with
+  unsaved files takes a confirming second attempt. UI chrome (tabs, file
+  tree, status bar, panel titles) renders in the system's proportional UI
+  font (`MEDIT_UI_FONT` overrides); the buffer stays monospace.
 - **Tabs** — every file opens in its own tab with its own undo history,
   cursors, scroll position and selection history. Click to switch, `×` or
   middle-click to close (a dirty file shows a dot instead of `×`, and closing

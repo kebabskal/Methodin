@@ -13,6 +13,7 @@ import "core:path/filepath"
 import "core:strings"
 
 SIDEBAR_CELLS :: 32
+sidebar_cells: f32 = SIDEBAR_CELLS // drag the sidebar border to resize
 
 Tree_Node :: struct {
 	name:     string, // owned
@@ -334,23 +335,17 @@ impl App {
 
 		// Panel over anything the text area let bleed left, plus a border.
 		push_rect(r, 0, top, sidebar_px, h-top, theme.status_bg)
-		push_rect(r, sidebar_px-1, top, 1, h-top, color_alpha(theme.gutter_fg, 0.6))
+		hot := edge_hover == 1 || resizing == 1
+		push_rect(r, sidebar_px-2 if hot else sidebar_px-1, top, 3 if hot else 1, h-top,
+			theme.faces[.Function] if hot else color_alpha(theme.gutter_fg, 0.6))
 
 		rows := sidebar_rows(&sidebar)
 		content_h := f32(len(rows)+1)*row_h + row_h*0.5
 		sidebar.scroll_y = clamp(sidebar.scroll_y, 0, max(0, content_h-(h-top)))
 
-		// Truncate with '…' before running into the border.
+		// The proportional UI face, truncated with '…' before the border.
 		draw_name :: proc(r: ^Renderer, x, baseline, limit: f32, s: string, c: Color) {
-			x := x
-			for ch in s {
-				if x+r.cell_w*2 > limit {
-					push_glyph(r, x, baseline, '…', c)
-					return
-				}
-				push_glyph(r, x, baseline, ch, c)
-				x += r.cell_w
-			}
+			_ = utext_clip(r, x, baseline, limit, s, c)
 		}
 
 		isz := line_h * 0.62

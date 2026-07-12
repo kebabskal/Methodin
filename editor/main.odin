@@ -24,6 +24,8 @@ FONT_PT_MAX :: 40.0
 @(private = "file") cursor_ibeam: ^sdl.Cursor
 @(private = "file") cursor_arrow: ^sdl.Cursor
 @(private = "file") cursor_hand: ^sdl.Cursor
+@(private = "file") cursor_ew: ^sdl.Cursor
+@(private = "file") cursor_ns: ^sdl.Cursor
 
 // Custom event type carrying a system file-dialog result back to the loop
 // (the dialog callback may run on another thread; PushEvent is thread-safe).
@@ -199,9 +201,13 @@ main :: proc() {
 	cursor_ibeam = sdl.CreateSystemCursor(.TEXT)
 	cursor_arrow = sdl.CreateSystemCursor(.DEFAULT)
 	cursor_hand = sdl.CreateSystemCursor(.POINTER)
+	cursor_ew = sdl.CreateSystemCursor(.EW_RESIZE)
+	cursor_ns = sdl.CreateSystemCursor(.NS_RESIZE)
 	defer sdl.DestroyCursor(cursor_ibeam)
 	defer sdl.DestroyCursor(cursor_arrow)
 	defer sdl.DestroyCursor(cursor_hand)
+	defer sdl.DestroyCursor(cursor_ew)
+	defer sdl.DestroyCursor(cursor_ns)
 	_ = sdl.SetCursor(cursor_ibeam)
 
 	running := true
@@ -474,6 +480,8 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		if len(text) > 0 {
 			if app.palette.open {
 				app.palette_insert(text)
+			} else if app.task.filter_focus {
+				append(&app.task.filter, text)
 			} else {
 				app.type_text(text)
 				app.completion_after_insert(text)
@@ -490,8 +498,11 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		px := ev.button.x * density
 		py := ev.button.y * density
 		if ev.button.button == sdl.BUTTON_LEFT {
+			app.task.filter_focus = false // clicks re-focus (locals header re-arms it)
 			if app.palette.open {
 				app.palette_mouse(px, py, rend.cell_w, rend.line_h)
+			} else if app.edge_hover != 0 {
+				app.resizing = app.edge_hover // grab the hovered resize edge
 			} else if py < app.tabbar_h {
 				switch app.traffic_hit(px, py) {
 				case 0: // close: through the regular quit path (dirty guard)
@@ -556,18 +567,43 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 
 	case .MOUSE_BUTTON_UP:
 		if ev.button.button == sdl.BUTTON_LEFT {
+			app.resizing = 0
 			app.task_drag_end(ev.button.x*density, ev.button.y*density, rend.cell_w)
 			app.mouse_up()
 		}
 
 	case .MOUSE_MOTION:
+		if app.resizing == 1 {
+			sidebar_cells = clamp(ev.motion.x*density/rend.cell_w, 14, 90)
+			return true
+		} else if app.resizing == 2 {
+			// The panel bottom edge is fixed; rows follow the dragged top.
+			bottom := app.task.top + app.task.h
+			output_rows = clamp(int((bottom-ev.motion.y*density-rend.line_h*PANEL_HEAD_SCALE)/(rend.line_h*PANEL_ROW_SCALE)), 3, 40)
+			return true
+		}
 		over_ui := app.palette.open ||
 			ev.motion.x*density < app.sidebar_px || ev.motion.y*density < app.tabbar_h ||
 			(app.problems_open && ev.motion.y*density >= app.problems_top) ||
 			(app.task.open && ev.motion.y*density >= app.task.top)
 		over_link := app.task_motion(ev.motion.x*density, ev.motion.y*density, rend.cell_w) &&
 			!app.palette.open
-		_ = sdl.SetCursor(cursor_hand if over_link else cursor_arrow if over_ui else cursor_ibeam)
+		// Resize edges: generous grab zones with cursor feedback.
+		app.edge_hover = 0
+		if !app.palette.open && ev.motion.y*density > app.tabbar_h {
+			if app.task.open && abs(ev.motion.y*density-app.task.top) < 8 {
+				app.edge_hover = 2
+			} else if app.sidebar_px > 0 && abs(ev.motion.x*density-app.sidebar_px) < 8 {
+				app.edge_hover = 1
+			}
+		}
+		cur := cursor_hand if over_link else cursor_arrow if over_ui else cursor_ibeam
+		if app.edge_hover == 1 || app.resizing == 1 {
+			cur = cursor_ew
+		} else if app.edge_hover == 2 || app.resizing == 2 {
+			cur = cursor_ns
+		}
+		_ = sdl.SetCursor(cur)
 		app.hover_motion(ev.motion.x*density, ev.motion.y*density, rend.cell_w, rend.line_h)
 		if app.palette.open {
 			app.palette_motion(ev.motion.x*density, ev.motion.y*density, rend.line_h)
@@ -601,8 +637,8 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 			app.tab_scroll -= (dy + dx) * rend.cell_w * 6
 		} else if app.task.open && ev.wheel.mouse_y*density >= app.task.top &&
 		   ev.wheel.mouse_y*density < app.task.top+app.task.h {
-			// Over the task output panel: scroll its lines.
-			app.task_wheel(dy, rend.cell_w)
+			// Over the task output panel: scroll its lines (or a column).
+			app.task_wheel(dy, rend.cell_w, ev.wheel.mouse_x*density)
 		} else if app.problems_open && ev.wheel.mouse_y*density >= app.problems_top &&
 		   ev.wheel.mouse_y*density < app.problems_top+app.problems_h {
 			// Over the problems panel: scroll its rows (clamped next draw).
@@ -689,6 +725,24 @@ handle_key :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.Eve
 			app.open_search()
 		}
 		return
+	}
+
+	// The panel's locals filter, while focused: backspace edits, esc leaves.
+	if app.task.filter_focus {
+		switch {
+		case key == sdl.K_ESCAPE:
+			app.task.filter_focus = false
+			clear(&app.task.filter)
+			return
+		case key == sdl.K_BACKSPACE:
+			if n := len(app.task.filter); n > 0 {
+				resize(&app.task.filter, n-1)
+			}
+			return
+		case key == sdl.K_RETURN:
+			app.task.filter_focus = false
+			return
+		}
 	}
 
 	// The completion popup claims navigation/accept keys; everything else
