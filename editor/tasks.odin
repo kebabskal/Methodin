@@ -803,54 +803,53 @@ impl App {
 		_ = utext_clip(r, cell_w+hsz+cell_w*0.7, head_base, width * 0.5, ts.title, theme.status_dim)
 
 		// Header buttons, right-aligned (built right-to-left): close, kill,
-		// and — while the debugger is stopped — the stepping controls.
+		// and — while the debugger is stopped — the stepping controls. Icon
+		// buttons in square boxes; hovering fills the box faintly.
 		ts.head_bot = top + head_h
 		clear(&ts.btns)
-		bx := width - cell_w
+		bx := width - cell_w*0.5
 		put_btn :: proc(
 			ts: ^Task_State,
 			r: ^Renderer,
 			bx: ^f32,
-			head_base: f32,
-			label: string,
+			top, head_h: f32,
+			icon: Icon,
 			id: int,
 			color: Color,
 			t: ^Theme,
 		) {
-			w := f32(len(label)) * r.cell_w
+			w := head_h
 			bx^ -= w
-			c := color
 			if ts.hover_btn == id {
-				push_rect(r, bx^, head_base + 3, w, 1, c)
+				push_rect(r, bx^, top + 2, w, head_h - 4, color_alpha(t.fg, 0.10))
 			}
-			x := bx^
-			for ch in label {
-				push_glyph(r, x, head_base, ch, c)
-				x += r.cell_w
-			}
+			isz := r.line_h * 0.7
+			push_icon(r, bx^ + (w - isz) * 0.5, top + (head_h - isz) * 0.5, isz, icon, color)
 			append(&ts.btns, Panel_Btn{x0 = bx^, x1 = bx^ + w, id = id})
-			bx^ -= r.cell_w * 3
+			bx^ -= r.cell_w * 0.4
 		}
 		put_btn(
 			ts,
 			r,
 			&bx,
-			head_base,
-			"close",
+			top,
+			head_h,
+			.X,
 			PBTN_CLOSE,
 			theme.fg if ts.hover_btn == PBTN_CLOSE else theme.status_dim,
 			&theme,
 		)
 		if ts.running || self.dap_active() {
-			put_btn(ts, r, &bx, head_base, "kill", PBTN_KILL, theme.diag_err, &theme)
+			put_btn(ts, r, &bx, top, head_h, .Square, PBTN_KILL, theme.diag_err, &theme)
 		}
 		if dap.state == .Stopped {
 			put_btn(
 				ts,
 				r,
 				&bx,
-				head_base,
-				"out",
+				top,
+				head_h,
+				.Arrow_Up_From_Dot,
 				PBTN_OUT,
 				theme.fg if ts.hover_btn == PBTN_OUT else theme.status_fg,
 				&theme,
@@ -859,8 +858,9 @@ impl App {
 				ts,
 				r,
 				&bx,
-				head_base,
-				"in",
+				top,
+				head_h,
+				.Arrow_Down_To_Dot,
 				PBTN_IN,
 				theme.fg if ts.hover_btn == PBTN_IN else theme.status_fg,
 				&theme,
@@ -869,22 +869,14 @@ impl App {
 				ts,
 				r,
 				&bx,
-				head_base,
-				"over",
+				top,
+				head_h,
+				.Redo_Dot,
 				PBTN_OVER,
 				theme.fg if ts.hover_btn == PBTN_OVER else theme.status_fg,
 				&theme,
 			)
-			put_btn(
-				ts,
-				r,
-				&bx,
-				head_base,
-				"continue",
-				PBTN_CONTINUE,
-				theme.faces[.Function],
-				&theme,
-			)
+			put_btn(ts, r, &bx, top, head_h, .Play, PBTN_CONTINUE, theme.faces[.Function], &theme)
 		}
 
 		hi := f32(max(len(ts.lines) - output_rows, 0))

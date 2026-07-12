@@ -31,17 +31,25 @@ Icon :: enum {
 	Play,
 	Bug,
 	X,
+	Square,            // stop/kill
+	Redo_Dot,          // step over
+	Arrow_Down_To_Dot, // step in
+	Arrow_Up_From_Dot, // step out
 }
 
 // Codepoints from vendor/lucide/codepoints.json (Lucide 1.24.0).
 @(private = "file")
 ICON_CODEPOINTS := [Icon]rune {
-	.Chevron_Right = 0xE06F,
-	.Chevron_Down  = 0xE06D,
-	.Search        = 0xE151,
-	.Play          = 0xE13C,
-	.Bug           = 0xE20C,
-	.X             = 0xE1B2,
+	.Chevron_Right     = 0xE06F,
+	.Chevron_Down      = 0xE06D,
+	.Search            = 0xE151,
+	.Play              = 0xE13C,
+	.Bug               = 0xE20C,
+	.X                 = 0xE1B2,
+	.Square            = 0xE167,
+	.Redo_Dot          = 0xE450,
+	.Arrow_Down_To_Dot = 0xE44D,
+	.Arrow_Up_From_Dot = 0xE44E,
 }
 
 @(private = "file")
