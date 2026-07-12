@@ -37,6 +37,7 @@ SETTINGS_TEMPLATE :: `; medit settings — the project's .medit/settings.ini add
 theme = tokyo-night
 ; sidebar-cells = 32   ; sidebar width in text columns (drag its border)
 ; output-rows = 12     ; output panel height in rows (drag its top edge)
+; panel-cols = 0.24 0.28 ; debug column widths (drag their dividers)
 
 [editor]
 ; tab-width = 2        ; the palette cycles 2/4/8
@@ -88,6 +89,16 @@ settings_parse :: proc(app: ^App, src: string) {
 			case "output-rows":
 				if v, vok := strconv.parse_int(strings.trim_space(value)); vok {
 					output_rows = clamp(v, 3, 40)
+				}
+			case "panel-cols":
+				f := strings.fields(value, context.temp_allocator)
+				if len(f) == 2 {
+					if v, vok := strconv.parse_f32(f[0]); vok {
+						app.task.stack_frac = clamp(v, 0.08, 0.5)
+					}
+					if v, vok := strconv.parse_f32(f[1]); vok {
+						app.task.locals_frac = clamp(v, 0.08, 0.5)
+					}
 				}
 			}
 		}

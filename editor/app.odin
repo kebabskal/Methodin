@@ -179,6 +179,9 @@ app_init :: proc(app: ^App, path: string) {
 	}
 	app.doc_append(b, lang)
 	app.task.drag_from = -1
+	app.task.hover_local = -1
+	app.task.stack_frac = 0.24
+	app.task.locals_frac = 0.28
 	settings_load(app) // before the tree first loads: [files] hide filters it
 	sidebar_init(&app.sidebar)
 }

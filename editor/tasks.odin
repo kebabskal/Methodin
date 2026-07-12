@@ -112,12 +112,20 @@ Task_State :: struct {
 	drag_from_off:         int,
 	drag_to_off:           int,
 
-	// Hover feedback: the link span, header button or frame under the mouse.
+	// Hover feedback: the link span, header button, frame or local under
+	// the mouse.
 
 	hover_row:             int, // -1 = none
 	hover_lo, hover_hi:    int, // byte span within lines[hover_row]
 	hover_btn:             int, // Panel_Btn id under the mouse (0 none)
 	hover_frame:           int, // call-stack frame index (-1 none)
+	hover_local:           int, // locals row index (-1 none)
+
+	// Debug-column widths as window fractions; drag the dividers to resize.
+
+	stack_frac:            f32,
+	locals_frac:           f32,
+	panel_w:               f32, // window width from the last draw (drag math)
 }
 
 // A clickable word in the panel header (kill/close, debug stepping).
@@ -573,6 +581,7 @@ impl App {
 		ts.hover_row = -1
 		ts.hover_btn = 0
 		ts.hover_frame = -1
+		ts.hover_local = -1
 		if !ts.open || py < ts.top || py >= ts.top + ts.h {
 			return false
 		}
@@ -605,6 +614,17 @@ impl App {
 					if fi < len(dap.frames) && dap.frames[fi].path != "" {
 						ts.hover_frame = fi
 						return true
+					}
+				}
+			} else {
+				fi := int((py - ts.head_bot) / ts.row_h) - 1
+				if fi >= 0 && fi < output_rows - 1 {
+					vis := self.task_locals_filtered()
+					if i := fi + int(ts.locals_scroll); i < len(vis) {
+						if dap.locals[vis[i]].value != "" { // not the divider
+							ts.hover_local = vis[i]
+							return true
+						}
 					}
 				}
 			}
@@ -949,30 +969,34 @@ impl App {
 
 		// While stopped in the debugger, the panel splits into columns:
 		// output | call stack (clickable frames) | locals of the frame.
+		// Divider drags adjust the fractions (hot like the sidebar border).
 		ts.stack_x0 = 0
 		ts.locals_x0 = 0
+		ts.panel_w = width
 		out_w := width
 		if len(dap.frames) > 0 && width > cell_w * 100 {
-			stack_w := clamp(width * 0.24, cell_w * 24, cell_w * 46)
-			locals_w := clamp(width * 0.28, cell_w * 24, cell_w * 54)
+			stack_w := clamp(width * ts.stack_frac, cell_w * 16, width * 0.5)
+			locals_w := clamp(width * ts.locals_frac, cell_w * 16, width * 0.5)
 			out_w = width - stack_w - locals_w
 			ts.stack_x0 = out_w
 			ts.locals_x0 = out_w + stack_w
+			hot3 := edge_hover == 3 || resizing == 3
 			push_rect(
 				r,
-				ts.stack_x0,
+				ts.stack_x0 - 1 if hot3 else ts.stack_x0,
 				ts.head_bot,
-				1,
+				3 if hot3 else 1,
 				ts.h - head_h,
-				color_alpha(theme.gutter_fg, 0.4),
+				theme.faces[.Function] if hot3 else color_alpha(theme.gutter_fg, 0.4),
 			)
+			hot4 := edge_hover == 4 || resizing == 4
 			push_rect(
 				r,
-				ts.locals_x0,
+				ts.locals_x0 - 1 if hot4 else ts.locals_x0,
 				ts.head_bot,
-				1,
+				3 if hot4 else 1,
 				ts.h - head_h,
-				color_alpha(theme.gutter_fg, 0.4),
+				theme.faces[.Function] if hot4 else color_alpha(theme.gutter_fg, 0.4),
 			)
 
 			hy := ts.head_bot + (row_h - line_h) * 0.5 + r.ascent
@@ -1049,6 +1073,16 @@ impl App {
 				v := &dap.locals[vis_locals[i]]
 				ry := ts.head_bot + f32(vi + 1) * row_h
 				y := ry + (row_h - line_h) * 0.5 + r.ascent
+				if vis_locals[i] == ts.hover_local {
+					push_rect(
+						r,
+						ts.locals_x0 + 1,
+						ry,
+						width - ts.locals_x0 - 1,
+						row_h,
+						color_alpha(theme.selection, 0.45),
+					)
+				}
 				if v.value == "" { 	// section divider (globals)
 					draw_clip(r, ts.locals_x0 + cell_w, y, width, v.name, theme.status_dim)
 				} else {

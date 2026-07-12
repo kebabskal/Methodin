@@ -595,6 +595,9 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 				_ = settings_save_key("ui", "sidebar-cells", fmt.tprintf("%.0f", sidebar_cells))
 			} else if app.resizing == 2 {
 				_ = settings_save_key("ui", "output-rows", fmt.tprintf("%d", output_rows))
+			} else if app.resizing == 3 || app.resizing == 4 {
+				_ = settings_save_key("ui", "panel-cols",
+					fmt.tprintf("%.2f %.2f", app.task.stack_frac, app.task.locals_frac))
 			}
 			app.resizing = 0
 			app.task_drag_end(ev.button.x*density, ev.button.y*density, rend.cell_w)
@@ -610,6 +613,15 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 			bottom := app.task.top + app.task.h
 			output_rows = clamp(int((bottom-ev.motion.y*density-rend.line_h*PANEL_HEAD_SCALE)/(rend.line_h*PANEL_ROW_SCALE)), 3, 40)
 			return true
+		} else if app.resizing == 3 {
+			// Output | stack divider: trades output for call-stack width.
+			ts := &app.task
+			ts.stack_frac = clamp((ts.locals_x0-ev.motion.x*density)/max(ts.panel_w, 1), 0.08, 0.5)
+			return true
+		} else if app.resizing == 4 {
+			ts := &app.task
+			ts.locals_frac = clamp((ts.panel_w-ev.motion.x*density)/max(ts.panel_w, 1), 0.08, 0.5)
+			return true
 		}
 		over_ui := app.palette.open ||
 			ev.motion.x*density < app.sidebar_px || ev.motion.y*density < app.tabbar_h ||
@@ -620,14 +632,26 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		// Resize edges: generous grab zones with cursor feedback.
 		app.edge_hover = 0
 		if !app.palette.open && ev.motion.y*density > app.tabbar_h {
+			in_cols := app.task.open && app.task.stack_x0 > 0 &&
+				ev.motion.y*density > app.task.head_bot
 			if app.task.open && abs(ev.motion.y*density-app.task.top) < 8 {
 				app.edge_hover = 2
+			} else if in_cols && abs(ev.motion.x*density-app.task.stack_x0) < 8 {
+				app.edge_hover = 3 // output | call stack divider
+			} else if in_cols && abs(ev.motion.x*density-app.task.locals_x0) < 8 {
+				app.edge_hover = 4 // call stack | locals divider
 			} else if app.sidebar_px > 0 && abs(ev.motion.x*density-app.sidebar_px) < 8 {
 				app.edge_hover = 1
 			}
 		}
+		if app.edge_hover != 0 {
+			// A hot resize edge wins over whatever row sits under it.
+			app.task.hover_frame = -1
+			app.task.hover_local = -1
+			over_link = false
+		}
 		cur := cursor_hand if over_link else cursor_arrow if over_ui else cursor_ibeam
-		if app.edge_hover == 1 || app.resizing == 1 {
+		if app.edge_hover == 1 || app.edge_hover >= 3 || app.resizing == 1 || app.resizing >= 3 {
 			cur = cursor_ew
 		} else if app.edge_hover == 2 || app.resizing == 2 {
 			cur = cursor_ns
