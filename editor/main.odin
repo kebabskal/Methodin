@@ -146,9 +146,19 @@ main :: proc() {
 	sdl.GL_SetAttribute(.DOUBLEBUFFER, 1)
 
 	title := fmt.ctprintf("medit — %s", path if path != "" else "[untitled]")
+	// A roomy default, clamped to the display; the size of the previous run
+	// wins when there was one (saved on quit).
+	usable := sdl.Rect{0, 0, 3840, 2160}
+	_ = sdl.GetDisplayUsableBounds(sdl.GetPrimaryDisplay(), &usable)
+	win_w := min(c.int(1700), usable.w - 60)
+	win_h := min(c.int(1050), usable.h - 60)
+	if w, h, wok := window_size_load(); wok {
+		win_w = clamp(c.int(w), 640, usable.w)
+		win_h = clamp(c.int(h), 480, usable.h)
+	}
 	// Borderless: the tab bar doubles as the title bar (drag, window buttons);
 	// hit_test below tells the OS which regions drag and resize.
-	window := sdl.CreateWindow(title, 1200, 800, {.OPENGL, .RESIZABLE, .HIGH_PIXEL_DENSITY, .BORDERLESS})
+	window := sdl.CreateWindow(title, win_w, win_h, {.OPENGL, .RESIZABLE, .HIGH_PIXEL_DENSITY, .BORDERLESS})
 	if window == nil {
 		fmt.eprintfln("medit: window creation failed: %s", sdl.GetError())
 		os.exit(1)
@@ -275,6 +285,12 @@ main :: proc() {
 		}
 
 		render_frame(&app, &rend, window)
+	}
+
+	// The window size survives restarts.
+	ww, wh: c.int
+	if sdl.GetWindowSize(window, &ww, &wh) {
+		window_size_save(int(ww), int(wh))
 	}
 }
 
@@ -567,6 +583,12 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 
 	case .MOUSE_BUTTON_UP:
 		if ev.button.button == sdl.BUTTON_LEFT {
+			// A finished sidebar/panel resize is worth keeping.
+			if app.resizing == 1 {
+				_ = settings_save_key("ui", "sidebar-cells", fmt.tprintf("%.0f", sidebar_cells))
+			} else if app.resizing == 2 {
+				_ = settings_save_key("ui", "output-rows", fmt.tprintf("%d", output_rows))
+			}
 			app.resizing = 0
 			app.task_drag_end(ev.button.x*density, ev.button.y*density, rend.cell_w)
 			app.mouse_up()

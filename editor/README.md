@@ -102,9 +102,13 @@ the editor's own internals use in-struct procs and `impl` blocks throughout
 - **Settings** — `>Settings: Open Settings` (user-wide, in the user config
   directory) and `>Settings: Open Project Settings` (`.medit/settings.ini`);
   both created from a template on first use, re-read on save, focus and
-  workspace switch, and the project file adds to the user one. Currently:
-  `[files] hide = *.exe *.pdb bin` — globs hidden from the file tree — and
-  `[ui] theme = <name>`.
+  workspace switch, and the project file adds to the user one. The palette's
+  Settings/Theme commands and the sidebar/panel resize drags write their
+  keys back to the user-wide file, so preferences survive restarts. Keys:
+  `[ui] theme`, `sidebar-cells`, `output-rows`; `[editor] tab-width`,
+  `smart-word`, `format-on-save`, `outline-fields`; `[files] hide` (globs
+  hidden from the file tree). The window size is remembered too (state
+  file next to the recent-dirs list, saved on quit).
 - **Themes** — `>Theme: …` in the palette switches live and saves the
   choice to the user settings: `tokyo-night` (default), `tokyo-day` and
   high-contrast `paper` for daylight, and `gruvbox`.

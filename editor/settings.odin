@@ -5,10 +5,19 @@
 //   .medit/settings.ini                 ">Settings: Open Project Settings"
 //
 // Read at startup, on workspace switch, when saved from a medit tab, and on
-// window focus (so external edits count too). Currently:
+// window focus (so external edits count too). The palette's Settings/Theme
+// commands and the sidebar/panel resize drags write their keys back into
+// the user-wide file (settings_save_key). Currently:
 //
 //   [ui]
 //   theme = tokyo-night       ; see THEMES in theme.odin
+//   sidebar-cells = 32        ; sidebar width in text columns
+//   output-rows = 12          ; output panel height in rows
+//   [editor]
+//   tab-width = 2
+//   smart-word = true         ; word movement stops at subwords
+//   format-on-save = true
+//   outline-fields = false    ; fields/enum members in the outline
 //   [files]
 //   hide = *.exe *.pdb bin    ; globs hidden from the file tree
 package medit
@@ -16,20 +25,36 @@ package medit
 import "core:encoding/ini"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:strings"
 
 PROJECT_SETTINGS_PATH :: ".medit/settings.ini"
 
 SETTINGS_TEMPLATE :: `; medit settings — the project's .medit/settings.ini adds to the user-wide one.
+; The palette's Settings/Theme commands keep the user-wide file up to date.
 [ui]
 ; color theme: tokyo-night, tokyo-day, paper, gruvbox
 theme = tokyo-night
+; sidebar-cells = 32   ; sidebar width in text columns (drag its border)
+; output-rows = 12     ; output panel height in rows (drag its top edge)
+
+[editor]
+; tab-width = 2        ; the palette cycles 2/4/8
+; smart-word = true    ; word movement stops at subwords
+; format-on-save = true
+; outline-fields = false ; fields/enum members in the outline
 
 [files]
 ; space-separated globs hidden from the file tree, e.g.:
 ; hide = *.exe *.pdb *.obj bin
 hide =
 `
+
+@(private = "file")
+settings_bool :: proc(value: string) -> bool {
+	v := strings.trim_space(value)
+	return v == "true" || v == "1" || v == "on"
+}
 
 settings_user_path :: proc() -> (string, bool) {
 	cfg, err := os.user_config_dir(context.temp_allocator)
@@ -50,9 +75,34 @@ settings_parse :: proc(app: ^App, src: string) {
 				append(&app.sidebar.hide, strings.clone(g))
 			}
 		}
-		if it.section == "ui" && key == "theme" {
-			if t, ok := theme_by_name(strings.trim_space(value)); ok {
-				app.theme = t
+		if it.section == "ui" {
+			switch key {
+			case "theme":
+				if t, ok := theme_by_name(strings.trim_space(value)); ok {
+					app.theme = t
+				}
+			case "sidebar-cells":
+				if v, vok := strconv.parse_f32(strings.trim_space(value)); vok {
+					sidebar_cells = clamp(v, 14, 90)
+				}
+			case "output-rows":
+				if v, vok := strconv.parse_int(strings.trim_space(value)); vok {
+					output_rows = clamp(v, 3, 40)
+				}
+			}
+		}
+		if it.section == "editor" {
+			switch key {
+			case "tab-width":
+				if v, vok := strconv.parse_int(strings.trim_space(value)); vok {
+					tab_w = clamp(v, 1, 16)
+				}
+			case "smart-word":
+				smart_word = settings_bool(value)
+			case "format-on-save":
+				app.format_on_save = settings_bool(value)
+			case "outline-fields":
+				app.outline_fields = settings_bool(value)
 			}
 		}
 	}
@@ -74,10 +124,10 @@ settings_load :: proc(app: ^App) {
 	}
 }
 
-// Persist the theme choice into the user settings.ini: replace its first
-// [ui] theme line, or append a [ui] section (last key wins on load, so a
+// Persist one key into the user settings.ini: replace the first `key`
+// line of [section], or append the section (last key wins on load, so a
 // trailing section also overrides an untouched earlier one).
-settings_save_theme :: proc(name: string) -> bool {
+settings_save_key :: proc(section, key, value: string) -> bool {
 	path, ok := settings_user_path()
 	if !ok {
 		return false
@@ -90,19 +140,20 @@ settings_save_theme :: proc(name: string) -> bool {
 	}
 
 	sb := strings.builder_make(context.temp_allocator)
-	section := ""
+	cur := ""
 	replaced := false
 	rest := src
 	for line in strings.split_lines_iterator(&rest) {
 		t := strings.trim_space(line)
 		if strings.has_prefix(t, "[") && strings.has_suffix(t, "]") {
-			section = t[1:len(t)-1]
+			cur = t[1:len(t)-1]
 		}
-		if !replaced && section == "ui" {
-			if key, eq, _ := strings.partition(t, "="); eq == "=" &&
-			   strings.trim_space(key) == "theme" {
-				strings.write_string(&sb, "theme = ")
-				strings.write_string(&sb, name)
+		if !replaced && cur == section {
+			if k, eq, _ := strings.partition(t, "="); eq == "=" &&
+			   strings.trim_space(k) == key {
+				strings.write_string(&sb, key)
+				strings.write_string(&sb, " = ")
+				strings.write_string(&sb, value)
 				strings.write_byte(&sb, '\n')
 				replaced = true
 				continue
@@ -112,8 +163,12 @@ settings_save_theme :: proc(name: string) -> bool {
 		strings.write_byte(&sb, '\n')
 	}
 	if !replaced {
-		strings.write_string(&sb, "\n[ui]\ntheme = ")
-		strings.write_string(&sb, name)
+		strings.write_string(&sb, "\n[")
+		strings.write_string(&sb, section)
+		strings.write_string(&sb, "]\n")
+		strings.write_string(&sb, key)
+		strings.write_string(&sb, " = ")
+		strings.write_string(&sb, value)
 		strings.write_byte(&sb, '\n')
 	}
 

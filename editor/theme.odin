@@ -221,7 +221,7 @@ impl App {
 			return
 		}
 		theme = t
-		if settings_save_theme(name) {
+		if settings_save_key("ui", "theme", name) {
 			self.set_status(fmt.tprintf("theme: %s (saved to settings)", name))
 		} else {
 			self.set_status(fmt.tprintf("theme: %s (could not save settings)", name))

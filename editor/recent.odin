@@ -1,6 +1,6 @@
 // medit — tiny per-user persistence (under the user config directory):
 // recently opened folders, offered in the command palette as "Open Recent: …"
-// entries, and the last zoom level.
+// entries, the last zoom level, and the last window size.
 package medit
 
 import "core:fmt"
@@ -48,6 +48,33 @@ zoom_pt_save :: proc(pt: f32) {
 	cfg_dir, _ := os.split_path(path)
 	_ = os.make_directory_all(cfg_dir)
 	_ = os.write_entire_file(path, transmute([]u8)fmt.tprintf("%.1f", pt))
+}
+
+// --- Window size (logical points; saved on quit, restored at startup) --------
+
+window_size_load :: proc() -> (w, h: int, ok: bool) {
+	path, pok := config_path("window")
+	if !pok {
+		return
+	}
+	data, rerr := os.read_entire_file(path, context.temp_allocator)
+	if rerr != nil {
+		return
+	}
+	ws, _, hs := strings.partition(strings.trim_space(string(data)), " ")
+	wv, wok := strconv.parse_int(strings.trim_space(ws))
+	hv, hok := strconv.parse_int(strings.trim_space(hs))
+	return wv, hv, wok && hok
+}
+
+window_size_save :: proc(w, h: int) {
+	path, pok := config_path("window")
+	if !pok {
+		return
+	}
+	cfg_dir, _ := os.split_path(path)
+	_ = os.make_directory_all(cfg_dir)
+	_ = os.write_entire_file(path, transmute([]u8)fmt.tprintf("%d %d", w, h))
 }
 
 impl App {

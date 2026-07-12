@@ -214,6 +214,7 @@ PALETTE_COMMANDS := []Palette_Command{
 	{"File: Open Folder…", "", proc(app: ^App) { open_folder_dialog() }},
 	{"File: Toggle Format on Save", "", proc(app: ^App) {
 		app.format_on_save = !app.format_on_save
+		_ = settings_save_key("editor", "format-on-save", "true" if app.format_on_save else "false")
 		app.set_status("format on save: on" if app.format_on_save else "format on save: off")
 	}},
 	{"File: Quit (Exit)", "ctrl+q", proc(app: ^App) { request_quit() }},
@@ -299,16 +300,19 @@ PALETTE_COMMANDS := []Palette_Command{
 	{"Language: HTML / XML", "", proc(app: ^App) { app.set_language(.HTML) }},
 	{"Settings: Cycle Tab Width (2/4/8)", "", proc(app: ^App) {
 		tab_w = 2 if tab_w == 8 else tab_w * 2
+		_ = settings_save_key("editor", "tab-width", fmt.tprintf("%d", tab_w))
 		app.set_status(fmt.tprintf("tab width: %d", tab_w))
 	}},
 	{"Settings: Toggle Smart Word Movement", "", proc(app: ^App) {
 		smart_word = !smart_word
+		_ = settings_save_key("editor", "smart-word", "true" if smart_word else "false")
 		app.set_status("word movement: smart (subwords)" if smart_word else "word movement: whole words")
 	}},
 	{"Settings: Open Settings", "", proc(app: ^App) { app.settings_open(project = false) }},
 	{"Settings: Open Project Settings", "", proc(app: ^App) { app.settings_open(project = true) }},
 	{"Settings: Toggle Outline Fields", "", proc(app: ^App) {
 		app.outline_fields = !app.outline_fields
+		_ = settings_save_key("editor", "outline-fields", "true" if app.outline_fields else "false")
 		app.set_status("outline: fields shown" if app.outline_fields else "outline: fields hidden")
 	}},
 	{"Theme: Tokyo Night", "", proc(app: ^App) { app.theme_apply("tokyo-night") }},
