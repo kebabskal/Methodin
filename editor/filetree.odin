@@ -225,23 +225,6 @@ sidebar_rows :: proc(sb: ^Sidebar, allocator := context.temp_allocator) -> []Tre
 	return rows[:]
 }
 
-// Right- (collapsed) or down-pointing (expanded) triangle built from rects,
-// so it needs nothing from the font atlas.
-@(private = "file")
-push_tri :: proc(r: ^Renderer, x, y_center, size: f32, expanded: bool, c: Color) {
-	STEPS :: 4
-	for i in 0 ..< STEPS {
-		frac := f32(STEPS - i) / STEPS
-		if expanded {
-			w := size * frac
-			push_rect(r, x+(size-w)*0.5, y_center-size*0.5+f32(i)*size*0.5/STEPS, w, size*0.5/STEPS+0.5, c)
-		} else {
-			h := size * frac
-			push_rect(r, x+f32(i)*size*0.5/STEPS, y_center-h*0.5, size*0.5/STEPS+0.5, h, c)
-		}
-	}
-}
-
 impl App {
 	// Row index (into sidebar_rows) under a sidebar pixel y; -1 for none/header.
 	sidebar_row_at :: proc(py: f32, line_h: f32) -> int {
@@ -374,7 +357,8 @@ impl App {
 			x := cell_w*1.6 + f32(row.depth)*cell_w*1.6
 			mid := y + row_h*0.5
 			if n.is_dir {
-				push_tri(r, x, mid, cell_w*0.55, n.expanded, theme.status_dim)
+				push_icon(r, x+cell_w*0.28-isz*0.5, mid-isz*0.5, isz,
+					.Chevron_Down if n.expanded else .Chevron_Right, theme.status_dim)
 			}
 			ix := x + cell_w*1.0
 			if n.is_dir {

@@ -11,7 +11,8 @@ import "core:strings"
 import gl "vendor:OpenGL"
 import stbtt "vendor:stb/truetype"
 
-// 2048² fits the ~190 packed glyphs up to ~40pt at 2× display scale.
+// 2048² fits the ~440 packed glyphs (two text faces + icons) up to ~40pt at
+// 2× display scale.
 ATLAS_W :: 2048
 ATLAS_H :: 2048
 ASCII_FIRST :: 32
@@ -20,6 +21,31 @@ LATIN1_FIRST :: 0xA0
 LATIN1_COUNT :: 96 // 0xA0..0xFF
 PUNCT_FIRST :: 0x2010 // dashes, curly quotes, bullet, ellipsis...
 PUNCT_COUNT :: 48 // 0x2010..0x203F
+
+// The few chrome icons, from the vendored Lucide icon font (vendor/lucide,
+// ISC). They pack into the same atlas as a sparse codepoint range.
+Icon :: enum {
+	Chevron_Right,
+	Chevron_Down,
+	Search,
+	Play,
+	Bug,
+	X,
+}
+
+// Codepoints from vendor/lucide/codepoints.json (Lucide 1.24.0).
+@(private = "file")
+ICON_CODEPOINTS := [Icon]rune {
+	.Chevron_Right = 0xE06F,
+	.Chevron_Down  = 0xE06D,
+	.Search        = 0xE151,
+	.Play          = 0xE13C,
+	.Bug           = 0xE20C,
+	.X             = 0xE1B2,
+}
+
+@(private = "file")
+LUCIDE_TTF := #load("../vendor/lucide/lucide.ttf")
 
 VERTEX_FLOATS :: 8 // x y u v r g b a
 
@@ -38,6 +64,8 @@ Renderer :: struct {
 	// the monospace face when no system UI font is found.
 	ui_ascii:  [ASCII_COUNT]stbtt.packedchar,
 	ui_latin1: [LATIN1_COUNT]stbtt.packedchar,
+	icons:     [len(Icon)]stbtt.packedchar,
+	icons_ok:  bool,
 	white_uv: [2]f32, // uv of a solid white pixel in the atlas
 
 	// Font metrics (pixels).
@@ -280,6 +308,20 @@ renderer_build_atlas :: proc(r: ^Renderer, font_px: f32) -> bool {
 			ui_ok = u1 != 0 && u2 != 0
 		}
 	}
+	// The icon face: a sparse range with just the glyphs the chrome uses.
+	icons: [len(Icon)]stbtt.packedchar
+	icon_cps: [len(Icon)]rune
+	for icon in Icon {
+		icon_cps[int(icon)] = ICON_CODEPOINTS[icon]
+	}
+	icon_range := stbtt.pack_range {
+		font_size                   = font_px,
+		array_of_unicode_codepoints = raw_data(icon_cps[:]),
+		num_chars                   = len(Icon),
+		chardata_for_range          = &icons[0],
+	}
+	icons_ok := stbtt.PackFontRanges(&spc, raw_data(LUCIDE_TTF), 0, &icon_range, 1) != 0
+
 	stbtt.PackEnd(&spc)
 	if ok1 == 0 || ok2 == 0 || ok3 == 0 {
 		return false // glyphs did not fit; keep the previous atlas
@@ -289,6 +331,8 @@ renderer_build_atlas :: proc(r: ^Renderer, font_px: f32) -> bool {
 	r.punct = punct
 	r.ui_ascii = ui_ascii if ui_ok else ascii
 	r.ui_latin1 = ui_latin1 if ui_ok else latin1
+	r.icons = icons
+	r.icons_ok = icons_ok
 	r.font_px = font_px
 
 	// Stamp a solid white block in the bottom-right corner for rect fills.
@@ -385,6 +429,29 @@ push_icon_folder :: proc(r: ^Renderer, x, y, size: f32, c: Color) {
 	tab_h := size * 0.22
 	push_rect(r, x, y+size*0.10, size*0.45, tab_h, c)
 	push_rect(r, x, y+size*0.10+tab_h*0.6, size*0.92, size*0.62, c)
+}
+
+// One Lucide glyph, its ink box centered in the square (x, y, size). Icons
+// pack at font_px like the text faces; other sizes scale the quad (the
+// atlas samples linearly). A hollow box if the icon face failed to pack.
+push_icon :: proc(r: ^Renderer, x, y, size: f32, icon: Icon, c: Color) {
+	if !r.icons_ok {
+		t: f32 = 1.0
+		push_rect(r, x, y, size, t, c)
+		push_rect(r, x, y+size-t, size, t, c)
+		push_rect(r, x, y, t, size, c)
+		push_rect(r, x+size-t, y, t, size, c)
+		return
+	}
+	xpos, ypos: f32
+	q: stbtt.aligned_quad
+	stbtt.GetPackedQuad(&r.icons[0], ATLAS_W, ATLAS_H, i32(icon), &xpos, &ypos, &q, false)
+	s := size / r.font_px
+	w := (q.x1 - q.x0) * s
+	h := (q.y1 - q.y0) * s
+	x0 := x + (size-w)*0.5
+	y0 := y + (size-h)*0.5
+	push_quad(r, x0, y0, x0+w, y0+h, q.s0, q.t0, q.s1, q.t1, c)
 }
 
 // Draw one glyph with its baseline at (x, baseline_y). Unknown runes render

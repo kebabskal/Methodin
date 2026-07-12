@@ -793,8 +793,14 @@ impl App {
 				x += r.cell_w
 			}
 		}
+		// A bug while a debug session is up, a play glyph otherwise; accent
+		// while something is live.
 		head_base := top + (head_h - line_h) * 0.5 + r.ascent
-		_ = utext_clip(r, cell_w, head_base, width * 0.5, ts.title, theme.status_dim)
+		hsz := line_h * 0.7
+		live := ts.running || self.dap_active()
+		push_icon(r, cell_w, top+(head_h-hsz)*0.5, hsz, .Bug if self.dap_active() else .Play,
+			color_alpha(theme.faces[.Function], 0.95) if live else theme.status_dim)
+		_ = utext_clip(r, cell_w+hsz+cell_w*0.7, head_base, width * 0.5, ts.title, theme.status_dim)
 
 		// Header buttons, right-aligned (built right-to-left): close, kill,
 		// and — while the debugger is stopped — the stepping controls.

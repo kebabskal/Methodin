@@ -118,6 +118,7 @@ Palette :: struct {
 	// Layout of the last draw, for mouse hit testing (pixels).
 	lx, ly, lw, lh: f32,
 	l_row0:         f32,
+	l_qx:           f32, // x where the query text starts (right of the search glyph)
 	l_vis:          int,
 }
 
@@ -1741,7 +1742,7 @@ impl App {
 		if py < p.l_row0 {
 			// Click in the input row: place the caret (collapses selection).
 			q := string(p.query[:])
-			ri := max(int((px-(p.lx+cell_w*1.5))/cell_w + 0.5), 0) // rune index
+			ri := max(int((px-p.l_qx)/cell_w + 0.5), 0) // rune index
 			off := 0
 			for _ in 0 ..< ri {
 				if off >= len(q) {
@@ -1880,9 +1881,13 @@ impl App {
 		push_rect(r, px, py, pw, ph, theme.status_bg)
 		push_rect(r, px+pad*0.5, py+(input_h-line_h)*0.5-3, pw-pad, line_h+6, theme.bg)
 
-		// Input: prefix in accent, rest normal, hint while empty.
+		// Input: a search glyph, then the prefix in accent, the rest normal,
+		// a hint while empty.
+		isz_q := line_h * 0.7
+		push_icon(r, px+pad*0.6, py+(input_h-isz_q)*0.5, isz_q, .Search, theme.status_dim)
 		q := string(p.query[:])
-		qx := px + pad
+		qx := px + pad*0.6 + isz_q + cell_w*0.6
+		p.l_qx = qx
 		qbase := py + (input_h-line_h)*0.5 + r.ascent
 		if lo, hi := self.palette_sel(); lo != hi {
 			sx := qx + f32(strings.rune_count(q[:lo]))*cell_w

@@ -385,7 +385,9 @@ impl App {
 			if self.doc_buf(i).is_dirty() {
 				push_disc(r, cx+cell_w*0.5, tabbar_h*0.5, cell_w*0.32, theme.faces[.Number])
 			} else {
-				push_glyph(r, cx, baseline, '×', color_alpha(color, 0.8))
+				xsz := line_h * 0.55
+				push_icon(r, cx+cell_w*0.5-xsz*0.5, (tabbar_h-xsz)*0.5, xsz, .X,
+					color_alpha(color, 0.8))
 			}
 		}
 
@@ -399,7 +401,8 @@ impl App {
 		if hovered {
 			push_rect(r, win_close[0], 0, close_w, tabbar_h-1, Color{0.83, 0.18, 0.18, 1.0})
 		}
-		push_glyph(r, width-close_w*0.5-cell_w*0.5, baseline, '×',
+		wsz := line_h * 0.6
+		push_icon(r, width-close_w*0.5-wsz*0.5, (tabbar_h-1-wsz)*0.5, wsz, .X,
 			Color{1, 1, 1, 1} if hovered else theme.status_fg)
 	}
 }

@@ -14,7 +14,10 @@ the editor's own internals use in-struct procs and `impl` blocks throughout
   and resizable window edges, all drawn by the editor itself. Closing with
   unsaved files takes a confirming second attempt. UI chrome (tabs, file
   tree, status bar, panel titles) renders in the system's proportional UI
-  font (`MEDIT_UI_FONT` overrides); the buffer stays monospace.
+  font (`MEDIT_UI_FONT` overrides); the buffer stays monospace. The few
+  chrome icons (chevrons, search, play/bug, ×) come from the
+  [Lucide](https://lucide.dev) icon font, vendored under `vendor/lucide/`
+  (ISC license) and compiled into the binary.
 - **Tabs** — every file opens in its own tab with its own undo history,
   cursors, scroll position and selection history. Click to switch, `×` or
   middle-click to close (a dirty file shows a dot instead of `×`, and closing
