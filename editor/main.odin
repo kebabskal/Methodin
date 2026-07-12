@@ -166,6 +166,13 @@ main :: proc() {
 	defer sdl.DestroyWindow(window)
 	main_window = window
 
+	// Taskbar/alt-tab icon, rasterized from the vendored icon font.
+	icon_px := app_icon_pixels(64, context.temp_allocator)
+	if icon := sdl.CreateSurfaceFrom(64, 64, .RGBA32, raw_data(icon_px), 64*4); icon != nil {
+		_ = sdl.SetWindowIcon(window, icon)
+		sdl.DestroySurface(icon)
+	}
+
 	glctx := sdl.GL_CreateContext(window)
 	if glctx == nil {
 		fmt.eprintfln("medit: GL context failed: %s", sdl.GetError())

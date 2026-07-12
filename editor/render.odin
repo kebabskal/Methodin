@@ -4,6 +4,7 @@
 // for an alternative (e.g. terminal) backend later.
 package medit
 
+import "core:c"
 import "core:fmt"
 import "core:math"
 import "core:os"
@@ -425,6 +426,50 @@ push_disc :: proc(r: ^Renderer, cx, cy, radius: f32, c: Color) {
 		half := math.sqrt(max(radius*radius - ymid*ymid, 0))
 		push_rect(r, cx-half, cy+y0, half*2, step+0.4, c)
 	}
+}
+
+// The window icon: Lucide's file-pen-line glyph on a dark rounded square,
+// rasterized from the vendored font. RGBA bytes, size×size; corners go
+// transparent outside the plate.
+app_icon_pixels :: proc(size: int, allocator := context.allocator) -> []u8 {
+	px := make([]u8, size*size*4, allocator)
+
+	info: stbtt.fontinfo
+	glyph: [^]byte
+	gw, gh: c.int
+	if stbtt.InitFont(&info, raw_data(LUCIDE_TTF), 0) {
+		scale := stbtt.ScaleForPixelHeight(&info, f32(size)*0.8)
+		xo, yo: c.int
+		glyph = stbtt.GetCodepointBitmap(&info, scale, scale, 0xE320, &gw, &gh, &xo, &yo)
+	}
+	defer if glyph != nil {
+		stbtt.FreeBitmap(glyph, nil)
+	}
+
+	bg := [3]f32{0x1a, 0x1b, 0x26} // tokyo night, the brand look regardless of theme
+	fg := [3]f32{0x7a, 0xa2, 0xf7}
+	radius := f32(size) * 0.19
+	ox := (size - int(gw)) / 2
+	oy := (size - int(gh)) / 2
+	for y in 0 ..< size {
+		for x in 0 ..< size {
+			// The plate: a rounded square, edges antialiased over one pixel.
+			dx := max(radius - f32(x), f32(x) - (f32(size-1) - radius), 0)
+			dy := max(radius - f32(y), f32(y) - (f32(size-1) - radius), 0)
+			cover := clamp(radius + 1 - math.sqrt(dx*dx+dy*dy), 0, 1)
+			a: f32 = 0
+			if gx, gy := x - ox, y - oy;
+			   glyph != nil && gx >= 0 && gx < int(gw) && gy >= 0 && gy < int(gh) {
+				a = f32(glyph[gy*int(gw)+gx]) / 255
+			}
+			i := (y*size + x) * 4
+			px[i+0] = u8(bg[0] + (fg[0]-bg[0])*a)
+			px[i+1] = u8(bg[1] + (fg[1]-bg[1])*a)
+			px[i+2] = u8(bg[2] + (fg[2]-bg[2])*a)
+			px[i+3] = u8(255 * cover)
+		}
+	}
+	return px
 }
 
 // One Lucide glyph, its ink box centered in the square (x, y, size). Icons
