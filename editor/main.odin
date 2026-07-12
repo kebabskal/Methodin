@@ -252,6 +252,7 @@ main :: proc() {
 		lsp_update(&app)
 		lsp_poll(&app)
 		task_poll(&app)
+		dap_poll(&app)
 		app.format_save_tick()
 		app.lsp_hover_tick(rend.cell_w, rend.line_h)
 
@@ -512,6 +513,10 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 				app.problems_click(px, py)
 			} else if px < app.sidebar_px {
 				app.sidebar_click(py, rend.line_h)
+			} else if px < app.gutter_px-rend.cell_w {
+				// The gutter: toggle a breakpoint on that line.
+				line := clamp(int((py-app.tabbar_h+app.scroll_y)/rend.line_h), 0, app.buf.line_count()-1)
+				app.breakpoint_toggle(app.buf.path, line)
 			} else {
 				mods := sdl.GetModState()
 				p := app.pos_at_pixel(px, py, rend.cell_w, rend.line_h)
@@ -534,6 +539,10 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		} else if ev.button.button == sdl.BUTTON_RIGHT && !app.palette.open {
 			if py < app.tabbar_h {
 				app.tabbar_click(px, rend.cell_w, 2)
+			} else if app.task.open && py >= app.task.top {
+				app.task_context(px, py)
+			} else if app.problems_open && py >= app.problems_top {
+				// No context menu; must not fall through to the editor text.
 			} else if px < app.sidebar_px {
 				app.sidebar_context(py, rend.line_h)
 			} else {
@@ -547,6 +556,7 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 
 	case .MOUSE_BUTTON_UP:
 		if ev.button.button == sdl.BUTTON_LEFT {
+			app.task_drag_end(ev.button.x*density, ev.button.y*density, rend.cell_w)
 			app.mouse_up()
 		}
 
@@ -852,6 +862,24 @@ handle_key :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.Eve
 		follow = false
 	case ctrl && key == sdl.K_R:
 		app.task_run_default()
+		follow = false
+	case key == sdl.K_F9:
+		app.breakpoint_toggle_at_cursor()
+		follow = false
+	case shift && key == sdl.K_F5:
+		app.dap_stop()
+		follow = false
+	case key == sdl.K_F5:
+		app.dap_f5()
+		follow = false
+	case key == sdl.K_F10:
+		app.dap_resume("next")
+		follow = false
+	case shift && key == sdl.K_F11:
+		app.dap_resume("stepOut")
+		follow = false
+	case key == sdl.K_F11:
+		app.dap_resume("stepIn")
 		follow = false
 	case ctrl && key == sdl.K_A:
 		app.select_all()

@@ -76,6 +76,24 @@ the editor's own internals use in-struct procs and `impl` blocks throughout
   straight to the spot, and the exit code lands in the title and status bar.
   While a task runs, a spinner with its name sits in the status bar and the
   panel header grows a `kill` button (`close` hides the panel).
+- **Debugging (DAP)** — breakpoints, stepping and runtime-error stops via
+  the Debug Adapter Protocol (`lldb-dap` on PATH by default, `MEDIT_DAP`
+  overrides — the same stdio-JSON shape as the LSP client). A task with
+  `debug = true` and `program = path` builds (its `cmd`) and then launches
+  the program under the adapter. `F9` (or a click in the gutter) toggles a
+  breakpoint, `F5` continues or starts the debug task, `F10`/`F11`/
+  `shift+F11` step over/in/out, `shift+F5` stops — and while stopped the
+  output panel header grows clickable `continue over in out` buttons next
+  to `kill`. Stops highlight the line (marker in the gutter's breakpoint
+  column), jump to it, and print the call stack (each frame a clickable
+  file reference) plus the locals into the panel; hovering an expression
+  in the source shows its runtime value. Panics and bounds-check traps
+  stop like breakpoints, and program output arrives in the same panel.
+  `odin_lldb.py` (next to the medit binary) teaches LLDB to render Odin
+  strings as text and slices/dynamic arrays as their elements — use it from
+  plain lldb (`command script import .../odin_lldb.py`); set
+  `MEDIT_DAP_FORMATTERS=1` to auto-load it into debug sessions once your
+  lldb-dap survives script imports (22.1.8 on Windows crashes on them).
 - **Settings** — `>Settings: Open Settings` (user-wide, in the user config
   directory) and `>Settings: Open Project Settings` (`.medit/settings.ini`);
   both created from a template on first use, re-read on save, focus and
@@ -167,6 +185,9 @@ at runtime (the current buffer survives the move).
 | `ctrl++` / `ctrl+-` / `ctrl+0` | font size up / down / reset (also ctrl+wheel) |
 | `ctrl+b` | toggle the file tree sidebar |
 | `ctrl+r` / `ctrl+shift+r` | run default task (restart if running) / pick a task |
+| `F9` / gutter click | toggle breakpoint |
+| `F5` / `shift+F5` | continue (or start the debug task) / stop debugging |
+| `F10` / `F11` / `shift+F11` | step over / into / out |
 | `ctrl+n` | new untitled tab |
 | `ctrl+o` | open file (system dialog) |
 | `ctrl+s` | save (untitled: system save dialog) |

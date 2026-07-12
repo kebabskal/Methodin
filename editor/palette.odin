@@ -86,6 +86,7 @@ Palette :: struct {
 	forced_mode: int,    // ≥ 0: use this mode regardless of query prefix (context menu)
 	ctx_path:    string, // owned; file the context menu is about ("" = editor context)
 	ctx_is_dir:  bool,   // the context path is a directory ("." = the workspace root)
+	ctx_local:   int,    // index into dap.locals for the locals context menu (-1 none)
 	ctx_pos:     Pos,    // symbol position for the rename mode
 	keep_open:   bool,   // an accept proc re-opened the palette; skip the close
 	home_doc:    int,    // tab the palette was opened from (esc returns there)
@@ -175,6 +176,39 @@ PALETTE_COMMANDS := []Palette_Command{
 		}
 	}},
 	{"Tasks: Configure (.medit/tasks.ini)", "", proc(app: ^App) { app.task_edit_config() }},
+	{"Tasks: Copy Output", "", proc(app: ^App) {
+		sb := strings.builder_make(context.temp_allocator)
+		for l in app.task.lines {
+			strings.write_string(&sb, l)
+			strings.write_byte(&sb, '\n')
+		}
+		clipboard_set(strings.to_string(sb))
+		app.set_status(fmt.tprintf("copied %d lines", len(app.task.lines)))
+	}},
+	{"Debug: Copy Call Stack", "", proc(app: ^App) {
+		sb := strings.builder_make(context.temp_allocator)
+		for f, i in app.dap.frames {
+			strings.write_string(&sb, fmt.tprintf("#%d %s — %s(%d)\n", i, f.name, f.path, f.line) if f.path != "" else fmt.tprintf("#%d %s\n", i, f.name))
+		}
+		clipboard_set(strings.to_string(sb))
+		app.set_status(fmt.tprintf("copied %d frames", len(app.dap.frames)))
+	}},
+	{"Debug: Copy Locals", "", proc(app: ^App) {
+		sb := strings.builder_make(context.temp_allocator)
+		for v in app.dap.locals {
+			strings.write_string(&sb, fmt.tprintf("%s = %s\n", v.name, v.value))
+		}
+		clipboard_set(strings.to_string(sb))
+		app.set_status(fmt.tprintf("copied %d locals", len(app.dap.locals)))
+	}},
+	{"Problems: Copy All", "", proc(app: ^App) {
+		sb := strings.builder_make(context.temp_allocator)
+		for d in app.problems {
+			strings.write_string(&sb, fmt.tprintf("%s %s:%d %s\n", severity_letter(d.severity), d.path, d.line+1, d.msg))
+		}
+		clipboard_set(strings.to_string(sb))
+		app.set_status(fmt.tprintf("copied %d problems", len(app.problems)))
+	}},
 	{"File: Close Tab", "ctrl+w", proc(app: ^App) { app.tab_close(app.active) }},
 	{"File: Open Folder…", "", proc(app: ^App) { open_folder_dialog() }},
 	{"File: Toggle Format on Save", "", proc(app: ^App) {
@@ -789,6 +823,10 @@ accept_nothing :: proc(app: ^App, it: ^Palette_Item) {
 @(private = "file")
 Ctx_Action :: enum {
 	Open_File,
+	Local_Goto,
+	Local_Copy_Value,
+	Local_Copy_Pair,
+	Locals_Copy_All,
 	New_File,
 	New_Folder,
 	Rename_Path,
@@ -842,7 +880,14 @@ context_refresh :: proc(app: ^App, q: string) {
 	}
 	entries := make([dynamic]Entry, context.temp_allocator)
 
-	if len(p.ctx_path) > 0 {
+	if p.ctx_local >= 0 && p.ctx_local < len(app.dap.locals) {
+		// A debugger local (right-click in the panel's locals column).
+		v := &app.dap.locals[p.ctx_local]
+		append(&entries, Entry{fmt.tprintf("Go to Declaration of %s", v.name), .Local_Goto})
+		append(&entries, Entry{"Copy Value", .Local_Copy_Value})
+		append(&entries, Entry{fmt.tprintf("Copy %s = …", v.name), .Local_Copy_Pair})
+		append(&entries, Entry{"Copy All Locals", .Locals_Copy_All})
+	} else if len(p.ctx_path) > 0 {
 		// File or directory context (sidebar right-click, or ctrl+. on a
 		// palette file item). "." is the workspace root row.
 		is_root := p.ctx_path == "."
@@ -916,6 +961,26 @@ context_accept :: proc(app: ^App, it: ^Palette_Item) {
 	switch action {
 	case .Open_File:
 		app.open_file(p.ctx_path)
+	case .Local_Goto:
+		app.dap_local_goto(p.ctx_local)
+	case .Local_Copy_Value:
+		if p.ctx_local >= 0 && p.ctx_local < len(app.dap.locals) {
+			clipboard_set(app.dap.locals[p.ctx_local].value)
+			app.set_status("value copied")
+		}
+	case .Local_Copy_Pair:
+		if p.ctx_local >= 0 && p.ctx_local < len(app.dap.locals) {
+			v := &app.dap.locals[p.ctx_local]
+			clipboard_set(fmt.tprintf("%s = %s", v.name, v.value))
+			app.set_status("copied")
+		}
+	case .Locals_Copy_All:
+		sb := strings.builder_make(context.temp_allocator)
+		for v in app.dap.locals {
+			strings.write_string(&sb, fmt.tprintf("%s = %s\n", v.name, v.value))
+		}
+		clipboard_set(strings.to_string(sb))
+		app.set_status(fmt.tprintf("copied %d locals", len(app.dap.locals)))
 	case .New_File, .New_Folder:
 		// Create in the directory itself, or next to the file.
 		dir := p.ctx_path if p.ctx_is_dir else p.ctx_path[:max(base_start(p.ctx_path)-1, 0)]
@@ -1358,6 +1423,7 @@ impl App {
 	open_context_editor :: proc() {
 		delete(palette.ctx_path)
 		palette.ctx_path = ""
+		palette.ctx_local = -1
 		self.palette_open_with("", forced = PALETTE_MODE_CONTEXT)
 	}
 
@@ -1368,6 +1434,15 @@ impl App {
 		delete(palette.ctx_path)
 		palette.ctx_path = np
 		palette.ctx_is_dir = is_dir
+		palette.ctx_local = -1
+		self.palette_open_with("", forced = PALETTE_MODE_CONTEXT)
+	}
+
+	// Context actions for a debugger local (locals column right-click).
+	open_context_local :: proc(i: int) {
+		delete(palette.ctx_path)
+		palette.ctx_path = ""
+		palette.ctx_local = i
 		self.palette_open_with("", forced = PALETTE_MODE_CONTEXT)
 	}
 
@@ -1628,6 +1703,7 @@ impl App {
 		p.forced_mode = -1
 		delete(p.ctx_path)
 		p.ctx_path = ""
+		p.ctx_local = -1
 		p.fileop = .None
 		delete(p.confirm_delete) // closing the menu resets the delete arm
 		p.confirm_delete = ""

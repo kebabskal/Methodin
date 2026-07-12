@@ -1131,9 +1131,6 @@ impl App {
 		if hover_state != .Idle || !hover_armed || palette.open {
 			return
 		}
-		if lsp.state != .Ready || lsp.open_uri == "" {
-			return
-		}
 		if now_ms - mouse_moved_ms < HOVER_DELAY_MS {
 			return
 		}
@@ -1142,6 +1139,14 @@ impl App {
 		}
 		p := self.pos_at_pixel(mouse_x, mouse_y, cell_w, line_h)
 		if char_class(buf.rune_at(p)) != 1 {
+			return
+		}
+		// While the debugger is stopped, hover shows the runtime value of
+		// the expression under the mouse instead of the LSP signature.
+		if dap.state == .Stopped && self.dap_hover_request(p) {
+			return
+		}
+		if lsp.state != .Ready || lsp.open_uri == "" {
 			return
 		}
 		hover_pos = p

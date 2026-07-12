@@ -90,6 +90,11 @@ App :: struct {
 	// Project tasks (ctrl+r) and their output panel (tasks.odin).
 	task: Task_State,
 
+	// Debugging (dap.odin): the adapter session and the breakpoints, which
+	// outlive sessions (set them first, debug later).
+	dap:         Dap,
+	breakpoints: [dynamic]Breakpoint,
+
 	problems:        [dynamic]Diagnostic,
 	problems_open:   bool,
 	problems_scroll: f32, // first visible row (fractional while wheeling)
@@ -158,6 +163,7 @@ app_init :: proc(app: ^App, path: string) {
 		b = buffer_make()
 	}
 	app.doc_append(b, lang)
+	app.task.drag_from = -1
 	settings_load(app) // before the tree first loads: [files] hide filters it
 	sidebar_init(&app.sidebar)
 }
@@ -188,6 +194,11 @@ app_destroy :: proc(app: ^App) {
 	delete(app.odin_root_dir)
 	problems_destroy(app)
 	tasks_destroy(&app.task)
+	dap_destroy(&app.dap)
+	for b in app.breakpoints {
+		delete(b.path)
+	}
+	delete(app.breakpoints)
 }
 
 impl App {
@@ -1291,7 +1302,9 @@ impl App {
 		tabbar_h = line_h * 2.1
 		sidebar_px = min(SIDEBAR_CELLS*cell_w, width*0.35) if sidebar.visible else 0
 		gutter_digits := count_digits(buf.line_count())
-		gutter_cells := f32(gutter_digits + 2)
+		// Two extra cells on the left make room for the breakpoint disc and
+		// the debugger's stop marker next to the line numbers.
+		gutter_cells := f32(gutter_digits + 4)
 		gutter_px = sidebar_px + gutter_cells*cell_w
 		view_w = width - gutter_px
 		problems_h = 0
@@ -1313,6 +1326,12 @@ impl App {
 		if len(cursors) == 1 && !cursor_has_selection(cursors[0]) {
 			y := tabbar_h + f32(cursors[0].head.line)*line_h - scroll_y
 			push_rect(r, sidebar_px, y, width-sidebar_px, line_h, theme.current_line)
+		}
+
+		// The debugger's stop line.
+		if dap.stop_line >= 0 && dap.stop_path == buf.path {
+			y := tabbar_h + f32(dap.stop_line)*line_h - scroll_y
+			push_rect(r, sidebar_px, y, width-sidebar_px, line_h, color_alpha(theme.diag_warn, 0.16))
 		}
 
 		// Selections.
@@ -1344,6 +1363,15 @@ impl App {
 		for line in first_line ..= last_line {
 			y := tabbar_h + f32(line)*line_h - scroll_y
 			baseline := y + r.ascent + (line_h-r.line_h)*0.5
+
+			// Breakpoint disc and the debugger's stop marker, in the marker
+			// column the gutter reserves left of the line numbers.
+			if self.breakpoint_at(buf.path, line) {
+				push_disc(r, sidebar_px+cell_w*1.0, y+line_h*0.5, cell_w*0.34, theme.diag_err)
+			}
+			if dap.stop_line == line && dap.stop_path == buf.path {
+				push_glyph(r, sidebar_px+cell_w*1.8, baseline, '>', theme.diag_warn)
+			}
 
 			// Line number, right-aligned in the gutter.
 			num := fmt.tprintf("%d", line+1)
@@ -1465,12 +1493,18 @@ impl App {
 			rx -= f32(len(counts)+2) * cell_w
 			draw_str(r, rx, baseline, counts, theme.diag_err if errs > 0 else theme.diag_warn)
 		}
-		if task.running {
-			// A live task spins here even with its output panel closed.
+		if task.running || self.dap_active() {
+			// A live task (or debug session) shows here even with the output
+			// panel closed: a spinner while running, "||" while stopped.
 			spinner := [4]string{"|", "/", "-", "\\"}
-			run := fmt.tprintf("%s %s", spinner[now_ms/120%4], task.last)
+			ind := spinner[now_ms/120%4]
+			if dap.state == .Stopped {
+				ind = "||"
+			}
+			run := fmt.tprintf("%s %s", ind, task.last)
 			rx -= f32(len(run)+2) * cell_w
-			draw_str(r, rx, baseline, run, theme.faces[.Function])
+			draw_str(r, rx, baseline, run,
+				theme.diag_warn if dap.state == .Stopped else theme.faces[.Function])
 		}
 	}
 }

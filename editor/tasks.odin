@@ -35,17 +35,39 @@ cmd = odin run ${workspaceFolder}
 ; [test]
 ; cmd = odin test ${fileDir}
 ; cwd = ${workspaceFolder}
+
+; A debug task: cmd builds, then program launches under the debug adapter
+; (lldb-dap on PATH; MEDIT_DAP overrides). F9 toggles breakpoints, F5
+; continues, F10/F11 step.
+; [debug]
+; cmd = odin build ${workspaceFolder} -debug -out:dev.exe
+; program = dev.exe
+; debug = true
 `
 
 Task :: struct {
-	name: string, // owned; the section name
-	cmd:  string, // owned
-	cwd:  string, // owned; "" = the workspace directory
+	name:    string, // owned; the section name
+	cmd:     string, // owned
+	cwd:     string, // owned; "" = the workspace directory
+	program: string, // owned; executable a debug task launches under the adapter
+	debug:   bool,   // run program under the debugger after cmd succeeds
+}
+
+// One line into the output panel (tasks and the debugger share it).
+task_append_line :: proc(ts: ^Task_State, line: string) {
+	if len(ts.lines) < OUTPUT_MAX_LINES {
+		append(&ts.lines, strings.clone(line))
+	}
 }
 
 Task_State :: struct {
 	tasks: [dynamic]Task,
 	last:  string, // owned; name of the last-started task (ctrl+r restarts it while it runs)
+
+	// A debug task's build step ran; launch this under the adapter when it
+	// succeeds (owned; "" = nothing pending).
+	pending_debug_program: string,
+	pending_debug_cwd:     string,
 
 	// The live run.
 	running: bool,
@@ -60,16 +82,37 @@ Task_State :: struct {
 	scroll:  f32,
 	follow:  bool, // pinned to the bottom while output arrives
 	top, h:  f32,  // layout of the last draw (hit testing)
-	head_bot:           f32, // bottom edge of the header row
-	row_h:              f32,
-	kill_x0, kill_x1:   f32, // header "kill" button (while running)
-	close_x0, close_x1: f32, // header "close" button
+	head_bot: f32, // bottom edge of the header row
+	row_h:    f32,
+	btns:     [dynamic]Panel_Btn, // header buttons of the last draw
 
-	// Hover feedback: the link span or header button under the mouse.
+	// Debug columns (0 = not shown): call stack and locals, right of output.
+	stack_x0:  f32,
+	locals_x0: f32,
+
+	// Row drag-selection in the output (terminal-style: release copies).
+	drag_from: int, // -1 = no drag
+	drag_to:   int,
+
+	// Hover feedback: the link span, header button or frame under the mouse.
 	hover_row:          int, // -1 = none
 	hover_lo, hover_hi: int, // byte span within lines[hover_row]
-	hover_btn:          int, // 0 none, 1 kill, 2 close
+	hover_btn:          int, // Panel_Btn id under the mouse (0 none)
+	hover_frame:        int, // call-stack frame index (-1 none)
 }
+
+// A clickable word in the panel header (kill/close, debug stepping).
+Panel_Btn :: struct {
+	x0, x1: f32,
+	id:     int,
+}
+
+PBTN_KILL :: 1
+PBTN_CLOSE :: 2
+PBTN_CONTINUE :: 3
+PBTN_OVER :: 4
+PBTN_IN :: 5
+PBTN_OUT :: 6
 
 @(private = "file")
 tasks_clear :: proc(ts: ^Task_State) {
@@ -77,6 +120,7 @@ tasks_clear :: proc(ts: ^Task_State) {
 		delete(t.name)
 		delete(t.cmd)
 		delete(t.cwd)
+		delete(t.program)
 	}
 	clear(&ts.tasks)
 }
@@ -97,6 +141,9 @@ tasks_destroy :: proc(ts: ^Task_State) {
 	}
 	delete(ts.lines)
 	delete(ts.partial)
+	delete(ts.btns)
+	delete(ts.pending_debug_program)
+	delete(ts.pending_debug_cwd)
 }
 
 // Parse tasks out of ini source (separate from the file read for testing).
@@ -126,13 +173,19 @@ tasks_parse :: proc(ts: ^Task_State, src: string) {
 		case "cwd":
 			delete(t.cwd)
 			t.cwd = strings.clone(value)
+		case "program":
+			delete(t.program)
+			t.program = strings.clone(value)
+		case "debug":
+			t.debug = value == "true" || value == "1"
 		}
 	}
-	// A section without a cmd runs nothing; drop it.
+	// A section that neither runs nor debugs anything is dropped.
 	for i := len(ts.tasks) - 1; i >= 0; i -= 1 {
-		if ts.tasks[i].cmd == "" {
+		if ts.tasks[i].cmd == "" && !(ts.tasks[i].debug && ts.tasks[i].program != "") {
 			delete(ts.tasks[i].name)
 			delete(ts.tasks[i].cwd)
+			delete(ts.tasks[i].program)
 			ordered_remove(&ts.tasks, i)
 		}
 	}
@@ -204,13 +257,11 @@ Task_Link :: struct {
 }
 
 // Callers validate with all_digits first.
-@(private = "file")
 to_int :: proc(s: string) -> int {
 	n, _ := strconv.parse_int(s)
 	return n
 }
 
-@(private = "file")
 all_digits :: proc(s: string) -> bool {
 	if len(s) == 0 {
 		return false
@@ -315,7 +366,9 @@ task_scan_links :: proc(s: string, out: ^[dynamic]Task_Link) {
 }
 
 impl App {
-	// Launch tasks[i]; a still-running previous task is killed first.
+	// Launch tasks[i]; a still-running previous task (or debug session) is
+	// killed first. A debug task runs its cmd (the build) and hands program
+	// to the debug adapter once it exits 0 — or straight away without a cmd.
 	task_run :: proc(i: int) {
 		ts := &task
 		if i < 0 || i >= len(ts.tasks) {
@@ -330,14 +383,37 @@ impl App {
 			}
 			ts.running = false
 		}
+		self.dap_finish()
+		delete(ts.pending_debug_program)
+		ts.pending_debug_program = ""
+		delete(ts.pending_debug_cwd)
+		ts.pending_debug_cwd = ""
+
 		t := &ts.tasks[i]
 		ws, _ := os.get_working_directory(context.temp_allocator)
 		file := abs_path(buf.path) if buf.path != "" else ""
+		cwd := task_expand(t.cwd, file, ws) if t.cwd != "" else ""
+		if t.debug {
+			if t.program == "" {
+				self.set_status("debug task needs a program = path")
+				return
+			}
+			prog := task_expand(t.program, file, ws)
+			delete(ts.last)
+			ts.last = strings.clone(t.name)
+			if t.cmd == "" {
+				self.dap_launch(prog, cwd)
+				return
+			}
+			ts.pending_debug_program = strings.clone(prog)
+			ts.pending_debug_cwd = strings.clone(cwd)
+			// The build runs below like any task; task_poll launches the
+			// debugger when it exits 0.
+		}
 		args := task_split(task_expand(t.cmd, file, ws))
 		if len(args) == 0 {
 			return
 		}
-		cwd := task_expand(t.cwd, file, ws) if t.cwd != "" else ""
 
 		out_r, out_w, perr := os.pipe()
 		if perr != nil {
@@ -396,9 +472,15 @@ impl App {
 
 	task_stop :: proc() {
 		ts := &task
+		if self.dap_active() {
+			self.dap_stop()
+			return
+		}
 		if !ts.running {
 			return
 		}
+		delete(ts.pending_debug_program) // a killed build launches nothing
+		ts.pending_debug_program = ""
 		_ = os.process_kill(ts.process)
 		self.set_status("task: killed")
 		// task_poll reaps it and stamps the title.
@@ -428,16 +510,32 @@ impl App {
 		ts := &task
 		ts.hover_row = -1
 		ts.hover_btn = 0
+		ts.hover_frame = -1
 		if !ts.open || py < ts.top || py >= ts.top+ts.h {
 			return false
 		}
 		if py < ts.head_bot {
-			if ts.running && px >= ts.kill_x0 && px < ts.kill_x1 {
-				ts.hover_btn = 1
-			} else if px >= ts.close_x0 && px < ts.close_x1 {
-				ts.hover_btn = 2
+			for b in ts.btns {
+				if px >= b.x0 && px < b.x1 {
+					ts.hover_btn = b.id
+					break
+				}
 			}
 			return ts.hover_btn != 0
+		}
+		if ts.drag_from >= 0 {
+			ts.drag_to = clamp(int(ts.scroll)+int((py-ts.head_bot)/ts.row_h), 0, max(len(ts.lines)-1, 0))
+			return false
+		}
+		if ts.stack_x0 > 0 && px >= ts.stack_x0 {
+			if px < ts.locals_x0 {
+				fi := int((py-ts.head_bot)/ts.row_h) - 1 // row 0 is the header
+				if fi >= 0 && fi+1 < OUTPUT_VISIBLE && fi < len(dap.frames) && dap.frames[fi].path != "" {
+					ts.hover_frame = fi
+					return true
+				}
+			}
+			return false
 		}
 		row := int(ts.scroll) + int((py-ts.head_bot)/ts.row_h)
 		if row < 0 || row >= len(ts.lines) {
@@ -463,10 +561,33 @@ impl App {
 	task_click :: proc(px, py: f32, cell_w: f32) {
 		ts := &task
 		if py < ts.head_bot {
-			if ts.running && px >= ts.kill_x0 && px < ts.kill_x1 {
-				self.task_stop()
-			} else if px >= ts.close_x0 && px < ts.close_x1 {
-				ts.open = false
+			for b in ts.btns {
+				if px < b.x0 || px >= b.x1 {
+					continue
+				}
+				switch b.id {
+				case PBTN_KILL:
+					self.task_stop()
+				case PBTN_CLOSE:
+					ts.open = false
+				case PBTN_CONTINUE:
+					self.dap_resume("continue")
+				case PBTN_OVER:
+					self.dap_resume("next")
+				case PBTN_IN:
+					self.dap_resume("stepIn")
+				case PBTN_OUT:
+					self.dap_resume("stepOut")
+				}
+				break
+			}
+			return
+		}
+		if ts.stack_x0 > 0 && px >= ts.stack_x0 {
+			if px < ts.locals_x0 {
+				self.dap_select_frame(int((py-ts.head_bot)/ts.row_h) - 1)
+			} else {
+				self.dap_local_goto(int((py-ts.head_bot)/ts.row_h) - 1)
 			}
 			return
 		}
@@ -474,7 +595,47 @@ impl App {
 		if row < 0 || row >= len(ts.lines) {
 			return
 		}
-		line := ts.lines[row]
+		// A drag starts here; mouse-up decides click (link) vs copy.
+		ts.drag_from = row
+		ts.drag_to = row
+	}
+
+	// Right-click on the panel: a context menu for the local under the
+	// mouse (elsewhere it just swallows the click).
+	task_context :: proc(px, py: f32) {
+		ts := &task
+		if ts.locals_x0 > 0 && px >= ts.locals_x0 && py >= ts.head_bot {
+			i := int((py-ts.head_bot)/ts.row_h) - 1 // row 0 is the header
+			if i >= 0 && i < len(dap.locals) {
+				self.open_context_local(i)
+			}
+		}
+	}
+
+	// Mouse-up over the panel: a plain click opens a file link; a row drag
+	// copies the selected lines to the clipboard.
+	task_drag_end :: proc(px, py: f32, cell_w: f32) {
+		ts := &task
+		from := ts.drag_from
+		ts.drag_from = -1
+		if from < 0 {
+			return
+		}
+		lo, hi := min(from, ts.drag_to), max(from, ts.drag_to)
+		if lo != hi {
+			sb := strings.builder_make(context.temp_allocator)
+			for i in lo ..= min(hi, len(ts.lines)-1) {
+				strings.write_string(&sb, ts.lines[i])
+				strings.write_byte(&sb, '\n')
+			}
+			clipboard_set(strings.to_string(sb))
+			self.set_status(fmt.tprintf("copied %d lines", hi-lo+1))
+			return
+		}
+		if from >= len(ts.lines) {
+			return
+		}
+		line := ts.lines[from]
 		off := task_cell_to_offset(line, px, cell_w)
 		links := make([dynamic]Task_Link, context.temp_allocator)
 		task_scan_links(line, &links)
@@ -541,25 +702,39 @@ impl App {
 		head_base := top + (head_h-line_h)*0.5 + r.ascent
 		draw_str(r, cell_w, head_base, ts.title, theme.status_dim)
 
-		// Header buttons, right-aligned: kill (while running) and close.
+		// Header buttons, right-aligned (built right-to-left): close, kill,
+		// and — while the debugger is stopped — the stepping controls.
 		ts.head_bot = top + head_h
-		bx := width - cell_w - f32(len("close"))*cell_w
-		ts.close_x0 = bx
-		ts.close_x1 = bx + f32(len("close"))*cell_w
-		draw_str(r, bx, head_base, "close", theme.fg if ts.hover_btn == 2 else theme.status_dim)
-		if ts.hover_btn == 2 {
-			push_rect(r, bx, head_base+3, f32(len("close"))*cell_w, 1, theme.status_dim)
-		}
-		ts.kill_x0 = 0
-		ts.kill_x1 = 0
-		if ts.running {
-			bx -= f32(len("kill")+3)*cell_w
-			ts.kill_x0 = bx
-			ts.kill_x1 = bx + f32(len("kill"))*cell_w
-			draw_str(r, bx, head_base, "kill", theme.diag_err)
-			if ts.hover_btn == 1 {
-				push_rect(r, bx, head_base+3, f32(len("kill"))*cell_w, 1, theme.diag_err)
+		clear(&ts.btns)
+		bx := width - cell_w
+		put_btn :: proc(ts: ^Task_State, r: ^Renderer, bx: ^f32, head_base: f32, label: string, id: int, color: Color, t: ^Theme) {
+			w := f32(len(label)) * r.cell_w
+			bx^ -= w
+			c := color
+			if ts.hover_btn == id {
+				push_rect(r, bx^, head_base+3, w, 1, c)
 			}
+			x := bx^
+			for ch in label {
+				push_glyph(r, x, head_base, ch, c)
+				x += r.cell_w
+			}
+			append(&ts.btns, Panel_Btn{x0 = bx^, x1 = bx^ + w, id = id})
+			bx^ -= r.cell_w * 3
+		}
+		put_btn(ts, r, &bx, head_base, "close", PBTN_CLOSE,
+			theme.fg if ts.hover_btn == PBTN_CLOSE else theme.status_dim, &theme)
+		if ts.running || self.dap_active() {
+			put_btn(ts, r, &bx, head_base, "kill", PBTN_KILL, theme.diag_err, &theme)
+		}
+		if dap.state == .Stopped {
+			put_btn(ts, r, &bx, head_base, "out", PBTN_OUT,
+				theme.fg if ts.hover_btn == PBTN_OUT else theme.status_fg, &theme)
+			put_btn(ts, r, &bx, head_base, "in", PBTN_IN,
+				theme.fg if ts.hover_btn == PBTN_IN else theme.status_fg, &theme)
+			put_btn(ts, r, &bx, head_base, "over", PBTN_OVER,
+				theme.fg if ts.hover_btn == PBTN_OVER else theme.status_fg, &theme)
+			put_btn(ts, r, &bx, head_base, "continue", PBTN_CONTINUE, theme.faces[.Function], &theme)
 		}
 
 		hi := f32(max(len(ts.lines)-OUTPUT_VISIBLE, 0))
@@ -570,6 +745,60 @@ impl App {
 		row0 := int(ts.scroll)
 		ts.row_h = row_h
 
+		draw_clip :: proc(r: ^Renderer, x, baseline, limit: f32, s: string, color: Color) {
+			x := x
+			for ch in s {
+				if x+r.cell_w*2 > limit {
+					push_glyph(r, x, baseline, '…', color)
+					return
+				}
+				push_glyph(r, x, baseline, ch, color)
+				x += r.cell_w
+			}
+		}
+
+		// While stopped in the debugger, the panel splits into columns:
+		// output | call stack (clickable frames) | locals of the frame.
+		ts.stack_x0 = 0
+		ts.locals_x0 = 0
+		out_w := width
+		if len(dap.frames) > 0 && width > cell_w*100 {
+			stack_w := clamp(width*0.24, cell_w*24, cell_w*46)
+			locals_w := clamp(width*0.28, cell_w*24, cell_w*54)
+			out_w = width - stack_w - locals_w
+			ts.stack_x0 = out_w
+			ts.locals_x0 = out_w + stack_w
+			push_rect(r, ts.stack_x0, ts.head_bot, 1, ts.h-head_h, color_alpha(theme.gutter_fg, 0.4))
+			push_rect(r, ts.locals_x0, ts.head_bot, 1, ts.h-head_h, color_alpha(theme.gutter_fg, 0.4))
+
+			hy := ts.head_bot + (row_h-line_h)*0.5 + r.ascent
+			draw_clip(r, ts.stack_x0+cell_w, hy, ts.locals_x0, "call stack", theme.status_dim)
+			for f, i in dap.frames {
+				if i+1 >= OUTPUT_VISIBLE {
+					break
+				}
+				y := ts.head_bot + f32(i+1)*row_h
+				if i == dap.sel_frame {
+					push_rect(r, ts.stack_x0+1, y, stack_w-1, row_h, theme.selection)
+				} else if ts.hover_frame == i {
+					push_rect(r, ts.stack_x0+1, y, stack_w-1, row_h, color_alpha(theme.selection, 0.45))
+				}
+				label := f.name if f.path == "" else fmt.tprintf("%s — %s(%d)", f.name, f.path, f.line)
+				draw_clip(r, ts.stack_x0+cell_w, y+(row_h-line_h)*0.5+r.ascent, ts.locals_x0,
+					label, theme.status_fg if f.path != "" else theme.status_dim)
+			}
+			draw_clip(r, ts.locals_x0+cell_w, hy, width, "locals", theme.status_dim)
+			for v, i in dap.locals {
+				if i+1 >= OUTPUT_VISIBLE {
+					draw_clip(r, ts.locals_x0+cell_w, ts.head_bot+f32(i+1)*row_h+(row_h-line_h)*0.5+r.ascent,
+						width, fmt.tprintf("… %d more", len(dap.locals)-i), theme.status_dim)
+					break
+				}
+				y := ts.head_bot + f32(i+1)*row_h + (row_h-line_h)*0.5 + r.ascent
+				draw_clip(r, ts.locals_x0+cell_w, y, width, fmt.tprintf("%s = %s", v.name, v.value), theme.status_fg)
+			}
+		}
+
 		links := make([dynamic]Task_Link, context.temp_allocator)
 		for vi in 0 ..< OUTPUT_VISIBLE {
 			i := row0 + vi
@@ -579,6 +808,9 @@ impl App {
 			row_y := top + head_h + f32(vi)*row_h
 			baseline := row_y + (row_h-line_h)*0.5 + r.ascent
 			line := ts.lines[i]
+			if ts.drag_from >= 0 && i >= min(ts.drag_from, ts.drag_to) && i <= max(ts.drag_from, ts.drag_to) {
+				push_rect(r, 0, row_y, out_w, row_h, theme.selection)
+			}
 			// File references draw accented and underlined — they're
 			// clickable; the one under the mouse also gets a backdrop and a
 			// solid underline.
@@ -586,7 +818,7 @@ impl App {
 			task_scan_links(line, &links)
 			x := cell_w
 			for ch, off in line {
-				if x+cell_w > width {
+				if x+cell_w > out_w {
 					break
 				}
 				in_link := false
@@ -611,7 +843,7 @@ impl App {
 			}
 		}
 
-		draw_vscrollbar(r, width, top+head_h, f32(OUTPUT_VISIBLE)*row_h,
+		draw_vscrollbar(r, out_w, top+head_h, f32(OUTPUT_VISIBLE)*row_h,
 			f32(len(ts.lines))*row_h, ts.scroll*row_h, &theme)
 	}
 }
@@ -682,4 +914,19 @@ task_poll :: proc(app: ^App) {
 	delete(ts.title)
 	ts.title = strings.clone(fmt.tprintf("%s — exited with code %d", name, state.exit_code))
 	app.set_status(fmt.tprintf("task %s: exit code %d", name, state.exit_code))
+
+	// A debug task's build step finished: hand the program to the adapter.
+	if ts.pending_debug_program != "" {
+		prog := strings.clone(ts.pending_debug_program, context.temp_allocator)
+		cwd := strings.clone(ts.pending_debug_cwd, context.temp_allocator)
+		delete(ts.pending_debug_program)
+		ts.pending_debug_program = ""
+		delete(ts.pending_debug_cwd)
+		ts.pending_debug_cwd = ""
+		if state.exit_code == 0 {
+			app.dap_launch(prog, cwd)
+		} else {
+			app.set_status("build failed — debug canceled")
+		}
+	}
 }
