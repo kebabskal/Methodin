@@ -73,7 +73,7 @@ _hot_reload_boot :: proc "contextless" () {
 	if sig := cast(^u64)_self_sym(self, "odin_hr_signature"); sig != nil {
 		g.host_sig = sig^
 	}
-	if dbg := cast(^int)posix.dlsym(main, "odin_hr_debug"); dbg != nil {
+	if dbg := cast(^int)_self_sym(self, "odin_hr_debug"); dbg != nil {
 		g.host_debug = dbg^ != 0
 	}
 	if tc := cast(^int)_self_sym(self, "odin_hr_threaded_checker"); tc != nil {
@@ -165,6 +165,10 @@ _reload :: proc() {
 		append(&cmd, "-file")
 	}
 	append(&cmd, "-build-mode:dll", "-hot-reload:reload", fmt.tprintf("-out:%s", out))
+	if g.host_debug {
+		// Match the host's debug info so breakpoints in reloaded procs keep binding.
+		append(&cmd, "-debug")
+	}
 	if !g.host_threaded_checker {
 		// Parallel is the default; mirror the host's opt-out.
 		append(&cmd, "-no-threaded-checker")
@@ -182,10 +186,6 @@ _reload :: proc() {
 	// containing spaces would still need handling there.
 	if g.host_implib != "" {
 		append(&cmd, fmt.tprintf("-extra-linker-flags:%s", g.host_implib))
-	}
-	if g.host_debug {
-		// Match the host's debug info so breakpoints in reloaded procs keep binding.
-		append(&cmd, "-debug")
 	}
 
 	fmt.eprintln("[hot-reload] change detected, rebuilding…")

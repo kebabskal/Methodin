@@ -348,6 +348,7 @@ gb_internal void lb_emit_hot_reload_manifest(lbModule *m) {
 	LLVMSetLinkage(debug_g, LLVMExternalLinkage);
 	LLVMSetVisibility(debug_g, LLVMDefaultVisibility);
 	LLVMSetGlobalConstant(debug_g, true);
+	lb_hot_reload_mark_host_export(debug_g);
 	lb_append_to_compiler_used(m, debug_g);
 
 	// Mirror the effective checker threading into reload rebuilds: the
