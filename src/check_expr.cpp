@@ -6937,11 +6937,23 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 	// lifted entity. Methods resolve too, giving `Vec3.dot(a, b)`-style
 	// explicit calls.
 	if (entity == nullptr && operand->mode == Addressing_Type &&
-	    operand->type != nullptr && operand->type->kind == Type_Named &&
-	    operand->type->Named.type_name != nullptr &&
-	    selector->kind == Ast_Ident) {
-		Entity *tn = operand->type->Named.type_name;
-		if (tn->scope != nullptr) {
+	    operand->type != nullptr && selector->kind == Ast_Ident) {
+		// The lifted `<Type>__<name>` entities live in the type's own scope.
+		// A named type (struct / `distinct`) carries that scope on its
+		// Type_Named; a plain alias (`Color :: [4]f32`) has no Type_Named
+		// wrapper, so recover it from the base's type-name entity, which names
+		// the alias and shares its (package) scope. entity_of_node handles both
+		// the bare `Color` ident and the qualified `pkg.Color` selector.
+		Entity *tn = nullptr;
+		if (operand->type->kind == Type_Named && operand->type->Named.type_name != nullptr) {
+			tn = operand->type->Named.type_name;
+		} else {
+			Entity *base = entity_of_node(op_expr);
+			if (base != nullptr && base->kind == Entity_TypeName) {
+				tn = base;
+			}
+		}
+		if (tn != nullptr && tn->scope != nullptr) {
 			String mangled = mangle_method_name(tn->token.string, selector->Ident.token.string);
 			Entity *e2 = scope_lookup(tn->scope, string_interner_insert(mangled), 0);
 			if (e2 != nullptr) {
