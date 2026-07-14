@@ -269,25 +269,10 @@ gb_internal LLVMValueRef llvm_const_slice(lbModule *m, lbValue data, lbValue len
 // Methodin: default struct field values. True when `t` (or anything it
 // contains by value) declares a constant field default, meaning zero-init
 // sites must materialize lb_const_default_value instead of zeroing.
+// Logic lives in type_has_default_values (types.cpp), shared with the
+// intrinsics.type_has_default_values builtin.
 gb_internal bool lb_type_has_field_defaults(Type *t) {
-	if (t == nullptr) return false;
-	t = base_type(t);
-	if (t == nullptr) return false;
-	switch (t->kind) {
-	case Type_Struct:
-		if (t->Struct.is_raw_union) return false;
-		for (Entity *f : t->Struct.fields) {
-			if (f == nullptr || f->kind != Entity_Variable) continue;
-			if (f->Variable.param_value.kind == ParameterValue_Constant) return true;
-			if (lb_type_has_field_defaults(f->type)) return true;
-		}
-		return false;
-	case Type_Array:
-		return lb_type_has_field_defaults(t->Array.elem);
-	case Type_EnumeratedArray:
-		return lb_type_has_field_defaults(t->EnumeratedArray.elem);
-	}
-	return false;
+	return type_has_default_values(t);
 }
 
 gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, Type *value_type, lbConstContext cc);

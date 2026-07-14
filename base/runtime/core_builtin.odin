@@ -515,11 +515,22 @@ delete :: proc{
 @(builtin, require_results)
 new :: proc($T: typeid, allocator := context.allocator, loc := #caller_location) -> (t: ^T, err: Allocator_Error) #optional_allocator_error {
 	t = (^T)(raw_data(mem_alloc_bytes(size_of(T), align_of(T), allocator, loc) or_return))
+	// Methodin: a heap-born T starts as T{}, honoring struct field defaults
+	when intrinsics.type_has_default_values(T) {
+		if t != nil {
+			t^ = T{}
+		}
+	}
 	return
 }
 @(builtin, require_results)
 new_aligned :: proc($T: typeid, alignment: int, allocator := context.allocator, loc := #caller_location) -> (t: ^T, err: Allocator_Error) {
 	t = (^T)(raw_data(mem_alloc_bytes(size_of(T), alignment, allocator, loc) or_return))
+	when intrinsics.type_has_default_values(T) {
+		if t != nil {
+			t^ = T{}
+		}
+	}
 	return
 }
 
@@ -537,6 +548,12 @@ DEFAULT_DYNAMIC_ARRAY_CAPACITY :: 8
 @(builtin, require_results)
 make_aligned :: proc($T: typeid/[]$E, #any_int len: int, alignment: int, allocator := context.allocator, loc := #caller_location) -> (res: T, err: Allocator_Error) #optional_allocator_error {
 	err = _make_aligned_type_erased(&res, size_of(E), len, alignment, allocator, loc)
+	// Methodin: elements start as E{}, honoring struct field defaults
+	when intrinsics.type_has_default_values(E) {
+		for &e in res {
+			e = E{}
+		}
+	}
 	return
 }
 
@@ -559,6 +576,12 @@ _make_aligned_type_erased :: proc(slice: rawptr, elem_size: int, len: int, align
 @(builtin, require_results)
 make_slice :: proc($T: typeid/[]$E, #any_int len: int, allocator := context.allocator, loc := #caller_location) -> (res: T, err: Allocator_Error) #optional_allocator_error {
 	err = _make_aligned_type_erased(&res, size_of(E), len, align_of(E), allocator, loc)
+	// Methodin: elements start as E{}, honoring struct field defaults
+	when intrinsics.type_has_default_values(E) {
+		for &e in res {
+			e = E{}
+		}
+	}
 	return
 }
 // `make_dynamic_array` allocates and initializes a dynamic array. Like `new`, the first argument is a type, not a value.
@@ -577,6 +600,12 @@ make_dynamic_array :: proc($T: typeid/[dynamic]$E, allocator := context.allocato
 @(builtin, require_results)
 make_dynamic_array_len :: proc($T: typeid/[dynamic]$E, #any_int len: int, allocator := context.allocator, loc := #caller_location) -> (array: T, err: Allocator_Error) #optional_allocator_error {
 	err = _make_dynamic_array_len_cap((^Raw_Dynamic_Array)(&array), size_of(E), align_of(E), len, len, allocator, loc)
+	// Methodin: elements start as E{}, honoring struct field defaults
+	when intrinsics.type_has_default_values(E) {
+		for &e in array {
+			e = E{}
+		}
+	}
 	return
 }
 // `make_dynamic_array_len_cap` allocates and initializes a dynamic array. Like `new`, the first argument is a type, not a value.
@@ -586,6 +615,12 @@ make_dynamic_array_len :: proc($T: typeid/[dynamic]$E, #any_int len: int, alloca
 @(builtin, require_results)
 make_dynamic_array_len_cap :: proc($T: typeid/[dynamic]$E, #any_int len: int, #any_int cap: int, allocator := context.allocator, loc := #caller_location) -> (array: T, err: Allocator_Error) #optional_allocator_error {
 	err = _make_dynamic_array_len_cap((^Raw_Dynamic_Array)(&array), size_of(E), align_of(E), len, cap, allocator, loc)
+	// Methodin: elements start as E{}, honoring struct field defaults
+	when intrinsics.type_has_default_values(E) {
+		for &e in array {
+			e = E{}
+		}
+	}
 	return
 }
 
@@ -1492,7 +1527,19 @@ _resize_dynamic_array :: #force_no_inline proc(a: ^Raw_Dynamic_Array, size_of_el
 // Note: Prefer the procedure group `resize`
 @builtin
 resize_dynamic_array :: proc(array: ^$T/[dynamic]$E, #any_int length: int, loc := #caller_location) -> Allocator_Error {
-	return _resize_dynamic_array((^Raw_Dynamic_Array)(array), size_of(E), align_of(E), length, true, loc=loc)
+	when intrinsics.type_has_default_values(E) {
+		// Methodin: elements born by growing start as E{}, honoring field defaults
+		old_len := 0 if array == nil else len(array^)
+		err := _resize_dynamic_array((^Raw_Dynamic_Array)(array), size_of(E), align_of(E), length, true, loc=loc)
+		if array != nil && len(array^) > old_len {
+			for &e in (array^)[old_len:] {
+				e = E{}
+			}
+		}
+		return err
+	} else {
+		return _resize_dynamic_array((^Raw_Dynamic_Array)(array), size_of(E), align_of(E), length, true, loc=loc)
+	}
 }
 
 // `non_zero_resize_dynamic_array` will try to resize memory of a passed dynamic array or map to the requested element count (setting the `len`, and possibly `cap`).

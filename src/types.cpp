@@ -2665,6 +2665,32 @@ gb_internal bool type_has_nil(Type *t) {
 	return false;
 }
 
+// Methodin: true when `t` (or anything it contains by value) declares a
+// constant field default, i.e. `T{}` differs from zero-initialization.
+// Checker-side twin of lb_type_has_field_defaults; exposed to user code as
+// intrinsics.type_has_default_values so runtime allocation paths (new, make,
+// resize) can materialize defaults only for types that need them.
+gb_internal bool type_has_default_values(Type *t) {
+	if (t == nullptr) return false;
+	t = base_type(t);
+	if (t == nullptr) return false;
+	switch (t->kind) {
+	case Type_Struct:
+		if (t->Struct.is_raw_union) return false;
+		for (Entity *f : t->Struct.fields) {
+			if (f == nullptr || f->kind != Entity_Variable) continue;
+			if (f->Variable.param_value.kind == ParameterValue_Constant) return true;
+			if (type_has_default_values(f->type)) return true;
+		}
+		return false;
+	case Type_Array:
+		return type_has_default_values(t->Array.elem);
+	case Type_EnumeratedArray:
+		return type_has_default_values(t->EnumeratedArray.elem);
+	}
+	return false;
+}
+
 gb_internal bool is_type_union_constantable(Type *type);
 
 gb_internal bool is_type_constant_type_for_unions(Type *t) {

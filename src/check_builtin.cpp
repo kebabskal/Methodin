@@ -66,6 +66,7 @@ gb_global BuiltinTypeIsProc *builtin_type_is_procs[BuiltinProc__type_simple_bool
 	is_type_polymorphic_record_unspecialized,
 
 	type_has_nil,
+	type_has_default_values,
 };
 
 
@@ -7269,6 +7270,7 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 	case BuiltinProc_type_is_specialized_polymorphic_record:
 	case BuiltinProc_type_is_unspecialized_polymorphic_record:
 	case BuiltinProc_type_has_nil:
+	case BuiltinProc_type_has_default_values:
 		GB_ASSERT(BuiltinProc__type_simple_boolean_begin < id && id < BuiltinProc__type_simple_boolean_end);
 
 		operand->value = exact_value_bool(false);

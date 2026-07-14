@@ -189,6 +189,10 @@ type_is_internally_pointer_like :: proc($T: typeid) -> bool ---
 
 type_has_nil :: proc($T: typeid) -> bool ---
 
+// Methodin: true when T (or anything it contains by value) declares a struct
+// field default, i.e. `T{}` differs from zero-initialization.
+type_has_default_values :: proc($T: typeid) -> bool ---
+
 type_is_matrix_row_major    :: proc($T: typeid) -> bool where type_is_matrix(T) ---
 type_is_matrix_column_major :: proc($T: typeid) -> bool where type_is_matrix(T) ---
 
