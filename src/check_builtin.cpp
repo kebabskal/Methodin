@@ -7815,6 +7815,16 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 
 	case BuiltinProc_type_struct_field_count:
 		operand->value = exact_value_i64(0);
+		if (operand->mode == Addressing_Type && is_type_typeid(operand->type)) {
+			// An unresolved polymorphic type parameter (`$T: typeid`) still has
+			// type `typeid` during abstract signature checking, so it isn't known
+			// to be a struct yet. Defer instead of erroring: the signature is
+			// re-checked with the concrete type at each instantiation, where the
+			// real field count is computed. Mirrors how size_of tolerates it.
+			operand->mode = Addressing_Constant;
+			operand->type = t_untyped_integer;
+			break;
+		}
 		if (operand->mode != Addressing_Type) {
 			error(operand->expr, "Expected a struct type for '%.*s'", LIT(builtin_name));
 		} else if (!is_type_struct(operand->type)) {
