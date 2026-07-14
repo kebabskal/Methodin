@@ -1381,6 +1381,17 @@ parse_unrolled_for_loop :: proc(p: ^Parser, inline_tok: tokenizer.Token) -> ^ast
 	return range_stmt
 }
 
+// Methodin: contextual `static` marker before a method's proc literal
+// (`from :: static proc(...)`). Consumes the marker and returns true.
+// `static` is not a reserved word; it only has meaning in this position.
+allow_static_method_marker :: proc(p: ^Parser) -> bool {
+	if p.curr_tok.kind == .Ident && p.curr_tok.text == "static" && peek_token_kind(p, .Proc, 0) {
+		advance_token(p)
+		return true
+	}
+	return false
+}
+
 parse_impl_block :: proc(p: ^Parser) -> ^ast.Stmt {
 	docs := p.lead_comment
 	impl_tok := expect_token(p, .Ident)
@@ -1404,6 +1415,7 @@ parse_impl_block :: proc(p: ^Parser) -> ^ast.Stmt {
 		name_tok := expect_token(p, .Ident)
 		expect_token(p, .Colon)
 		expect_token(p, .Colon)
+		is_static := allow_static_method_marker(p)
 		value := parse_expr(p, false)
 
 		name_ident := ast.new(ast.Ident, name_tok.pos, end_pos(name_tok))
@@ -1419,6 +1431,7 @@ parse_impl_block :: proc(p: ^Parser) -> ^ast.Stmt {
 		vd.values     = values
 		vd.is_mutable = false
 		vd.docs       = method_docs
+		vd.is_static_method = is_static
 		append(&methods, cast(^ast.Stmt)vd)
 
 		allow_token(p, .Comma)
@@ -2052,6 +2065,7 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 		name_tok := expect_token(p, .Ident)
 		expect_token(p, .Colon)
 		expect_token(p, .Colon)
+		is_static := allow_static_method_marker(p)
 		value := parse_expr(p, false)
 
 		name_ident := ast.new(ast.Ident, name_tok.pos, end_pos(name_tok))
@@ -2067,6 +2081,7 @@ parse_field_list :: proc(p: ^Parser, follow: tokenizer.Token_Kind, allowed_flags
 		vd.values     = values
 		vd.is_mutable = false
 		vd.docs       = docs
+		vd.is_static_method = is_static
 		append(methods_out, cast(^ast.Stmt)vd)
 
 		allow_token(p, .Comma)

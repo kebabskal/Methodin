@@ -515,6 +515,9 @@ Value_Decl :: struct {
 	comment:    ^Comment_Group, // possibly nil
 	is_using:   bool,
 	is_mutable: bool,
+	// Methodin: `name :: static proc(...)` in a struct body or impl block —
+	// a type-scoped static (no `self` receiver), callable as `Type.name(...)`.
+	is_static_method: bool,
 }
 
 Package_Decl :: struct {

@@ -2123,6 +2123,7 @@ gb_internal Ast *        parse_simple_stmt      (AstFile *f, u32 flags);
 gb_internal Ast *        parse_type             (AstFile *f);
 gb_internal Ast *        parse_call_expr        (AstFile *f, Ast *operand);
 gb_internal Ast *        parse_struct_field_list(AstFile *f, isize *name_count_, Array<Ast *> *methods_out = nullptr);
+gb_internal bool         allow_static_method_marker(AstFile *f);
 gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_flags, TokenKind follow, bool allow_default_parameters, bool allow_typeid_token, Array<Ast *> *methods_out = nullptr);
 gb_internal Ast *        parse_impl_block(AstFile *f);
 gb_internal Ast *parse_unary_expr(AstFile *f, bool lhs);
@@ -4512,12 +4513,14 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 			Token name_token = expect_token(f, Token_Ident);
 			expect_token(f, Token_Colon);
 			expect_token(f, Token_Colon);
+			bool is_static = allow_static_method_marker(f);
 			Ast *proc_lit = parse_expr(f, false);
 			auto method_names = array_make<Ast *>(ast_allocator(f), 0, 1);
 			array_add(&method_names, ast_ident(f, name_token));
 			auto method_values = array_make<Ast *>(ast_allocator(f), 0, 1);
 			array_add(&method_values, proc_lit);
 			Ast *method = ast_value_decl(f, method_names, nullptr, method_values, false, method_docs, f->line_comment);
+			method->ValueDecl.is_static_method = is_static;
 			array_add(methods_out, method);
 			allow_field_separator(f);
 			continue;
@@ -4653,12 +4656,14 @@ gb_internal Ast *parse_field_list(AstFile *f, isize *name_count_, u32 allowed_fl
 			Token name_token = expect_token(f, Token_Ident);
 			expect_token(f, Token_Colon);
 			expect_token(f, Token_Colon);
+			bool is_static = allow_static_method_marker(f);
 			Ast *proc_lit = parse_expr(f, false);
 			auto method_names = array_make<Ast *>(ast_allocator(f), 0, 1);
 			array_add(&method_names, ast_ident(f, name_token));
 			auto method_values = array_make<Ast *>(ast_allocator(f), 0, 1);
 			array_add(&method_values, proc_lit);
 			Ast *method = ast_value_decl(f, method_names, nullptr, method_values, false, docs, f->line_comment);
+			method->ValueDecl.is_static_method = is_static;
 			array_add(methods_out, method);
 			if (!allow_field_separator(f)) {
 				break;
@@ -6910,6 +6915,22 @@ gb_internal bool parse_file_tag(const String &lc, const Token &tok, AstFile *f) 
 
 // Parses `impl <Type> { name :: proc(...) {...}, ... }`. `impl` is a
 // contextual keyword — the caller has already confirmed the
+// Methodin: contextual `static` marker before a method's proc literal
+// (`from :: static proc(...)` in a struct body or impl block). Consumes the
+// marker and returns true. A static method is lifted with its signature kept
+// verbatim — no `self` receiver — making it a type-scoped proc callable as
+// `Type.name(...)`. `static` is not a reserved word; it only has meaning in
+// this exact position, mirroring how `impl` itself is contextual.
+gb_internal bool allow_static_method_marker(AstFile *f) {
+	if (f->curr_token.kind == Token_Ident &&
+	    f->curr_token.string == "static" &&
+	    peek_token_n(f, 0).kind == Token_proc) {
+		advance_token(f);
+		return true;
+	}
+	return false;
+}
+
 // `Ident("impl") Ident OpenBrace` shape. Returns an Ast_ImplBlock that
 // `lift_struct_methods` later expands into free procs at file scope.
 gb_internal Ast *parse_impl_block(AstFile *f) {
@@ -6935,6 +6956,7 @@ gb_internal Ast *parse_impl_block(AstFile *f) {
 		Token name_token = expect_token(f, Token_Ident);
 		expect_token(f, Token_Colon);
 		expect_token(f, Token_Colon);
+		bool is_static = allow_static_method_marker(f);
 		Ast *proc_lit = parse_expr(f, false);
 
 		auto method_names = array_make<Ast *>(ast_allocator(f), 0, 1);
@@ -6943,6 +6965,7 @@ gb_internal Ast *parse_impl_block(AstFile *f) {
 		array_add(&method_values, proc_lit);
 
 		Ast *method = ast_value_decl(f, method_names, nullptr, method_values, false, method_docs, f->line_comment);
+		method->ValueDecl.is_static_method = is_static;
 		array_add(&methods, method);
 
 		// Methods are separated by an optional comma + newline. The
@@ -7724,8 +7747,11 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			for (Ast *method : decl->ImplBlock.methods) {
 				if (lift_member_constant(f, method, struct_name_token, decls_out)) continue;
 				bool explicit_recv = impl_method_has_explicit_receiver(method, struct_name_token.string);
+				bool is_static = method->kind == Ast_ValueDecl && method->ValueDecl.is_static_method;
 				PendingMethod pm = {method, struct_name_token, poly};
-				pm.keep_signature = explicit_recv;
+				// Statics keep their signature verbatim: no `self` receiver is
+				// injected, and `Type.name(...)` resolves via the mangled entity.
+				pm.keep_signature = explicit_recv || is_static;
 				array_add(&pending, pm);
 			}
 			continue;
@@ -7748,7 +7774,11 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 		Token struct_name_token = name_ident->Ident.token;
 		for (Ast *method : st->methods) {
 			if (lift_member_constant(f, method, struct_name_token, decls_out)) continue;
-			array_add(&pending, PendingMethod{method, struct_name_token, st->polymorphic_params});
+			PendingMethod pm = {method, struct_name_token, st->polymorphic_params};
+			// `name :: static proc(...)` in a struct body: same verbatim lift
+			// as impl statics — no `self`, callable as `Type.name(...)`.
+			pm.keep_signature = method->kind == Ast_ValueDecl && method->ValueDecl.is_static_method;
+			array_add(&pending, pm);
 		}
 		// The lifted ValueDecls own these nodes from here on. Leaving the
 		// slice populated made every polymorphic instantiation deep-clone
@@ -7773,6 +7803,10 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 		for (PendingMethod const &pm : pending) {
 			Ast *method = pm.method;
 			if (method->kind != Ast_ValueDecl || method->ValueDecl.names.count != 1) continue;
+			// Statics have no receiver, so a bare call to one must NOT become
+			// `self.name(...)` — leave it to resolve via the package-scope
+			// proc-group (`name :: proc { Struct__name, ... }`) from Pass 2.
+			if (method->ValueDecl.is_static_method) continue;
 			Ast *name_ast = method->ValueDecl.names[0];
 			if (name_ast->kind != Ast_Ident) continue;
 			String mname = name_ast->Ident.token.string;
@@ -7795,6 +7829,9 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 		for (PendingMethod &pm : pending) {
 			Ast *method = pm.method;
 			if (method->kind != Ast_ValueDecl || method->ValueDecl.values.count != 1) continue;
+			// A static body has no `self` to rewrite sibling calls against;
+			// its bare sibling calls resolve through the package-scope groups.
+			if (method->ValueDecl.is_static_method) continue;
 			Ast *proc_lit = method->ValueDecl.values[0];
 			if (proc_lit->kind != Ast_ProcLit) continue;
 			Ast *body = proc_lit->ProcLit.body;

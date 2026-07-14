@@ -702,6 +702,7 @@ AST_KIND(_DeclBegin,      "", bool) \
 		CommentGroup *comment;    \
 		bool          is_using;   \
 		bool          is_mutable; \
+		bool          is_static_method; /* Methodin: `name :: static proc(...)` in a struct/impl body */ \
 	}) \
 	AST_KIND(PackageDecl, "package declaration", struct { \
 		Token token;           \
