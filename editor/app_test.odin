@@ -22,6 +22,18 @@ expect_app_text :: proc(t: ^testing.T, app: ^App, want: string, loc := #caller_l
 }
 
 @test
+test_max_visual_cols :: proc(t: ^testing.T) {
+	// "åäöåäö" is 12 bytes but 6 columns — visual width, not byte length.
+	app := test_app("aaaa\nåäöåäö")
+	defer app_destroy(&app)
+	testing.expect_value(t, max_visual_cols(&app.buf), 6)
+
+	// The cache follows edits.
+	app.buf.commit([]Edit{{range = {}, text = "0123456789\n"}}, nil)
+	testing.expect_value(t, max_visual_cols(&app.buf), 10)
+}
+
+@test
 test_move_lines :: proc(t: ^testing.T) {
 	app := test_app("aa\nbb\ncc")
 	defer app_destroy(&app)

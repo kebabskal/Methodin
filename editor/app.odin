@@ -11,6 +11,7 @@ import "core:strings"
 import "core:unicode/utf8"
 
 OVERSCROLL_LINES :: 4
+OVERSCROLL_COLS :: 6
 
 // UI list rows (sidebar, palette) in line_h units — roomier than text lines.
 UI_ROW_SCALE :: 1.55
@@ -281,6 +282,21 @@ visual_col :: proc(b: ^Buffer, line: int, col: int) -> int {
 		}
 	}
 	return vis
+}
+
+// Longest line's visual width in columns, cached by (version, tab width) —
+// whole-buffer rescans stay off the per-frame path, like highlighting.
+max_visual_cols :: proc(b: ^Buffer) -> int {
+	if b.vis_cols_version != b.version || b.vis_cols_tab_w != tab_w {
+		m := 0
+		for i in 0 ..< b.line_count() {
+			m = max(m, visual_col(b, i, b.line_len(i)))
+		}
+		b.vis_cols = m
+		b.vis_cols_version = b.version
+		b.vis_cols_tab_w = tab_w
+	}
+	return b.vis_cols
 }
 
 // Byte offset within a line for a target visual column (clamped to line end).
@@ -1389,10 +1405,13 @@ impl App {
 		}
 	}
 
-	clamp_scroll :: proc(line_h: f32) {
+	clamp_scroll :: proc(cell_w, line_h: f32) {
 		content_h := f32(buf.line_count() + OVERSCROLL_LINES) * line_h
 		scroll_y = clamp(scroll_y, 0, max(0, content_h - view_h))
-		scroll_x = max(scroll_x, 0)
+		// Sideways stops at the longest line plus a few cells (room for the
+		// end-of-line margin ensure_cursor_visible aims for).
+		content_w := f32(max_visual_cols(&buf) + OVERSCROLL_COLS) * cell_w
+		scroll_x = clamp(scroll_x, 0, max(0, content_w - view_w))
 	}
 
 	draw :: proc(r: ^Renderer, width, height: f32) {
@@ -1421,7 +1440,7 @@ impl App {
 		}
 		view_h = height - status_h - tabbar_h - problems_h - task.h
 
-		self.clamp_scroll(line_h)
+		self.clamp_scroll(cell_w, line_h)
 
 		// The half-line margin lets a line peek out under the tab bar for
 		// an extra half line of scroll — start one line early.

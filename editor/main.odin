@@ -737,7 +737,7 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		} else {
 			app.scroll_y -= dy * rend.line_h * 3
 			app.scroll_x += dx * rend.cell_w * 6
-			app.clamp_scroll(rend.line_h)
+			app.clamp_scroll(rend.cell_w, rend.line_h)
 		}
 	}
 

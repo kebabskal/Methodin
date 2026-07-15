@@ -63,6 +63,12 @@ Buffer :: struct {
 	// under a dirty buffer — saving then needs confirmation.
 	disk_mtime:  i64,
 	conflict:    bool,
+
+	// Longest line's visual width, cached for the horizontal scroll clamp
+	// (see max_visual_cols). vis_cols_tab_w == 0 marks it never computed.
+	vis_cols:         int,
+	vis_cols_version: int,
+	vis_cols_tab_w:   int,
 }
 
 pos_less :: proc(a, b: Pos) -> bool {
