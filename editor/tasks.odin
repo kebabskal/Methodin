@@ -436,6 +436,7 @@ impl App {
 		if i < 0 || i >= len(ts.tasks) {
 			return
 		}
+		self.save_all() // tasks read from disk; unsaved edits would be invisible
 		if ts.running {
 			_ = os.process_kill(ts.process)
 			_, _ = os.process_wait(ts.process)

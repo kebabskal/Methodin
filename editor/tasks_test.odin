@@ -1,5 +1,7 @@
 package medit
 
+import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -58,6 +60,57 @@ test_task_run_captures_output :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, found, "expected the task output to contain 'hello task'")
+}
+
+@test
+test_task_run_saves_dirty_buffers :: proc(t: ^testing.T) {
+	tmp, terr := os.make_directory_temp("", "medit_tasks_*", context.allocator)
+	testing.expect_value(t, terr, nil)
+	defer {
+		_ = os.remove_all(tmp)
+		delete(tmp)
+	}
+
+	app: App
+	app.theme = theme_default()
+	fa, _ := filepath.join({tmp, "a.txt"}, context.temp_allocator)
+	app.buf = buffer_make(fa)
+	app.buf.commit([]Edit{{range = {}, text = "active edit"}}, nil)
+	append(&app.cursors, cursor_at(Pos{0, 0}))
+	append(&app.docs, Doc{}) // the active doc's (stale) slot, like the real app
+	defer app_destroy(&app)
+
+	// A dirty background tab, and a dirty pathless scratch tab to leave alone.
+	fb, _ := filepath.join({tmp, "b.txt"}, context.temp_allocator)
+	bg := buffer_make(fb)
+	bg.commit([]Edit{{range = {}, text = "background edit"}}, nil)
+	append(&app.docs, Doc{buf = bg})
+	scratch := buffer_make()
+	scratch.commit([]Edit{{range = {}, text = "scratch"}}, nil)
+	append(&app.docs, Doc{buf = scratch})
+
+	when ODIN_OS == .Windows {
+		tasks_parse(&app.task, "[hi]\ncmd = cmd /c echo hi\n")
+	} else {
+		tasks_parse(&app.task, "[hi]\ncmd = echo hi\n")
+	}
+	app.task_run(0)
+	for _ in 0 ..< 400 {
+		task_poll(&app)
+		if !app.task.running {
+			break
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+
+	a_data, a_err := os.read_entire_file(fa, context.temp_allocator)
+	testing.expect(t, a_err == nil, "active buffer was not written before the task ran")
+	testing.expect_value(t, string(a_data), "active edit")
+	b_data, b_err := os.read_entire_file(fb, context.temp_allocator)
+	testing.expect(t, b_err == nil, "background buffer was not written before the task ran")
+	testing.expect_value(t, string(b_data), "background edit")
+	testing.expect_value(t, app.buf.is_dirty(), false)
+	testing.expect_value(t, app.docs[1].buf.is_dirty(), false)
 }
 
 @test
