@@ -4332,6 +4332,14 @@ gb_internal DECL_ATTRIBUTE_PROC(var_decl_attribute) {
 			error(elem, "Expected a string value for '%.*s'", LIT(name));
 		}
 		return true;
+	} else if (name == "lang") {
+		// Methodin: the declared string holds source of another language
+		// (e.g. @(lang="wgsl")). Metadata for tooling; no semantics.
+		ExactValue ev = check_decl_attribute_value(c, value);
+		if (ev.kind != ExactValue_String || ev.value_string == "") {
+			error(elem, "Expected a non-empty string value for '%.*s'", LIT(name));
+		}
+		return true;
 	} else if (name == "static") {
 		if (value != nullptr) {
 			error(elem, "'static' does not have any parameters");
@@ -4476,6 +4484,14 @@ gb_internal DECL_ATTRIBUTE_PROC(const_decl_attribute) {
 		ExactValue ev = check_decl_attribute_value(c, value);
 		if (ev.kind != ExactValue_String) {
 			error(elem, "Expected a string value for '%.*s'", LIT(name));
+		}
+		return true;
+	} else if (name == "lang") {
+		// Methodin: the declared string holds source of another language
+		// (e.g. @(lang="wgsl")). Metadata for tooling; no semantics.
+		ExactValue ev = check_decl_attribute_value(c, value);
+		if (ev.kind != ExactValue_String || ev.value_string == "") {
+			error(elem, "Expected a non-empty string value for '%.*s'", LIT(name));
 		}
 		return true;
 	} else if (name == "private") {
