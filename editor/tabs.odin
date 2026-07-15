@@ -73,6 +73,7 @@ impl App {
 		select_word = false
 		col_select = false
 		pending_close = -1
+		pending_overwrite = -1
 		tab_follow = true
 		retitle = true
 		self.blink_reset()

@@ -306,6 +306,7 @@ main :: proc() {
 			app.want_center = false
 		}
 
+		app.files_tick()
 		if app.retitle {
 			app.retitle = false
 			t := fmt.ctprintf("medit — %s", app.buf.path if app.buf.path != "" else "[untitled]")
@@ -523,6 +524,7 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		text := string(ev.text.text)
 		if len(text) > 0 {
 			if app.palette.open {
+		app.watch_ms = 0 // poll open files immediately
 				app.palette_insert(text)
 			} else if app.task.filter_focus {
 				append(&app.task.filter, text)

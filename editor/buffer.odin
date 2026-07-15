@@ -57,6 +57,12 @@ Buffer :: struct {
 	// remembering the depth at save time makes dirty-tracking exact even
 	// through undo/redo. -1 = the saved state is no longer reachable.
 	saved_depth: int,
+
+	// External change detection (watch.odin): the file's mtime as of the
+	// last load/save (0: never touched disk), and whether the file changed
+	// under a dirty buffer — saving then needs confirmation.
+	disk_mtime:  i64,
+	conflict:    bool,
 }
 
 pos_less :: proc(a, b: Pos) -> bool {
@@ -450,6 +456,7 @@ buffer_load :: proc(path: string) -> (b: Buffer, ok: bool) {
 	defer delete(data)
 
 	b.path = strings.clone(path)
+	b.disk_mtime = file_mtime(path)
 	text := string(data)
 	if strings.contains(text, "\r\n") {
 		b.line_ending = .CRLF
@@ -486,6 +493,8 @@ buffer_save :: proc(b: ^Buffer) -> bool {
 		return false
 	}
 	b.saved_depth = len(b.undo_stack)
+	b.disk_mtime = file_mtime(b.path)
+	b.conflict = false
 	return true
 }
 

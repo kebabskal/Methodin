@@ -40,6 +40,8 @@ App :: struct {
 
 	pending_close:      int, // tab awaiting a discard-changes confirmation; -1 = none
 	pending_quit:       bool, // window close was refused once over unsaved changes
+	pending_overwrite:  int, // tab awaiting a save-over-external-change confirmation; -1 = none
+	watch_ms:           u64, // last external-change poll (watch.odin); 0 forces one
 
 	tab_scroll:         f32, // tab bar horizontal scroll (pixels)
 	tab_follow:         bool, // scroll the active tab into view on the next draw
@@ -815,6 +817,9 @@ impl App {
 			self.set_status("no file path — start medit with a filename")
 			return
 		}
+		if self.save_conflicted() {
+			return
+		}
 		// With a live language server the write completes asynchronously,
 		// after textDocument/formatting answers (lsp.odin).
 		if format_on_save && self.format_request() {
@@ -822,6 +827,27 @@ impl App {
 			return
 		}
 		self.save_now()
+	}
+
+	// Write every dirty buffer that has a path, skipping format-on-save —
+	// callers (task_run) need the files on disk now, not after the language
+	// server answers. Pathless scratch buffers are left alone.
+	save_all :: proc() {
+		for i in 0 ..< len(docs) {
+			b := self.doc_buf(i)
+			if b.path == "" || !b.is_dirty() {
+				continue
+			}
+			if buffer_disk_changed(b) {
+				self.set_status(fmt.tprintf("NOT SAVED (changed on disk): %s", b.path))
+				continue
+			}
+			if i == active {
+				self.save_now()
+			} else if !buffer_save(b) {
+				self.set_status(fmt.tprintf("SAVE FAILED: %s", b.path))
+			}
+		}
 	}
 
 	save_now :: proc() {

@@ -160,6 +160,7 @@ PALETTE_MODES := []Palette_Mode{
 @(private = "file")
 PALETTE_COMMANDS := []Palette_Command{
 	{"File: Save", "ctrl+s", proc(app: ^App) { app.save() }},
+	{"File: Reload from Disk", "", proc(app: ^App) { app.doc_reload(app.active) }},
 	{"File: New Untitled File", "ctrl+n", proc(app: ^App) { app.new_file() }},
 	{"File: New File…", "", proc(app: ^App) { app.open_fileop_prompt(.New_File, ".") }},
 	{"File: New Folder…", "", proc(app: ^App) { app.open_fileop_prompt(.New_Folder, ".") }},
