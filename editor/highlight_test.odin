@@ -107,6 +107,38 @@ test_highlight_markup :: proc(t: ^testing.T) {
 	testing.expect_value(t, face_at(&h2, 1, 6), Face.String)  // 'c'
 }
 
+@test
+test_highlight_embedded_lang :: proc(t: ^testing.T) {
+	// @(lang="wgsl") on a raw string: the interior lexes as WGSL.
+	src := "@(lang=\"wgsl\")\nSHADER :: `\nfn vs_main() {\n\treturn true\n}\n`\nx := \"plain\"\n"
+	b, h := hl_setup(src, .Odin)
+	defer buffer_destroy(&b)
+	defer highlight_destroy(&h)
+	testing.expect_value(t, face_at(&h, 1, 10), Face.String)  // opening backtick keeps string face
+	testing.expect_value(t, face_at(&h, 2, 0), Face.Keyword)  // fn
+	testing.expect_value(t, face_at(&h, 2, 3), Face.Function) // vs_main
+	testing.expect_value(t, face_at(&h, 3, 8), Face.Constant) // true
+	testing.expect_value(t, face_at(&h, 6, 6), Face.String)   // later strings are ordinary
+
+	// The attribute's own value string must not consume the tag, and
+	// @(private, lang="json") works mid-group.
+	src2 := "@(private, lang=\"json\")\nCFG :: `{\"key\": 12, \"b\": null}`\n"
+	b2, h2 := hl_setup(src2, .Odin)
+	defer buffer_destroy(&b2)
+	defer highlight_destroy(&h2)
+	testing.expect_value(t, face_at(&h2, 0, 11), Face.Text)   // lang ident inside attr
+	testing.expect_value(t, face_at(&h2, 1, 9), Face.Key)     // "key"
+	testing.expect_value(t, face_at(&h2, 1, 16), Face.Number) // 12
+	testing.expect_value(t, face_at(&h2, 1, 25), Face.Constant) // null
+
+	// Unknown language: whole literal stays a plain string.
+	src3 := "@(lang=\"nope\")\nS :: `fn x`\n"
+	b3, h3 := hl_setup(src3, .Odin)
+	defer buffer_destroy(&b3)
+	defer highlight_destroy(&h3)
+	testing.expect_value(t, face_at(&h3, 1, 6), Face.String)
+}
+
 // Every language survives adversarial input (unterminated everything) and
 // produces only in-bounds, ordered spans.
 @test

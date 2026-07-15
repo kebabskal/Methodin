@@ -164,6 +164,35 @@ lang_from_path :: proc(path: string) -> Lang {
 	return .Plain
 }
 
+// "@(lang=...)" attribute value → Lang. Accepts the status-bar names plus
+// common aliases; unknown names mean "no embedded highlighting".
+lang_from_name :: proc(name: string) -> Lang {
+	for n, l in LANG_NAMES {
+		if n == name {
+			return l
+		}
+	}
+	switch name {
+	case "odin":
+		return .Odin
+	case "js":
+		return .JS
+	case "ts":
+		return .TS
+	case "cpp":
+		return .CPP
+	case "py":
+		return .Python
+	case "sh", "bash":
+		return .Shell
+	case "cs":
+		return .CSharp
+	case "md":
+		return .Markdown
+	}
+	return .Plain
+}
+
 highlight_destroy :: proc(h: ^Highlight) {
 	for &line in h.spans {
 		delete(line)
@@ -265,6 +294,11 @@ highlight_odin :: proc(h: ^Highlight, b: ^Buffer) {
 	}
 
 	depth := 0
+	// @(lang="wgsl") arms pending_lang; the next string literal outside the
+	// attribute parens gets its interior lexed as that language.
+	pending_lang := Lang.Plain
+	in_attr := false
+	attr_depth := 0
 	for token, i in tokens {
 		start := token.pos.offset
 		end := start + len(token.text)
@@ -279,17 +313,33 @@ highlight_odin :: proc(h: ^Highlight, b: ^Buffer) {
 			face = .Number
 		case token.kind == .Rune || token.kind == .String:
 			face = .String
+			if token.kind == .String && !in_attr && pending_lang != .Plain {
+				emit_embedded(&em, text, start, end, pending_lang)
+				pending_lang = .Plain
+				continue
+			}
 		case token.kind == .Open_Paren || token.kind == .Open_Bracket || token.kind == .Open_Brace:
 			face = bracket_face(depth)
 			depth += 1
 		case token.kind == .Close_Paren || token.kind == .Close_Bracket || token.kind == .Close_Brace:
 			depth = max(depth-1, 0)
 			face = bracket_face(depth)
+			if in_attr && depth == attr_depth {
+				in_attr = false
+			}
 		case token.kind == .Ident:
 			face = odin_ident_face(tokens[:], i)
+			if in_attr && token.text == "lang" &&
+			   i+2 < len(tokens) && tokens[i+1].kind == .Eq && tokens[i+2].kind == .String {
+				pending_lang = lang_from_name(strings.trim(tokens[i+2].text, `"`))
+			}
 		case token.kind == .Hash || token.kind == .At:
 			// Color the directive sigil and its identifier together.
 			face = .Directive
+			if token.kind == .At && i+1 < len(tokens) && tokens[i+1].kind == .Open_Paren {
+				in_attr = true
+				attr_depth = depth
+			}
 			if i+1 < len(tokens) && tokens[i+1].kind == .Ident && tokens[i+1].pos.offset == end {
 				end = tokens[i+1].pos.offset + len(tokens[i+1].text)
 			}
@@ -297,6 +347,21 @@ highlight_odin :: proc(h: ^Highlight, b: ^Buffer) {
 			face = .Operator
 		}
 		em.emit(start, end, face)
+	}
+}
+
+// A lang-tagged string literal: the delimiters keep the string face, the
+// interior is lexed as the embedded language.
+@(private = "file")
+emit_embedded :: proc(em: ^Span_Emitter, text: string, start, end: int, lang: Lang) {
+	q := text[start]
+	terminated := end-start >= 2 && text[end-1] == q
+	lo := start + 1
+	hi := end-1 if terminated else end
+	em.emit(start, lo, .String)
+	lex_generic_range(em, text, lo, hi, lex_config_for(lang))
+	if terminated {
+		em.emit(hi, end, .String)
 	}
 }
 
@@ -744,9 +809,16 @@ in_list :: proc(word: string, list: []string) -> bool {
 highlight_generic :: proc(h: ^Highlight, b: ^Buffer) {
 	cfg := lex_config_for(h.lang)
 	text, em := highlight_reset(h, b)
+	lex_generic_range(&em, text, 0, len(text), cfg)
+}
 
-	n := len(text)
-	i := 0
+// Lex text[lo:hi) with cfg, emitting absolute offsets. The whole-file
+// highlighters pass the full range; embedded @(lang=...) strings pass just
+// the literal's interior.
+@(private = "file")
+lex_generic_range :: proc(em: ^Span_Emitter, text: string, lo, hi: int, cfg: Lex_Config) {
+	n := hi
+	i := lo
 	depth := 0
 	for i < n {
 		c := text[i]
@@ -810,7 +882,7 @@ highlight_generic :: proc(h: ^Highlight, b: ^Buffer) {
 			}
 			em.emit(start, i, face)
 
-		case c == '[' && cfg.sections && (i == 0 || text[i-1] == '\n'):
+		case c == '[' && cfg.sections && (i == lo || text[i-1] == '\n'):
 			start := i
 			for i < n && text[i] != '\n' && text[i] != ']' {
 				i += 1
