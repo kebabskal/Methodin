@@ -154,7 +154,7 @@ tasks_clear :: proc(ts: ^Task_State) {
 
 tasks_destroy :: proc(ts: ^Task_State) {
 	if ts.running {
-		_ = os.process_kill(ts.process)
+		_ = os.process_kill_group(ts.process)
 		if ts.pipe != nil {
 			os.close(ts.pipe)
 		}
@@ -438,7 +438,7 @@ impl App {
 		}
 		self.save_all() // tasks read from disk; unsaved edits would be invisible
 		if ts.running {
-			_ = os.process_kill(ts.process)
+			_ = os.process_kill_group(ts.process)
 			_, _ = os.process_wait(ts.process)
 			if ts.pipe != nil {
 				os.close(ts.pipe)
@@ -485,10 +485,13 @@ impl App {
 		}
 		process, err := os.process_start(
 		{
-			command     = args,
-			working_dir = cwd,
-			stdout      = out_w,
-			stderr      = out_w, // merged; a run panel wants one stream
+			command           = args,
+			working_dir       = cwd,
+			stdout            = out_w,
+			stderr            = out_w, // merged; a run panel wants one stream
+			// Group kills reach grandchildren: `odin run`/`odin watch` spawn
+			// the built program, which must not outlive a restart (ctrl+r).
+			new_process_group = true,
 		},
 		)
 		os.close(out_w) // the child inherited its end
@@ -552,7 +555,7 @@ impl App {
 		}
 		delete(ts.pending_debug_program) // a killed build launches nothing
 		ts.pending_debug_program = ""
-		_ = os.process_kill(ts.process)
+		_ = os.process_kill_group(ts.process)
 		self.set_status("task: killed")
 		// task_poll reaps it and stamps the title.
 	}
