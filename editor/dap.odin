@@ -481,7 +481,9 @@ impl App {
 		_ = dap_request(&dap, .Disconnect, "disconnect", `{"terminateDebuggee":true}`)
 		// Blunt fallback so a wedged adapter cannot leave a zombie session:
 		// the poll loop cleans up on pipe EOF, and the kill covers the rest.
-		_ = os.process_kill(dap.process)
+		if dap.process.pid != 0 { // pid 0 = never spawned; kill(0) is our own process group
+			_ = os.process_kill(dap.process)
+		}
 	}
 
 	// Tear the session down (adapter gone or being replaced).
@@ -490,8 +492,10 @@ impl App {
 		if d.state == .Off {
 			return
 		}
-		_ = os.process_kill(d.process)
-		_, _ = os.process_wait(d.process)
+		if d.process.pid != 0 {
+			_ = os.process_kill(d.process)
+			_, _ = os.process_wait(d.process)
+		}
 		if d.to_adp != nil {
 			os.close(d.to_adp)
 			os.close(d.from_adp)
@@ -613,7 +617,9 @@ dap_destroy :: proc(d: ^Dap) {
 	delete(d.locals)
 	delete(d.child_req)
 	if d.state != .Off {
-		_ = os.process_kill(d.process)
+		if d.process.pid != 0 {
+			_ = os.process_kill(d.process)
+		}
 		if d.to_adp != nil {
 			os.close(d.to_adp)
 			os.close(d.from_adp)
@@ -631,7 +637,10 @@ dap_destroy :: proc(d: ^Dap) {
 // FOUND is the classic "liblldb cannot find its Python" failure.
 @(private = "file")
 dap_session_lost :: proc(app: ^App) {
-	state, _ := os.process_wait(app.dap.process, 0)
+	state: os.Process_State
+	if app.dap.process.pid != 0 {
+		state, _ = os.process_wait(app.dap.process, 0)
+	}
 	app.dap_finish()
 	if state.exited && state.exit_code == -1073741515 { // 0xC0000135
 		app.set_status("debug adapter failed to start: a DLL is missing (liblldb needs python311.dll)")

@@ -368,7 +368,9 @@ lsp_stop :: proc(l: ^Lsp) {
 		lsp_notify(l, "exit", "null")
 		os.close(l.to_srv)
 		os.close(l.from_srv)
-		_ = os.process_kill(l.process)
+		if l.process.pid != 0 { // pid 0 = never spawned; kill(0) is our own process group
+			_ = os.process_kill(l.process)
+		}
 	}
 	l.to_srv = nil
 	l.from_srv = nil
@@ -387,7 +389,9 @@ lsp_fail :: proc(app: ^App, msg: string) {
 	if l.to_srv != nil {
 		os.close(l.to_srv)
 		os.close(l.from_srv)
-		_ = os.process_kill(l.process)
+		if l.process.pid != 0 {
+			_ = os.process_kill(l.process)
+		}
 		l.to_srv = nil
 		l.from_srv = nil
 	}
