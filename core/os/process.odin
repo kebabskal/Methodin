@@ -351,6 +351,11 @@ Process_Desc :: struct {
 	// or a readable end of a pipe. Passing a `nil` will shut down the process'
 	// input.
 	stdin: ^File,
+	// When true, the child becomes the leader of a new process group, so
+	// `process_kill_group` can terminate it together with everything it
+	// spawned (a compiler running the built program, shells, ...).
+	// POSIX: setpgid; Windows: CREATE_NEW_PROCESS_GROUP.
+	new_process_group: bool,
 }
 
 /*
@@ -539,6 +544,20 @@ The process is forced to exit and can't ignore the request.
 @(require_results)
 process_kill :: proc(process: Process) -> (Error) {
 	return _process_kill(process)
+}
+
+/*
+Kill a process and its descendants.
+
+For a process started with `new_process_group`, kills its whole process
+group — including children it spawned itself (a compiler running the built
+program, a shell running a pipeline, ...). On platforms without process
+group support (currently Windows) this falls back to killing just the
+process.
+*/
+@(require_results)
+process_kill_group :: proc(process: Process) -> (Error) {
+	return _process_kill_group(process)
 }
 
 /*

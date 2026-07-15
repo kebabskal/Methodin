@@ -62,6 +62,10 @@ _process_kill :: proc(process: Process) -> (err: Error) {
 	return .Unsupported
 }
 
+_process_kill_group :: proc(process: Process) -> (err: Error) {
+	return .Unsupported
+}
+
 _process_terminate :: proc(process: Process) -> (err: Error) {
 	return .Unsupported
 }

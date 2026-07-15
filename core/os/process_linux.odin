@@ -521,6 +521,12 @@ _process_start :: proc(desc: Process_Desc) -> (process: Process, err: Error) {
 			linux.exit(126)
 		}
 
+		if desc.new_process_group {
+			// Both sides set it: whichever runs first wins the race, so a
+			// process_kill_group cannot fire before the group exists.
+			_ = linux.setpgid(0, 0)
+		}
+
 		stdin_fd: linux.Fd
 		stdout_fd: linux.Fd
 		stderr_fd: linux.Fd
@@ -579,6 +585,11 @@ _process_start :: proc(desc: Process_Desc) -> (process: Process, err: Error) {
 	}
 
 	linux.close(child_pipe_fds[WRITE])
+
+	if desc.new_process_group {
+		// Mirrors the child's setpgid; fails benignly once the child exec'd.
+		_ = linux.setpgid(pid, pid)
+	}
 
 	process.pid = int(pid)
 
@@ -871,6 +882,11 @@ _process_close :: proc(process: Process) -> Error {
 @(private="package")
 _process_kill :: proc(process: Process) -> Error {
 	return _get_platform_error(linux.kill(linux.Pid(process.pid), .SIGKILL))
+}
+
+@(private="package")
+_process_kill_group :: proc(process: Process) -> Error {
+	return _get_platform_error(linux.kill(linux.Pid(-process.pid), .SIGKILL))
 }
 
 @(private="package")

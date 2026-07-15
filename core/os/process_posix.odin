@@ -159,6 +159,12 @@ _process_start :: proc(desc: Process_Desc) -> (process: Process, err: Error) {
 			posix.exit(126)
 		}
 
+		if desc.new_process_group {
+			// Both sides set it: whichever runs first wins the race, so a
+			// process_kill_group cannot fire before the group exists.
+			_ = posix.setpgid(0, 0)
+		}
+
 		null := posix.open("/dev/null", {.RDWR})
 		if null == -1 { abort(pipe[WRITE]) }
 
@@ -180,6 +186,11 @@ _process_start :: proc(desc: Process_Desc) -> (process: Process, err: Error) {
 
 	case:
 		posix.close(pipe[WRITE])
+
+		if desc.new_process_group {
+			// Mirrors the child's setpgid; fails benignly once the child exec'd.
+			_ = posix.setpgid(pid, pid)
+		}
 
 		errno: posix.Errno
 		for {
@@ -333,6 +344,16 @@ _process_kill :: proc(process: Process) -> (err: Error) {
 	_process_handle_still_valid(process) or_return
 
 	if posix.kill(posix.pid_t(process.pid), .SIGKILL) != .OK {
+		err = _get_platform_error()
+	}
+
+	return
+}
+
+_process_kill_group :: proc(process: Process) -> (err: Error) {
+	_process_handle_still_valid(process) or_return
+
+	if posix.kill(posix.pid_t(-process.pid), .SIGKILL) != .OK {
 		err = _get_platform_error()
 	}
 
