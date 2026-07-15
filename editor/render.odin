@@ -302,7 +302,7 @@ renderer_build_atlas :: proc(r: ^Renderer, font_px: f32) -> bool {
 	bitmap := make([]byte, ATLAS_W*ATLAS_H, context.temp_allocator)
 
 	spc: stbtt.pack_context
-	if stbtt.PackBegin(&spc, raw_data(bitmap), ATLAS_W, ATLAS_H, 0, 1, nil) == 0 {
+	if !stbtt.PackBegin(&spc, raw_data(bitmap), ATLAS_W, ATLAS_H, 0, 1, nil) {
 		return false
 	}
 	stbtt.PackSetOversampling(&spc, 2, 2)
@@ -320,7 +320,7 @@ renderer_build_atlas :: proc(r: ^Renderer, font_px: f32) -> bool {
 		if u_off >= 0 {
 			u1 := stbtt.PackFontRange(&spc, raw_data(ui_ttf), 0, font_px, ASCII_FIRST, ASCII_COUNT, &ui_ascii[0])
 			u2 := stbtt.PackFontRange(&spc, raw_data(ui_ttf), 0, font_px, LATIN1_FIRST, LATIN1_COUNT, &ui_latin1[0])
-			ui_ok = u1 != 0 && u2 != 0
+			ui_ok = bool(u1) && bool(u2)
 		}
 	}
 	// The icon face: a sparse range with just the glyphs the chrome uses.
@@ -335,10 +335,10 @@ renderer_build_atlas :: proc(r: ^Renderer, font_px: f32) -> bool {
 		num_chars                   = len(Icon),
 		chardata_for_range          = &icons[0],
 	}
-	icons_ok := stbtt.PackFontRanges(&spc, raw_data(LUCIDE_TTF), 0, &icon_range, 1) != 0
+	icons_ok := bool(stbtt.PackFontRanges(&spc, raw_data(LUCIDE_TTF), 0, &icon_range, 1))
 
 	stbtt.PackEnd(&spc)
-	if ok1 == 0 || ok2 == 0 || ok3 == 0 {
+	if !ok1 || !ok2 || !ok3 {
 		return false // glyphs did not fit; keep the previous atlas
 	}
 	r.ascii = ascii
