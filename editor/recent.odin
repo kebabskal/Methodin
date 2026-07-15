@@ -11,7 +11,7 @@ import "core:strings"
 
 RECENT_DIRS_MAX :: 20
 
-@(private = "file")
+@(private)
 config_path :: proc(name: string) -> (string, bool) {
 	cfg, err := os.user_config_dir(context.temp_allocator)
 	if err != nil {

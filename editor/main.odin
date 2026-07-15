@@ -139,6 +139,7 @@ shorten_path :: proc(path: string) -> string {
 
 main :: proc() {
 	path := ""
+	restore_session := false
 	if len(runtime.args__) > 1 {
 		path = string(os.args[1])
 		// A directory argument becomes the workspace: sidebar, file finder
@@ -148,6 +149,10 @@ main :: proc() {
 				path = ""
 			}
 		}
+	} else if dir, ok := session_restore_dir(); ok && os.set_working_directory(dir) == nil {
+		// Launched bare: return to the last session's workspace; its
+		// documents are reopened once the app exists below.
+		restore_session = true
 	}
 
 	// By default SDL also posts QUIT when the last (only) window asks to
@@ -224,6 +229,9 @@ main :: proc() {
 	app_init(&app, path)
 	app.recent_dirs_load()
 	defer app_destroy(&app)
+	if restore_session {
+		app.session_open_docs()
+	}
 
 	// While the user drags a window edge, the OS traps the event loop in a
 	// modal resize loop and WaitEventTimeout never returns — the window would
@@ -298,15 +306,18 @@ main :: proc() {
 		task_poll(&app)
 		dap_poll(&app)
 		app.format_save_tick()
+		app.files_tick()
 		app.lsp_hover_tick(rend.cell_w, rend.line_h)
 
-		if app.want_follow {
+		// View geometry is filled in by the first draw; a follow requested
+		// before then (session restore) waits a frame instead of scrolling
+		// against a zero-size viewport.
+		if app.want_follow && app.view_w > 0 {
 			app.want_follow = false
 			app.ensure_cursor_visible(rend.cell_w, rend.line_h, center = app.want_center)
 			app.want_center = false
 		}
 
-		app.files_tick()
 		if app.retitle {
 			app.retitle = false
 			t := fmt.ctprintf("medit — %s", app.buf.path if app.buf.path != "" else "[untitled]")
@@ -316,11 +327,12 @@ main :: proc() {
 		render_frame(&app, &rend, window)
 	}
 
-	// The window size survives restarts.
+	// The window size and the session survive restarts.
 	ww, wh: c.int
 	if sdl.GetWindowSize(window, &ww, &wh) {
 		window_size_save(int(ww), int(wh))
 	}
+	session_save(&app)
 }
 
 // Change the font size: rebuild the glyph atlas and rescale every pixel
@@ -512,6 +524,7 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		// Coming back from elsewhere: files (or settings) may have changed.
 		settings_load(app)
 		sidebar_refresh(&app.sidebar)
+		app.watch_ms = 0 // poll open files immediately
 
 	case .WINDOW_FOCUS_LOST:
 		app.focused = false
@@ -524,7 +537,6 @@ handle_event :: proc(app: ^App, rend: ^Renderer, window: ^sdl.Window, ev: ^sdl.E
 		text := string(ev.text.text)
 		if len(text) > 0 {
 			if app.palette.open {
-		app.watch_ms = 0 // poll open files immediately
 				app.palette_insert(text)
 			} else if app.task.filter_focus {
 				append(&app.task.filter, text)
