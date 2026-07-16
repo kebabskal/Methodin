@@ -3773,10 +3773,44 @@ gb_internal lbAddr lb_add_local_generated_temp(lbProcedure *p, Type *type, i64 m
 }
 
 
-// An entity is "hot-reloadable" if it lives in the initial (user) package while building
-// in a hot-reload mode. Such procs are dispatched through writable slots in the host and
-// re-bound on reload; such globals are exported by the host and imported by reload dylibs
-// so that program state is preserved across reloads.
+// A package is "watched" in a hot-reload build if it is the initial (user) package or a
+// normal package whose directory lives inside the initial package's directory (e.g. an
+// engine subpackage like `<project>/haylib`). Globals of watched packages are shared
+// between the host and reload dylibs so their state survives reloads; out-of-tree
+// dependencies (base:/core:/vendor:, or packages elsewhere on disk) keep per-dylib
+// private copies and re-run their own initialization on each load. Derived purely from
+// the initial package's path so host and reload builds always agree.
+gb_internal bool lb_is_hot_reload_watched_package(CheckerInfo *info, AstPackage *pkg) {
+	if (info == nullptr || pkg == nullptr || info->init_package == nullptr) {
+		return false;
+	}
+	AstPackage *init = info->init_package;
+	if (pkg == init) {
+		return true;
+	}
+	// A single-file build (`odin watch file.odin -file`) watches just that file; sibling
+	// directories under its parent are unrelated packages, not project subpackages.
+	if (init->is_single_file) {
+		return false;
+	}
+	if (pkg->kind != Package_Normal) {
+		return false;
+	}
+	String root = init->fullpath;
+	String path = pkg->fullpath;
+	if (root.len == 0 || path.len <= root.len || !string_starts_with(path, root)) {
+		return false;
+	}
+	return path.text[root.len] == '/' || path.text[root.len] == '\\';
+}
+
+// An entity is "hot-reloadable" if it participates in the hot-reload contract while
+// building in a hot-reload mode. Procs qualify only in the initial package: they are
+// dispatched through writable slots in the host and re-bound on reload (dependency-package
+// procs are recompiled into each reload dylib and reached through those re-bound entry
+// points, so they need no slots of their own). Globals qualify in every watched package:
+// they are exported by the host and imported by reload dylibs so that program state —
+// including engine state in project subpackages — is preserved across reloads.
 gb_internal bool lb_is_hot_reloadable_entity(lbModule *m, Entity *e) {
 	if (build_context.hot_reload_mode == HotReload_None) {
 		return false;
@@ -3787,6 +3821,9 @@ gb_internal bool lb_is_hot_reloadable_entity(lbModule *m, Entity *e) {
 	AstPackage *epkg = e->pkg;
 	if (epkg == nullptr && e->scope != nullptr) {
 		epkg = e->scope->pkg;
+	}
+	if (e->kind == Entity_Variable) {
+		return lb_is_hot_reload_watched_package(m->info, epkg);
 	}
 	return epkg == m->info->init_package;
 }

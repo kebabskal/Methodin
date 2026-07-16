@@ -6,12 +6,14 @@
 // At startup an `@(init)` proc discovers a manifest emitted by the compiler (the dispatch
 // slots for the user package's procedures, plus the source/odin paths) and spawns a
 // background thread that:
-//   1. watches the package's `.odin` files for modification,
+//   1. watches the project tree's `.odin` files for modification (the root package and
+//      any subpackages in directories beneath it),
 //   2. rebuilds the package as a dynamic library (`-build-mode:dll -hot-reload:reload`),
 //   3. loads the result and overwrites each dispatch slot with the new proc address.
 //
-// Package globals are exported by the host and imported by the reload library, so program
-// state (globals) is preserved across reloads — only code changes.
+// Globals of the root package AND of its in-tree subpackages are exported by the host and
+// imported by the reload library, so program state is preserved across reloads — only code
+// changes. Out-of-tree dependencies (base:/core:/vendor:) keep per-library private copies.
 //
 // This file is platform-neutral. The OS primitives it relies on — resolving symbols in the
 // running host, loading the reload library, naming a scratch path, and restarting the process
@@ -122,7 +124,11 @@ _watch_loop :: proc() {
 	}
 }
 
-// Newest modification time across the watched `.odin` sources.
+// Newest modification time across the watched `.odin` sources. The whole project tree is
+// watched, not just the root package: subpackages (directories under the watched root) are
+// compiled into every reload library and their globals are host-shared, so an edit to one
+// must trigger a rebuild exactly like an edit to the root package. Hidden directories
+// (`.git`, editor state, …) are skipped.
 @(private)
 _latest_mtime :: proc() -> i64 {
 	newest: i64 = 0
@@ -134,21 +140,29 @@ _latest_mtime :: proc() -> i64 {
 			}
 		}
 	}
+	scan :: proc(newest: ^i64, dir_path: string) {
+		dir, derr := os.open(dir_path)
+		if derr != nil {
+			return
+		}
+		defer os.close(dir)
+		infos, _ := os.read_dir(dir, -1, context.temp_allocator)
+		for fi in infos {
+			if strings.has_prefix(fi.name, ".") {
+				continue
+			}
+			if fi.type == .Directory {
+				scan(newest, fi.fullpath)
+			} else if strings.has_suffix(fi.name, ".odin") {
+				consider(newest, fi.fullpath)
+			}
+		}
+	}
 	if g.is_file {
 		consider(&newest, g.src_path)
 		return newest
 	}
-	dir, derr := os.open(g.src_path)
-	if derr != nil {
-		return newest
-	}
-	defer os.close(dir)
-	infos, _ := os.read_dir(dir, -1, context.temp_allocator)
-	for fi in infos {
-		if strings.has_suffix(fi.name, ".odin") {
-			consider(&newest, fi.fullpath)
-		}
-	}
+	scan(&newest, g.src_path)
 	return newest
 }
 

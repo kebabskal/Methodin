@@ -240,8 +240,15 @@ Odds and ends:
 - Reload rebuilds inherit the host's `-define:` flags, `-debug`, and checker
   threading, so each per-edit rebuild matches the original build.
 - Both directory and single-file (`-file`) packages work, on Linux, macOS,
-  and Windows; only the initial package is watched/reloaded. See
-  [`examples/hot_reload`](examples/hot_reload) for a runnable demo.
+  and Windows. The whole project tree is watched: subpackages in directories
+  beneath the watched root (e.g. an engine package at `<project>/engine`) are
+  rebuilt into each reload, and their globals are shared with the host just
+  like the root package's, so engine state survives reloads too. Out-of-tree
+  dependencies (`base:`/`core:`/`vendor:`) are not watched and keep per-reload
+  private copies. Rude-edit detection (globals/type layouts) covers every
+  watched package; proc bodies — including procs declared inside structs —
+  reload in place. See [`examples/hot_reload`](examples/hot_reload) for a
+  runnable demo.
 
 ## Compiler notes
 

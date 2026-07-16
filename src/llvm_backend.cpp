@@ -396,13 +396,14 @@ gb_internal void lb_emit_hot_reload_manifest(lbModule *m) {
 	lb_append_to_compiler_used(m, flag_count_g);
 }
 
-// A content hash of everything about the initial package that CANNOT be live-patched:
-// the layout (name + byte size) of every package global, and the body of `main`. If this
-// differs between the running host and a freshly built reload library, the change is a
-// "rude edit" (added/removed/resized global, or an edit to the main loop) and the agent
-// must restart the program rather than swap code in. Computed purely from the checker info
-// and source, so the host and the reload dylib agree for identical source regardless of
-// which mode they were built in.
+// A content hash of everything about the watched packages (the initial package plus its
+// in-tree subpackages) that CANNOT be live-patched: the identity (name + type) of every
+// package global, the layout of every file-scope named type, and the body of `main`. If
+// this differs between the running host and a freshly built reload library, the change is
+// a "rude edit" (added/removed/retyped global, edited type layout, or an edit to the main
+// loop) and the agent must restart the program rather than swap code in. Computed purely
+// from the checker info and source, so the host and the reload dylib agree for identical
+// source regardless of which mode they were built in.
 gb_internal u64 lb_hot_reload_signature(CheckerInfo *info) {
 	constexpr u64 FNV_OFFSET = 1469598103934665603ull;
 	auto fold = [](u64 h, u8 const *bytes, isize n) -> u64 {
@@ -425,7 +426,7 @@ gb_internal u64 lb_hot_reload_signature(CheckerInfo *info) {
 	u64 globals_acc = 0;
 	for (DeclInfo *d : info->variable_init_order) {
 		Entity *e = d->entity;
-		if (e == nullptr || e->kind != Entity_Variable || e->pkg != info->init_package) {
+		if (e == nullptr || e->kind != Entity_Variable || !lb_is_hot_reload_watched_package(info, e->pkg)) {
 			continue;
 		}
 		if (e->scope == nullptr || (e->scope->flags & ScopeFlag_File) == 0) {
@@ -435,6 +436,9 @@ gb_internal u64 lb_hot_reload_signature(CheckerInfo *info) {
 			continue;
 		}
 		u64 gh = FNV_OFFSET;
+		// Fold the owning package's path so two same-named, same-typed globals in
+		// different watched packages cannot XOR-cancel each other.
+		gh = fold(gh, e->pkg->fullpath.text, e->pkg->fullpath.len);
 		gh = fold(gh, e->token.string.text, e->token.string.len);
 		// Hash the type identity (not just its size): int and f64 are both 8 bytes but
 		// reinterpreting one as the other across a reload would silently corrupt state.
@@ -457,11 +461,36 @@ gb_internal u64 lb_hot_reload_signature(CheckerInfo *info) {
 	//   - the computed size/align/field offsets, which catch layout shifts caused by
 	//     types from OTHER packages the declaration merely embeds.
 	// XOR-accumulated per entity for order independence; the set (file-scope type decls
-	// of one package) is stable across builds, and the file path is folded in so two
-	// identical `@(private="file")` decls in different files can't cancel.
+	// of the watched packages) is stable across builds, and the file path is folded in so
+	// two identical `@(private="file")` decls in different files can't cancel.
+	//
+	// Methodin: procs declared inside a struct (methods) are lexically part of the type's
+	// declaration, so a naive token fold over the decl range would treat every method-body
+	// edit as a layout change and force a restart. Methods are hoisted by the parser into
+	// ordinary package-level procedures whose proc-literal bodies span source inside the
+	// struct; collect those body ranges for the watched packages and skip their tokens in
+	// the fold below — a method body is ordinary reloadable code, not layout.
+	struct HrBodyRange { AstFile *file; i32 lo, hi; };
+	auto hr_body_ranges = array_make<HrBodyRange>(temporary_allocator(), 0, 64);
+	for (Entity *e : info->entities) {
+		if (e == nullptr || e->kind != Entity_Procedure || e->file == nullptr) {
+			continue;
+		}
+		if (!lb_is_hot_reload_watched_package(info, e->pkg)) {
+			continue;
+		}
+		DeclInfo *d = decl_info_of_entity(e);
+		if (d == nullptr || d->proc_lit == nullptr || d->proc_lit->kind != Ast_ProcLit || d->proc_lit->ProcLit.body == nullptr) {
+			continue;
+		}
+		Ast *body = d->proc_lit->ProcLit.body;
+		HrBodyRange r = {e->file, ast_token(body).pos.offset, ast_end_token(body).pos.offset};
+		array_add(&hr_body_ranges, r);
+	}
+
 	u64 types_acc = 0;
 	for (Entity *e : info->entities) {
-		if (e == nullptr || e->kind != Entity_TypeName || e->pkg != info->init_package) {
+		if (e == nullptr || e->kind != Entity_TypeName || !lb_is_hot_reload_watched_package(info, e->pkg)) {
 			continue;
 		}
 		if (e->scope == nullptr || (e->scope->flags & ScopeFlag_File) == 0) {
@@ -482,10 +511,21 @@ gb_internal u64 lb_hot_reload_signature(CheckerInfo *info) {
 			i32 lo = ast_token(d->decl_node).pos.offset;
 			i32 hi = ast_end_token(d->decl_node).pos.offset;
 			for (Token const &t : e->file->tokens) {
-				if (t.pos.offset >= lo && t.pos.offset <= hi) {
-					th = fold(th, t.string.text, t.string.len);
-					th = fold(th, cast(u8 const *)" ", 1);
+				if (t.pos.offset < lo || t.pos.offset > hi) {
+					continue;
 				}
+				bool in_method_body = false;
+				for (HrBodyRange const &r : hr_body_ranges) {
+					if (r.file == e->file && t.pos.offset >= r.lo && t.pos.offset <= r.hi) {
+						in_method_body = true;
+						break;
+					}
+				}
+				if (in_method_body) {
+					continue;
+				}
+				th = fold(th, t.string.text, t.string.len);
+				th = fold(th, cast(u8 const *)" ", 1);
 			}
 		}
 
@@ -2537,13 +2577,13 @@ gb_internal void lb_create_startup_runtime_generate_body(lbModule *m, lbProcedur
 	CheckerInfo *info = m->gen->info;
 
 	for (Entity *e : info->init_procedures) {
-		// Hot reload: the init package's @(init) procs already ran in the host
-		// process, and its globals are shared imports here — the linker's -init
+		// Hot reload: watched packages' @(init) procs already ran in the host
+		// process, and their globals are shared imports here — the linker's -init
 		// runs this proc on every dlopen, so re-running them would mutate live
-		// program state from the watch thread on each reload. Dependency
-		// packages keep their init: their globals are this dylib's private
-		// copies and must be initialized.
-		if (build_context.hot_reload_mode == HotReload_Reload && e->pkg == info->init_package) {
+		// program state from the watch thread on each reload. Out-of-tree
+		// dependency packages keep their init: their globals are this dylib's
+		// private copies and must be initialized.
+		if (build_context.hot_reload_mode == HotReload_Reload && lb_is_hot_reload_watched_package(info, e->pkg)) {
 			continue;
 		}
 		lbValue value = lb_find_procedure_value_from_entity(m, e);
@@ -2598,10 +2638,10 @@ gb_internal lbProcedure *lb_create_cleanup_runtime(lbModule *main_module) { // C
 	CheckerInfo *info = main_module->gen->info;
 
 	for (Entity *e : info->fini_procedures) {
-		// See init_procedures in lb_create_startup_runtime: the init package's
+		// See init_procedures in lb_create_startup_runtime: watched packages'
 		// @(fini) procs belong to the host; each reload dylib's -fini would
 		// re-run them (once per loaded generation) at process exit.
-		if (build_context.hot_reload_mode == HotReload_Reload && e->pkg == info->init_package) {
+		if (build_context.hot_reload_mode == HotReload_Reload && lb_is_hot_reload_watched_package(info, e->pkg)) {
 			continue;
 		}
 		lbValue value = lb_find_procedure_value_from_entity(main_module, e);
