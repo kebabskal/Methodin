@@ -85,6 +85,12 @@ enum EntityFlag : u64 {
 	EntityFlag_Require = 1ull<<50,
 	EntityFlag_ByPtr   = 1ull<<51, // enforce parameter is passed by pointer
 
+	// Methodin: parameter is the parser-synthesised `using self` method
+	// receiver. Lets the checker silently skip `using` expansion (instead of
+	// erroring) when the receiver's concrete type is not a struct — e.g. a
+	// polymorphic `^$Self/Vec3` receiver instantiated with an array type.
+	EntityFlag_SelfSynth = 1ull<<52,
+
 	EntityFlag_Overridden    = 1ull<<63,
 };
 

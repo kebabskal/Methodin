@@ -2211,6 +2211,12 @@ gb_internal bool check_proc_body(CheckerContext *ctx_, Token token, DeclInfo *de
 						}
 					}
 					rw_mutex_unlock(&scope->mutex);
+				} else if (e->flags & EntityFlag_SelfSynth) {
+					// Methodin: synthesised `using self` receiver whose concrete
+					// type is not a struct (impl on an array alias, enum, ...).
+					// There are no fields to promote — `self` stays usable as a
+					// plain parameter, so just skip the `using` expansion.
+					continue;
 				} else {
 					error(e->token, "'using' can only be applied to variables of type struct");
 					break;

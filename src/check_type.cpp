@@ -2037,6 +2037,22 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 		// 	type = t_invalid;
 		// }
 
+		// Methodin: `impl` on a non-struct type (array alias, enum, ...) still
+		// synthesises a `using self: ^T` receiver in the parser, but `using` is
+		// only legal on struct parameters. Demote the synthesised receiver to a
+		// plain `self` — `self.x` keeps working via the selector; only bare
+		// field access (a struct-only ergonomic) is unavailable. Polymorphic
+		// receivers (`^$Self/Base`) are left alone here; they resolve to a
+		// concrete type when the instantiation is checked and get demoted then
+		// if that type turns out to be a non-struct.
+		if (is_using && (p->flags&FieldFlag_using_self_synth) != 0 &&
+		    !is_type_polymorphic(type)) {
+			Type *self_bt = base_type(type_deref(type));
+			if (self_bt != nullptr && self_bt->kind != Type_Struct) {
+				is_using = false;
+			}
+		}
+
 		if (is_type_polymorphic(type)) {
 			switch (param_value.kind) {
 			case ParameterValue_Invalid:
@@ -2354,6 +2370,9 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 					param->flags |= EntityFlag_Used|EntityFlag_Param|EntityFlag_Value;
 					if (is_using) {
 						param->flags |= EntityFlag_Using;
+						if (p->flags&FieldFlag_using_self_synth) {
+							param->flags |= EntityFlag_SelfSynth;
+						}
 					}
 
 					param->interned_name.store(name->Ident.interned);
