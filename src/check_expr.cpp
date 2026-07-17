@@ -6868,6 +6868,46 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 					}
 				}
 
+				// Methods win over free procs. A name lifted from a struct body
+				// or impl block ('lerp' in `impl Color`) is a method someone
+				// deliberately attached to a type; a plain proc that merely
+				// accepts the receiver as its first parameter (math.lerp,
+				// linalg.lerp) is an extension-style fallback. When both kinds
+				// match, drop the free procs — mirroring inherent-beats-
+				// extension resolution elsewhere (Rust inherent methods, Kotlin
+				// members). Whether a package provides the name AS A METHOD is
+				// read from its methodin_methods registry, which records every
+				// lifted method's original name; parsing is fully complete
+				// before checking starts, so the registry is frozen here.
+				// Genuine method/method ties (or free/free ties) still error.
+				if (hit_entities.count > 1) {
+					String sel_string = sel_name.string();
+					auto pkg_provides_method = [](AstPackage *pkg, String const &name) -> bool {
+						if (pkg == nullptr) return false;
+						for (MethodinMethodEntry const &me : pkg->methodin_methods) {
+							if (me.original_name == name) return true;
+						}
+						return false;
+					};
+					isize method_hits = 0;
+					for (Entity *he : hit_entities) {
+						if (pkg_provides_method(he->pkg, sel_string)) method_hits++;
+					}
+					if (method_hits > 0 && method_hits < hit_entities.count) {
+						isize w = 0;
+						for (isize r = 0; r < hit_entities.count; r++) {
+							if (!pkg_provides_method(hit_entities[r]->pkg, sel_string)) continue;
+							hit_entities[w] = hit_entities[r];
+							hit_args[w]     = hit_args[r];
+							hit_imports[w]  = hit_imports[r];
+							w++;
+						}
+						hit_entities.count = w;
+						hit_args.count     = w;
+						hit_imports.count  = w;
+					}
+				}
+
 				if (hit_entities.count == 1) {
 					resolved = hit_entities[0];
 					resolved_arg = hit_args[0];

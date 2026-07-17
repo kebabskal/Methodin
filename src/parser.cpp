@@ -7056,10 +7056,10 @@ gb_internal bool lift_one_method(AstFile *f, Ast *method, Token struct_name_toke
 	}
 
 	if (keep_signature) {
-		// impl method with an explicit receiver (`scaled :: proc(v: Vec3, ...)`
-		// inside `impl Vec3`): lift verbatim — the receiver is already spelled
-		// out, and non-struct targets can't take `using self` at all. UFCS
-		// first-arg matching handles `v.scaled(...)`.
+		// impl method with an explicit receiver (first parameter named `self`,
+		// e.g. `scaled :: proc(self: Vec3, ...)` inside `impl Vec3`): lift
+		// verbatim — the receiver is already spelled out. UFCS first-arg
+		// matching handles `v.scaled(...)`.
 		array_add(decls_out, method);
 		return true;
 	}
@@ -7172,7 +7172,7 @@ struct PendingMethod {
 	Token struct_name_token; // owning struct's name token
 	Ast *polymorphic_params; // owning struct's polymorphic_params FieldList, or nullptr
 	bool no_using_self;      // true for union dispatchers: prepend `self: ^Union` without `using`
-	bool keep_signature;     // impl method with an explicit receiver param: lift verbatim, no self injection
+	bool keep_signature;     // impl method with an explicit receiver (first param named `self`): lift verbatim, no injection
 	bool self_polymorphic;   // Methodin: method body calls a sibling method (`self.m()`), so lift with a
 	                         // polymorphic `^$Self` receiver — each concrete receiver monomorphises the
 	                         // body, re-resolving those sibling calls against the *actual* type (virtual
@@ -7695,22 +7695,26 @@ gb_internal bool lift_member_constant(AstFile *f, Ast *member, Token struct_name
 	return true;
 }
 
-// True when an impl-block method already takes the target type as its first
-// parameter (`scaled :: proc(v: Vec3, ...)` inside `impl Vec3`): the method
-// keeps its explicit receiver and no `using self` is injected. This is what
-// makes `impl` usable on NON-struct named types (distinct arrays, enums...) —
-// `using self: ^Vec3` is only legal for struct receivers.
-gb_internal bool impl_method_has_explicit_receiver(Ast *method, String target_name) {
+// True when an impl-block method spells its receiver explicitly: the first
+// parameter is NAMED `self` (`scaled :: proc(self: Vec3, ...)` inside
+// `impl Vec3`); such a method is lifted verbatim and nothing is injected.
+// The receiver is matched by NAME, never by type: a binary method like
+// `lerp :: proc(to: Color, t: f32)` in `impl Color` has a first operand of
+// the target's type by pure coincidence, and an earlier type-based rule
+// silently treated `to` as the receiver — leaving the body's `self`
+// undeclared. Naming the parameter `self` is an unambiguous, greppable
+// opt-in; every other method gets `self` injected, non-struct targets
+// included.
+gb_internal bool impl_method_has_explicit_receiver(Ast *method) {
 	if (method->kind != Ast_ValueDecl || method->ValueDecl.values.count != 1) return false;
 	Ast *v = method->ValueDecl.values[0];
 	if (v->kind != Ast_ProcLit || v->ProcLit.type == nullptr || v->ProcLit.type->kind != Ast_ProcType) return false;
 	Ast *params = v->ProcLit.type->ProcType.params;
 	if (params == nullptr || params->kind != Ast_FieldList || params->FieldList.list.count == 0) return false;
 	Ast *f0 = params->FieldList.list[0];
-	if (f0->kind != Ast_Field || f0->Field.type == nullptr) return false;
-	Ast *t = f0->Field.type;
-	if (t->kind == Ast_PointerType) t = t->PointerType.type;
-	return t != nullptr && t->kind == Ast_Ident && t->Ident.token.string == target_name;
+	if (f0->kind != Ast_Field || f0->Field.names.count == 0) return false;
+	Ast *n0 = f0->Field.names[0];
+	return n0 != nullptr && n0->kind == Ast_Ident && n0->Ident.token.string == "self";
 }
 
 gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
@@ -7746,7 +7750,7 @@ gb_internal void lift_struct_methods(AstFile *f, Array<Ast *> *decls_out) {
 			}
 			for (Ast *method : decl->ImplBlock.methods) {
 				if (lift_member_constant(f, method, struct_name_token, decls_out)) continue;
-				bool explicit_recv = impl_method_has_explicit_receiver(method, struct_name_token.string);
+				bool explicit_recv = impl_method_has_explicit_receiver(method);
 				bool is_static = method->kind == Ast_ValueDecl && method->ValueDecl.is_static_method;
 				PendingMethod pm = {method, struct_name_token, poly};
 				// Statics keep their signature verbatim: no `self` receiver is

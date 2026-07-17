@@ -10,8 +10,12 @@ import "core:fmt"
 // ---------------------------------------------------------------------------
 
 // `impl` also works on NON-struct named types. A method whose first
-// parameter names the target keeps its explicit receiver (nothing is
-// injected), and still resolves through UFCS: `v.scaled(2)`.
+// parameter is NAMED `self` keeps its explicit receiver (nothing is
+// injected); any other method gets `self` injected. The receiver is
+// matched by name, never by type — so a binary method like
+// `lerp :: proc(to: Vec3, t: f32)` is NOT mistaken for explicit-receiver
+// style just because its operand shares the target type. Either way the
+// call resolves through UFCS: `v.scaled(2)`.
 Vec3 :: distinct [3]f32
 
 impl Vec3 {
@@ -19,8 +23,8 @@ impl Vec3 {
 	UP    :: Vec3{0, 1, 0},
 	RIGHT :: Vec3{1, 0, 0},
 
-	scaled :: proc(v: Vec3, f: f32) -> Vec3 {
-		return Vec3{v.x * f, v.y * f, v.z * f}
+	scaled :: proc(self: Vec3, f: f32) -> Vec3 {
+		return Vec3{self.x * f, self.y * f, self.z * f}
 	},
 }
 

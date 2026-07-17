@@ -158,9 +158,20 @@ See [`examples/methods`](examples/methods) and
 - **Type-scoped constants** — any non-proc `Name :: <expr>` inside a struct
   body or `impl` block is a constant (or nested type alias) accessed as
   `Vec3.UP`, `World.MAX_ENTITIES`, `World.Id` — usable in constant contexts
-  like array sizes. `impl` works on non-struct named types too (a method
-  whose first parameter names the target keeps its explicit receiver), so
+  like array sizes. `impl` works on non-struct named types too, so
   `impl Vec3 { UP :: Vec3{0, 1, 0} }` works on a `distinct [3]f32`.
+- **Explicit receivers in `impl` blocks** — an impl method whose first
+  parameter is *named* `self` keeps that explicit receiver and nothing is
+  injected (`scaled :: proc(self: Vec3, f: f32)`); every other method gets
+  `self` injected, non-struct targets included. The receiver is matched by
+  name, never by type: `lerp :: proc(to: Color, t: f32)` inside `impl Color`
+  takes `to` as an ordinary operand and still has `self` available.
+- **Methods win over free procs in UFCS** — when `x.lerp(...)` matches both a
+  lifted method (`lerp` in `impl Color`) and imported free procs that accept
+  the receiver as a first argument (`math.lerp`, `linalg.lerp`), the method is
+  chosen and the free procs are dropped, mirroring inherent-beats-extension
+  resolution in other languages. Only genuine method/method or free/free ties
+  report an ambiguity.
 - **Rvalue receivers** — methods work on temporaries: function results
   (`make_world().describe()`), constants (`Vec3.UP.scaled(2)`), struct
   literals, and immutable parameters. A hidden local is materialized for the
