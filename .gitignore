@@ -300,6 +300,14 @@ build.sh
 tests/issues/build/*
 misc/featuregen/featuregen
 
+# Locally built vendor C libs (make -C vendor/*/src)
+vendor/**/*.a
+
+# Scratch test binaries at the repo root
+/auto_union_test
+/self_dispatch
+/tmp
+
 # Clangd stuff
 .cache/
 .clangd
